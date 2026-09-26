@@ -18,10 +18,8 @@ import structlog
 
 from ptc_agent.core.sandbox._defaults import DEFAULT_DEPENDENCIES
 from ptc_agent.core.sandbox.retry import RetryPolicy
-from ptc_agent.core.sandbox.vault_helper import workspace_vault_path
 
 from ..paths import SandboxLayout
-from ..project_context import current_project
 from .supervisor_runtime import protocol as supervisor_protocol
 
 if TYPE_CHECKING:
@@ -118,14 +116,9 @@ async def _upload_discovery_client(
     # the vault path + mcp_servers path from it. Defaulting would point the
     # vault/server paths at the wrong directory after a working-dir change.
     # The union is not folded in: it holds the pre-edit config of the very
-    # server this probe is meant to see edited. A workspace-local server
-    # resolves its secrets from its owner's vault when a turn names one.
-    project = current_project()
-    vault_file = (
-        workspace_vault_path(work_dir, project.claim) if project is not None else None
-    )
+    # server this probe is meant to see edited.
     mcp_client_code = sandbox.tool_generator.generate_mcp_client_code(
-        enabled_servers, working_dir=work_dir, fold_union=False, vault_file=vault_file
+        enabled_servers, working_dir=work_dir, fold_union=False
     )
     layout = SandboxLayout(work_dir)
     client_path = (

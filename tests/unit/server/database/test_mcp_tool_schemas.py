@@ -224,23 +224,6 @@ async def test_user_purge_passes_every_named_server(schema_mock_db):
 
 
 @pytest.mark.asyncio
-async def test_workspace_purge_bumps_only_its_own_workspace(schema_mock_db):
-    schema_mock_db.rowcounts = [3]
-
-    deleted = await mts.delete_tool_schemas_and_bump("ws-1", ["authy"])
-
-    (purge_sql, purge_params), (bump_sql, bump_params) = _statements(schema_mock_db)
-    assert purge_sql == (
-        "DELETE FROM workspace_mcp_tool_schemas "
-        "WHERE workspace_id = %s AND server_name = ANY(%s)"
-    )
-    assert purge_params == ("ws-1", ["authy"])
-    assert bump_sql.endswith("WHERE workspace_id = %s")
-    assert bump_params == ("ws-1",)
-    assert deleted == 3
-
-
-@pytest.mark.asyncio
 async def test_workspace_upsert_never_probes_the_connection_table(schema_mock_db):
     """The workspace tier has no OAuth connection to check (in-sandbox
     discovery writes it), so the guard must stay off this path entirely.
@@ -255,19 +238,6 @@ async def test_workspace_upsert_never_probes_the_connection_table(schema_mock_db
     assert len(sqls) == 2  # the stale-hash DELETE and the INSERT, nothing else
     assert not any("user_mcp_oauth_connections" in sql for sql in sqls)
     assert not any("FOR SHARE" in sql for sql in sqls)
-
-
-@pytest.mark.asyncio
-async def test_workspace_purge_never_touches_the_user_tier(schema_mock_db):
-    """The reverse of the user-tier fix: a workspace secret is not inherited,
-    so widening this one would purge snapshots the change can't affect."""
-    schema_mock_db.rowcounts = [3]
-
-    await mts.delete_tool_schemas_and_bump("ws-1", ["authy"])
-
-    assert not any(
-        "user_mcp_tool_schemas" in sql for sql, _ in _statements(schema_mock_db)
-    )
 
 
 # ---------------------------------------------------------------------------

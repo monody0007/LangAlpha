@@ -446,7 +446,7 @@ async def read_workspace_file(
 
         # Parallel: fetch vault secrets + file content in one round-trip window
         vault_secrets, file_record = await asyncio.gather(
-            get_vault_secrets_for_redaction(workspace_id),
+            get_vault_secrets_for_redaction(workspace["user_id"]),
             FilePersistenceService.get_file_content(workspace_id, normalized_path),
         )
         if not file_record:
@@ -506,7 +506,7 @@ async def read_workspace_file(
         )
     text_content = decoded
 
-    vault_secrets = await get_vault_secrets_for_redaction(workspace_id)
+    vault_secrets = await get_vault_secrets_for_redaction(workspace["user_id"])
     text_content = get_redactor().redact(text_content, vault_secrets=vault_secrets)
 
     # Apply line range (skip when unlimited=True for edit mode)
@@ -741,7 +741,7 @@ async def download_workspace_file(
 
         # Parallel: fetch vault secrets + file content in one round-trip window
         vault_secrets, file_record = await asyncio.gather(
-            get_vault_secrets_for_redaction(workspace_id),
+            get_vault_secrets_for_redaction(workspace["user_id"]),
             FilePersistenceService.get_file_content(workspace_id, normalized_path),
         )
         if not file_record:
@@ -794,7 +794,7 @@ async def download_workspace_file(
             )
 
         if _is_text_content_type(mime) or _is_utf8(content):
-            vault_secrets = await get_vault_secrets_for_redaction(workspace_id)
+            vault_secrets = await get_vault_secrets_for_redaction(workspace["user_id"])
             content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
         _record_fs_bytes("download", len(content))

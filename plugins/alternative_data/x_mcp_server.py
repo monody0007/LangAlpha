@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """X (Twitter) API MCP Server — read-only v2 endpoints for PTC-mode agents.
 
-Auth: per-call Bearer Token. Primary source is the workspace vault; falls back
+Auth: per-call Bearer Token. Primary source is the vault; falls back
 to the X_BEARER_TOKEN host env when explicitly passed through in agent_config.
 
 Tools: search_posts, search_all_posts, get_user_by_username, get_tweet_by_id,
@@ -141,7 +141,7 @@ def _missing_token_error() -> dict:
     return {
         "error": "missing_token",
         "detail": (
-            "X bearer token required. Pass bearer_token from the workspace vault "
+            "X bearer token required. Pass bearer_token from the vault "
             '(from vault import get; token = get("X_BEARER_TOKEN")), or set '
             "X_BEARER_TOKEN in the host env for single-tenant deployments."
         ),

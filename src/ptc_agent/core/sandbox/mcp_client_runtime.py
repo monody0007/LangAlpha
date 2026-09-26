@@ -160,21 +160,19 @@ class _ServerCfg:
     headers: dict
     discovery_uses_secrets: bool
     relay_bound: bool
-    #: The display name; ``name`` is the union key, which a workspace-local
-    #: server qualifies with its owner's claim.
-    label: str
-    #: The vault this server resolves ``${vault:NAME}`` against; empty means
-    #: the computer root's (user tier) file.
-    vault_file: str
     #: Explicit credential files for a dependency that cannot be inferred.
     credential_files: tuple
+    #: Written by an earlier build for one workspace, whose refs named that
+    #: workspace's own vault. The root vault is the account's, where a secret
+    #: of the same name can hold another value, so such an entry gets none.
+    workspace_vault: bool
 
 
 def _normalize(name: str, entry: dict) -> _ServerCfg:
+    # Named keys only: a sibling's ledger entry written by an older host can
+    # carry keys this runtime no longer reads, and they must stay inert.
     return _ServerCfg(
         name=name,
-        label=str(entry.get("name") or name),
-        vault_file=str(entry.get("vault_file") or ""),
         transport=entry.get("transport") or "stdio",
         # The host computes trust; a missing flag fails CLOSED. Guessing
         # untrusted costs a builtin its inherited env; guessing trusted hands a
@@ -189,6 +187,7 @@ def _normalize(name: str, entry: dict) -> _ServerCfg:
         discovery_uses_secrets=bool(entry.get("discovery_uses_secrets")),
         relay_bound=bool(entry.get("relay_bound")),
         credential_files=tuple(entry.get("credential_files") or ()),
+        workspace_vault=bool(entry.get("vault_file")) or "@" in name,
     )
 
 
@@ -285,15 +284,11 @@ _VAULT_REF_RE = _re.compile(r"\$\{vault:([A-Za-z_][A-Za-z0-9_]{0,127})\}")
 
 
 def _load_vault(cfg=None) -> dict:
-    """The vault a server resolves against; {} when the file is absent.
-
-    A workspace-local server reads its owner's vault, everything shared on the
-    computer reads the root one, so two workspaces holding one secret name
-    with different values never see each other's.
-    """
-    path = (cfg.vault_file if cfg is not None else "") or _VAULT_SECRETS_FILE
+    """The owner's vault; {} when the file is absent."""
+    if cfg is not None and cfg.workspace_vault:
+        return {}
     try:
-        with open(path) as _f:
+        with open(_VAULT_SECRETS_FILE) as _f:
             return json.load(_f)
     except (FileNotFoundError, ValueError, OSError):
         return {}
@@ -331,6 +326,14 @@ def _resolve_all(cfg, values, *, discovery=False):
         _resolve_vault_refs(str(_v), vault, missing=missing, discovery=discovery)
         for _v in values
     ]
+    if missing and not discovery and cfg.workspace_vault:
+        raise RuntimeError(
+            "MCP server "
+            + repr(cfg.name)
+            + " was set up by an earlier version of its workspace and still "
+            "names that workspace's vault; its secrets resolve once the "
+            "workspace starts again"
+        )
     if missing and not discovery:
         raise RuntimeError(
             "Missing vault secret(s) for server "
@@ -488,8 +491,7 @@ def _resolve_relay(cfg):
     """
     creds = _load_relay_credentials()
     grants = creds.get("grants") or {}
-    # The host mints grants by display name; the key is a sandbox-side spelling.
-    grant_id = grants.get(cfg.name) or grants.get(cfg.label)
+    grant_id = grants.get(cfg.name)
     base = (creds.get("relay_base_url") or "").rstrip("/")
     token = creds.get("token") or ""
     if not (grant_id and base and token):
@@ -1783,17 +1785,10 @@ def server_secret_dependencies(server_name: str) -> list[str] | None:
     if cfg.relay_bound:
         dependencies.add(_EGRESS_RELAY_FILE)
     values = [*cfg.args, *cfg.env.values(), cfg.url, *cfg.headers.values()]
-    vault_path = cfg.vault_file or _VAULT_SECRETS_FILE
     if any(_VAULT_REF_RE.search(str(value)) for value in values):
-        dependencies.add(vault_path)
-    known_paths = {
-        _VAULT_SECRETS_FILE,
-        _MCP_TOKENS_FILE,
-        _EGRESS_RELAY_FILE,
-        *(c.vault_file for c in _SERVER_CONFIGS.values() if c.vault_file),
-    }
-    for path in known_paths:
-        if path and any(path in str(value) for value in values):
+        dependencies.add(_VAULT_SECRETS_FILE)
+    for path in (_VAULT_SECRETS_FILE, _MCP_TOKENS_FILE, _EGRESS_RELAY_FILE):
+        if any(path in str(value) for value in values):
             dependencies.add(path)
     file_hint = _re.compile(r"(?:CREDENTIAL|SECRET|TOKEN|KEY|FILE|PATH)", _re.I)
     for name, value in cfg.env.items():

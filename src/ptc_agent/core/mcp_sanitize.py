@@ -1,6 +1,6 @@
 """Sanitization helpers for untrusted (user-configured) MCP server schemas.
 
-Untrusted MCP servers (``source`` ``"workspace"`` or ``"user"``) report
+Untrusted MCP servers (``source`` ``"user"``) report
 arbitrary tool names, parameter names, and descriptions. That text reaches
 generated Python code (docstrings, wrapper modules) and the system prompt, so
 it is hostile input. These helpers bound identifiers and text before either
@@ -157,15 +157,16 @@ def vault_refs(value: str) -> list[str]:
 
 
 def is_untrusted_server(server) -> bool:
-    """True for user-configured servers (``source`` 'workspace' or 'user').
+    """True for every server that is not a built-in.
 
-    The single definition of the trust-boundary predicate — built-ins (no
-    ``source`` attr, or ``'builtin'``) are trusted; workspace-local and
-    user-level (workspace-inherited) servers are not. Named for the property
-    that matters: ``source='user'`` is one of the untrusted tiers, not the
-    complement of this predicate.
+    The single definition of the trust-boundary predicate. Only a built-in (no
+    ``source`` attr, or ``'builtin'``) is trusted, so a source this code does
+    not know, such as the retired ``'workspace'`` tier, fails closed rather
+    than inheriting the sandbox's environment. Named for the property that
+    matters, so a caller asks about trust rather than about which tier a
+    server came from.
     """
-    return getattr(server, "source", "builtin") in ("workspace", "user")
+    return getattr(server, "source", "builtin") != "builtin"
 
 
 def discovery_should_use_secrets(server) -> bool:

@@ -78,13 +78,7 @@ class TestTheRootOwnerReachesTheSync:
 
     def _manager(self):
         manager = ComputerManager.get_instance(config=_make_config())
-        manager.push_vault_secrets = AsyncMock()
-        manager._vault_payloads = AsyncMock(
-            side_effect=lambda workspace_id, user_id: (
-                user_id,
-                {"_root": {}, str(workspace_id): {}},
-            )
-        )
+        manager._vault_snapshot = AsyncMock(return_value=(None, {}, ""))
         manager._stamp_layout_version = AsyncMock()
         manager._stamp_mcp_config_version = AsyncMock()
         return manager

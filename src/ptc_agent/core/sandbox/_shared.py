@@ -119,8 +119,7 @@ def _internal_package_files(src_dir: Path) -> list[tuple[Path, Path]]:
         return []
     files: list[tuple[Path, Path]] = [(src_init, Path("__init__.py"))]
     # The file-transfer runtime rides the same all-or-nothing module so it is
-    # hashed into the manifest and re-shipped whenever it changes; the vault
-    # helper's unhashed upload is the precedent this deliberately avoids.
+    # hashed into the manifest and re-shipped whenever it changes.
     files.append((_TRANSFER_RUNTIME_SOURCE, Path(TRANSFER_RUNTIME_SANDBOX_NAME)))
     files.append((_TURN_CWD_SOURCE, Path(TURN_CWD_SANDBOX_NAME)))
     for supervisor_file in sorted(_SUPERVISOR_SOURCE_DIR.glob("*.py")):

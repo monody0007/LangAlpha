@@ -173,8 +173,12 @@ class TestHeaderKind:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "kwargs",
-        [{"state": State.DISABLED}, {"origin": Origin.WORKSPACE}],
-        ids=["disabled", "workspace-local"],
+        [
+            {"state": State.DISABLED},
+            {"state": State.TOMBSTONED},
+            {"origin": Origin.BUILTIN},
+        ],
+        ids=["disabled", "tombstoned", "builtin"],
     )
     async def test_only_an_active_user_tier_row_earns_one(self, kwargs):
         server = _server()

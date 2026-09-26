@@ -197,32 +197,6 @@ def probe_result(
     )
 
 
-async def effective_secrets_for_probe(
-    user_id: str, workspace_id: str | None, names: Sequence[str]
-) -> dict[str, str]:
-    """The vault the form's refs resolve against: the user's, plus a workspace's
-    the user owns when the form is that workspace's.
-
-    Only ``names`` are decrypted: each row is a full S2K derivation, and the
-    header-free probe a URL edit fires refers to none of them.
-    """
-    from fastapi import HTTPException
-
-    from src.server.database.user_vault_secrets import get_user_secrets_decrypted
-    from src.server.database.vault_secrets import get_effective_secrets
-    from src.server.database.workspace import get_workspace
-
-    if workspace_id:
-        workspace = await get_workspace(workspace_id)
-        if workspace is None or workspace.get("user_id") != user_id:
-            raise HTTPException(status_code=404, detail="Workspace not found")
-    if not names:
-        return {}
-    if workspace_id:
-        return await get_effective_secrets(workspace_id, user_id, names)
-    return await get_user_secrets_decrypted(user_id, names)
-
-
 def _host(url: str) -> str:
     try:
         return urlsplit(url).hostname or url

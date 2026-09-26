@@ -6495,7 +6495,7 @@ class TestGeneratedContentGoesToTheHeldFolder:
     @staticmethod
     def _asset_sync(events):
         manager = WorkspaceManager.get_instance(config=_make_config())
-        manager._vault_payloads = AsyncMock(return_value=("user-1", {"ws-1": {}}))
+        manager._vault_snapshot = AsyncMock(return_value=(None, {}, ""))
         manager._stamp_layout_version = AsyncMock()
         manager._stamp_mcp_config_version = AsyncMock()
         sandbox = MagicMock()

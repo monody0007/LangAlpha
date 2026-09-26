@@ -17,6 +17,7 @@ Endpoints (user-scoped):
 - GET    /api/v1/mcp/servers/{name}/tools
 - PUT    /api/v1/mcp/servers/{name}
 - PATCH  /api/v1/mcp/servers/{name}/enabled
+- PATCH  /api/v1/mcp/servers/{name}/new-workspaces
 - PATCH  /api/v1/mcp/servers/{name}/binding
 - DELETE /api/v1/mcp/servers/{name}
 
@@ -42,23 +43,21 @@ from src.server.database.mcp_oauth import (
     get_connection,
     list_connections,
 )
-from src.server.services.mcp_config import reserved_catalog_names
 from src.server.database.mcp_servers import (
     MAX_CATALOG_SERVERS_PER_USER,
     create_catalog_server,
     delete_catalog_server,
     get_catalog_server,
     list_catalog_servers,
-    list_local_servers_for_user,
     list_scope_markers_for_user,
     set_catalog_server_enabled,
+    set_catalog_server_new_workspace_default,
     update_catalog_server,
 )
 from src.server.database.mcp_tool_schemas import get_user_tool_schemas
 from src.server.database.pool import get_db_connection
 from src.server.database.user_vault_secrets import (
-    create_user_secret,
-    get_user_secret_names,
+    get_user_secrets_decrypted,
 )
 from src.server.models.mcp_server import (
     BindingInput,
@@ -69,7 +68,6 @@ from src.server.models.mcp_server import (
     ParsedMcpServer,
     ProbeInput,
     ProbeResult,
-    WorkspaceScopedServer,
     catalog_row_to_response,
     isolation_warnings,
     parse_mcp_servers_payload,
@@ -79,7 +77,7 @@ from src.server.services.mcp_catalog import (
     detach_warning,
     reject_reserved_catalog_name,
 )
-from src.server.services.mcp_import import ImportScope, run_mcp_import
+from src.server.services.mcp_import import catalog_import_scope, run_mcp_import
 from src.server.services.mcp_oauth.discovery import (
     SELF_HEAL_INTERVAL_S,
     RejectedHeaderValue,
@@ -89,12 +87,11 @@ from src.server.services.mcp_oauth.discovery import (
 )
 from src.server.services.mcp_probe import (
     bounded_probe,
-    effective_secrets_for_probe,
     missing_secrets_result,
     probe_result,
     rejected_header_result,
 )
-from src.server.services.vault_invalidation import USER_TIER, after_secret_change
+from src.server.services.vault_invalidation import after_secrets_changed
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 from src.server.utils.error_sanitization import validation_error_text
 
@@ -351,7 +348,7 @@ async def _oauth_headers_warning(user_id: str, server: McpServerInput) -> str | 
     )
 
 
-async def _write_warnings(user_id: str, server: McpServerInput) -> list[str] | None:
+async def catalog_write_warnings(user_id: str, server: McpServerInput) -> list[str] | None:
     """The write-time nudges for a catalog row: isolation, then dropped headers."""
     warnings = isolation_warnings(server)
     if headers_warning := await _oauth_headers_warning(user_id, server):
@@ -365,8 +362,7 @@ async def list_servers(
     user_id: CurrentUserId, all_scopes: bool = False
 ) -> CatalogServerList:
     """The user's catalog; ``all_scopes`` adds the scope-management inventory:
-    per-server tombstone workspaces (the "active in" deny-list) and every
-    workspace-local server across the user's workspaces.
+    per-server tombstone workspaces (the "active in" deny-list).
 
     Not a pure read: a remote row with no verdict gets its probe kicked here
     (stamping ``probe_kicked_at``), throttled per row, so a listing is what
@@ -388,7 +384,6 @@ async def list_servers(
                 snapshot=snapshot,
             )
         )
-    workspace_servers: list[WorkspaceScopedServer] = []
     if all_scopes:
         markers = await list_scope_markers_for_user(user_id)
         tombstoned: dict[str, list[str]] = {}
@@ -399,23 +394,9 @@ async def list_servers(
             server.disabled_workspace_ids = sorted(
                 tombstoned.get(server.name, [])
             )
-        catalog_names = {r["name"] for r in rows}
-        for local in await list_local_servers_for_user(user_id, live_only=True):
-            config = local.get("config") or {}
-            workspace_servers.append(
-                WorkspaceScopedServer(
-                    name=local["name"],
-                    workspace_id=local["workspace_id"],
-                    transport=config.get("transport") or "stdio",
-                    enabled=bool(local["enabled"]),
-                    description=config.get("description") or "",
-                    shadows_inherited=local["name"] in catalog_names,
-                )
-            )
     return CatalogServerList(
         servers=servers,
         max_servers=MAX_CATALOG_SERVERS_PER_USER,
-        workspace_servers=workspace_servers,
     )
 
 
@@ -446,7 +427,7 @@ async def create_server(
     response = catalog_row_to_response(row)
     # A brand-new name has no connection, but a recreate over a name whose
     # connection row outlived the old catalog entry does.
-    response.warnings = await _write_warnings(user_id, server)
+    response.warnings = await catalog_write_warnings(user_id, server)
     return response
 
 
@@ -490,9 +471,10 @@ async def probe_server(
     Nothing is written: the form shows the verdict and the save that follows
     schedules the discovery that caches it.
     """
-    secrets = await effective_secrets_for_probe(
-        user_id, body.workspace_id, vault_ref_names(body.headers)
-    )
+    names = vault_ref_names(body.headers)
+    # Only the referenced names are decrypted: each row is a full S2K
+    # derivation, and the header-free probe a URL edit fires refers to none.
+    secrets = await get_user_secrets_decrypted(user_id, names) if names else {}
     try:
         headers, missing = resolve_header_refs(body.headers, secrets)
     except RejectedHeaderValue:
@@ -602,7 +584,9 @@ async def update_server(
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=validation_error_text(e))
     # The path name is authoritative; a renamed body is rejected to avoid
-    # silently creating a second row under a different key.
+    # silently creating a second row under a different key. So an edit never
+    # introduces a name, which is why the sandbox's reserved names are not
+    # checked here: a row saved before its name was reserved stays editable.
     if server.name != name:
         raise HTTPException(
             status_code=409, detail="name in body must match the path name"
@@ -624,7 +608,7 @@ async def update_server(
     )
     # After the revoke inside the edit, so one that just severed the connection
     # does not warn about headers it has now made effective.
-    response.warnings = await _write_warnings(user_id, server)
+    response.warnings = await catalog_write_warnings(user_id, server)
     if plugin := edit.detached_from_plugin:
         response.warnings = (response.warnings or []) + [detach_warning(plugin)]
     return response
@@ -638,7 +622,7 @@ async def import_servers(
     """Parse a standard ``{"mcpServers": {...}}`` blob into the user catalog.
 
     Mirrors the workspace import (name coercion, transport mapping, literal
-    credentials auto-extracted — here into the USER vault) with one deliberate
+    credentials auto-extracted into the user's vault) with one deliberate
     difference: imported rows land ``enabled=false`` (inert templates), so an
     import never silently changes every workspace's toolset. The UI nudges the
     user to flip each one live.
@@ -649,11 +633,6 @@ async def import_servers(
             status_code=422,
             detail='No MCP servers found. Expected a JSON object like '
             '{"mcpServers": { "<name>": { ... } }}.',
-        )
-
-    async def create_secret(conn, secret) -> None:
-        await create_user_secret(
-            user_id, secret.name, secret.value, secret.description, conn=conn
         )
 
     landed_enabled: set[str] = set()
@@ -670,22 +649,13 @@ async def import_servers(
             landed_enabled.add(server.name)
         return True
 
-    existing_names = {r["name"] for r in await list_catalog_servers(user_id)}
     report = await run_mcp_import(
         parsed,
-        scope=ImportScope(
-            reserved_names=reserved_catalog_names(),
-            existing_names=existing_names,
-            current_count=len(existing_names),
-            cap=MAX_CATALOG_SERVERS_PER_USER,
-            cap_message=(
-                f"Plugins server cap "
-                f"({MAX_CATALOG_SERVERS_PER_USER}) reached"
-            ),
-            exists_message="already exists in your Plugins",
-            existing_secret_names=set(await get_user_secret_names(user_id)),
-            create_secret=create_secret,
+        scope=await catalog_import_scope(
+            user_id,
+            existing_names={r["name"] for r in await list_catalog_servers(user_id)},
             persist=persist,
+            exists_message="already exists in your Plugins",
         ),
     )
 
@@ -693,8 +663,8 @@ async def import_servers(
     # imported SECRETS do. One can complete a ``${vault:NAME}`` ref that an
     # already-enabled connector has been dangling on, and nothing else in this
     # path purges its snapshot, bumps the version, or pushes to a live sandbox.
-    for name in dict.fromkeys(report.secrets_created):
-        await after_secret_change(USER_TIER, user_id, name, user_id=user_id)
+    # One fan-out for the batch, not one vault push per secret.
+    await after_secrets_changed(user_id, report.secrets_created)
     # After the secrets landed, so a row whose header refs one of them probes
     # with the value rather than a missing-secret error. Only for a row that
     # landed switched on: the background pass refuses an inert one, so the
@@ -789,10 +759,9 @@ async def apply_catalog_enabled(
     bite now rather than at next acquire, which ``revoke_live_grants`` carries
     the reasoning for.
 
-    The column itself has other writers — promoting a workspace fork, and the
-    disable an edit does before rewriting a row. They reach the DB toggle
-    directly and mean to: neither is a user flipping a switch, so neither owes
-    a relay warning, and the edit path is mid-transaction when it runs.
+    The column itself has another writer, the disable an edit does before
+    rewriting a row. It reaches the DB toggle directly and means to: it is not
+    a user flipping a switch, so it owes no relay warning.
     """
     from src.server.services.mcp_oauth.lifecycle import revoke_live_grants
 
@@ -974,6 +943,24 @@ async def set_enabled(
     if warning:
         out["warnings"] = [warning]
     return out
+
+
+@router.patch("/servers/{name}/new-workspaces")
+@handle_api_exceptions("set MCP server default for new workspaces", logger)
+async def set_new_workspace_default(
+    name: str, body: EnabledInput, user_id: CurrentUserId
+) -> dict:
+    """Choose whether workspaces created from now on start with this server on.
+
+    Each existing workspace keeps its own switch, so nothing re-resolves.
+    """
+    row = await set_catalog_server_new_workspace_default(user_id, name, body.enabled)
+    if row is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    return {
+        "name": name,
+        "enabled_in_new_workspaces": row["enabled_in_new_workspaces"],
+    }
 
 
 @router.delete("/servers/{name}")

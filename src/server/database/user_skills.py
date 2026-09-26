@@ -33,6 +33,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from src.server.database.pool import get_db_connection
+from src.server.database.user_lock import lock_user_writes
 
 logger = logging.getLogger(__name__)
 
@@ -370,9 +371,7 @@ async def archive_key_unused_guard(archive_key: str, user_id: str):
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s::text))", (user_id,)
-                )
+                await lock_user_writes(cur, user_id)
                 await cur.execute(
                     "SELECT 1 FROM user_skills WHERE archive_key = %s LIMIT 1",
                     (archive_key,),
@@ -437,9 +436,7 @@ async def user_trigger_guard(user_id: str):
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s::text))", (user_id,)
-                )
+                await lock_user_writes(cur, user_id)
             yield
 
 
@@ -564,9 +561,7 @@ async def upsert_user_skill(
             async with conn.cursor(row_factory=dict_row) as cur:
                 if workspace_id is not None:
                     await _lock_skill_sync_xact(cur, workspace_id)
-                await cur.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s::text))", (user_id,)
-                )
+                await lock_user_writes(cur, user_id)
                 await _check_skill_caps(cur, user_id, name, workspace_id, archive_bytes)
 
                 await _check_trigger_clash(cur, user_id, name, workspace_id)
@@ -722,9 +717,7 @@ async def move_user_skill(
                     {w for w in (from_workspace_id, to_workspace_id) if w}
                 ):
                     await _lock_skill_sync_xact(cur, ws)
-                await cur.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s::text))", (user_id,)
-                )
+                await lock_user_writes(cur, user_id)
                 if to_workspace_id is not None:
                     # The JOIN makes this return a row only for an owned one,
                     # so there is no plugin_id null-check to get wrong.
@@ -857,9 +850,7 @@ async def set_user_skill_command(
             async with conn.cursor(row_factory=dict_row) as cur:
                 if workspace_id is not None:
                     await _lock_skill_sync_xact(cur, workspace_id)
-                await cur.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s::text))", (user_id,)
-                )
+                await lock_user_writes(cur, user_id)
                 if command is not None and command in (
                     await _platform_override_values(cur, user_id)
                 ):
@@ -1003,9 +994,7 @@ async def create_user_skill(
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s::text))", (user_id,)
-                )
+                await lock_user_writes(cur, user_id)
                 await _check_skill_caps(cur, user_id, name, workspace_id, archive_bytes)
                 await _check_trigger_clash(cur, user_id, name, workspace_id)
                 command = await _free_command(
@@ -1069,9 +1058,7 @@ async def update_user_skill_content_cas(
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext(%s::text))", (user_id,)
-                )
+                await lock_user_writes(cur, user_id)
                 await cur.execute(
                     "SELECT name, workspace_id, archive_key FROM user_skills "
                     "WHERE user_id = %s AND user_skill_id = %s "

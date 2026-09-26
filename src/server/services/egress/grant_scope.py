@@ -93,8 +93,7 @@ async def grant_refs(
     refs: list[GrantRef] = []
     for entry in resolved.entries:
         # The user tier only: a grant resolves its credential from the catalog
-        # row or the connection behind it, and a workspace-local row has
-        # neither.
+        # row or the connection behind it, and a built-in has neither.
         if entry.state is not State.ACTIVE or entry.origin is not Origin.USER:
             continue
         server = entry.config

@@ -21,7 +21,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from src.server.database.mcp_oauth import SERVABLE_PARAM, ConnectionStatus
-from src.server.database.mcp_servers import _bump_version, bump_user_versions
+from src.server.database.mcp_servers import bump_user_versions
 from src.server.database.pool import get_db_connection
 
 
@@ -319,26 +319,6 @@ async def delete_tool_schemas(workspace_id: str, server_name: str) -> int:
     return await _delete(WORKSPACE_TIER, workspace_id, server_name)
 
 
-async def delete_tool_schemas_and_bump(
-    workspace_id: str, server_names: list[str]
-) -> int:
-    """Purge workspace snapshots for the named servers AND bump the config
-    version, atomically — a mid-purge failure must never leave schemas
-    partially deleted with the version un-bumped (live sessions would then skip
-    re-resolution against the half-purged cache)."""
-    async with get_db_connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "DELETE FROM workspace_mcp_tool_schemas "
-                    "WHERE workspace_id = %s AND server_name = ANY(%s)",
-                    (workspace_id, server_names),
-                )
-                deleted = cur.rowcount
-                await _bump_version(cur, workspace_id)
-                return deleted
-
-
 # ---------------------------------------------------------------------------
 # User tier — public API (host-side discovery for OAuth servers)
 # ---------------------------------------------------------------------------
@@ -423,9 +403,7 @@ async def delete_user_and_workspace_tool_schemas_and_bump(
                 )
                 deleted = cur.rowcount
                 # ALL the user's workspaces, not just the running ones — an idle
-                # sandbox would otherwise wake onto a stale snapshot. This also
-                # purges a workspace-local fork that shadows the inherited name;
-                # one needless rediscovery is cheaper than under-purging.
+                # sandbox would otherwise wake onto a stale snapshot.
                 await cur.execute(
                     """
                     DELETE FROM workspace_mcp_tool_schemas

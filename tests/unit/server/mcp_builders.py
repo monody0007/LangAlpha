@@ -29,10 +29,14 @@ def resolved_mcp(
     disabled_builtins: Iterable[MCPServerConfig] = (),
     tombstoned: Iterable[MCPServerConfig] = (),
     disabled_local: Iterable[MCPServerConfig] = (),
-    shadowed: Iterable[MCPServerConfig] = (),
     oauth_status: dict[str, str] | None = None,
 ) -> ResolvedMCP:
-    """Build a ResolvedMCP in resolver order (running set first)."""
+    """Build a ResolvedMCP in resolver order (running set first).
+
+    ``local`` and ``disabled_local`` predate the retirement of workspace-local
+    servers and now mean what such a server became: a user server switched on
+    (``inherited``) or off (``tombstoned``) in this workspace.
+    """
     # ResolvedServer is a plain dataclass — nothing coerces for us, and callers
     # spell statuses as wire strings.
     status = {k: ConnectionStatus(v) for k, v in (oauth_status or {}).items()}
@@ -54,11 +58,8 @@ def resolved_mcp(
 
     entries = [
         *_plain(builtins, Origin.BUILTIN, State.ACTIVE),
-        *[_user(c, State.ACTIVE) for c in inherited],
-        *_plain(local, Origin.WORKSPACE, State.ACTIVE),
+        *[_user(c, State.ACTIVE) for c in (*inherited, *local)],
         *_plain(disabled_builtins, Origin.BUILTIN, State.DISABLED),
-        *[_user(c, State.TOMBSTONED) for c in tombstoned],
-        *_plain(disabled_local, Origin.WORKSPACE, State.DISABLED),
-        *[_user(c, State.SHADOWED) for c in shadowed],
+        *[_user(c, State.TOMBSTONED) for c in (*tombstoned, *disabled_local)],
     ]
     return ResolvedMCP(entries=tuple(entries), version=version)

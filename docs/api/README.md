@@ -22,7 +22,7 @@ docs/api/
 ├── 30-workspaces/               # Workspace CRUD & lifecycle
 ├── 35-workspace-files/          # Sandbox file operations
 ├── 37-workspace-sandbox/        # Sandbox stats, packages, previews
-├── 38-vault/                    # Workspace secrets management
+├── 38-vault/                    # Vault secrets management
 ├── 39-sessions/                 # Active session stats
 ├── 50-users/                    # User management & auth sync
 ├── 52-api-keys/                 # BYOK API key management & model listing
@@ -150,7 +150,7 @@ User identification is handled via:
 | Workspaces | Workspace CRUD & lifecycle | `/api/v1/workspaces` |
 | Workspace Files | Sandbox file read/write/upload/download | `/api/v1/workspaces/{id}/files` |
 | Workspace Sandbox | Sandbox stats, packages, preview URLs | `/api/v1/workspaces/{id}/sandbox` |
-| Vault | Workspace secrets management | `/api/v1/workspaces/{id}/vault` |
+| Vault | Account secrets for MCP servers and sandbox code | `/api/v1/mcp/vault` |
 | Sessions | Active PTC session stats | `/api/v1/sessions` |
 | Users | User profile & preferences | `/api/v1/users` |
 | API Keys | BYOK key management & model listing | `/api/v1/users/me/api-keys` |

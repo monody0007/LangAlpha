@@ -2,19 +2,17 @@
 
 Modeled on ``resolve_llm_config``. Merges the process-global built-in MCP
 servers (from ``base_config.mcp.servers``), the user's enabled user-level
-servers, and a workspace's DB-backed rows into one deterministic effective set:
+servers, and a workspace's selection rows into one deterministic effective set:
 
     effective = built-ins (config order)
                 MINUS names disabled by a (source='builtin', enabled=false) row
                 MINUS names disabled account-wide (server or owning bundle)
                 PLUS  enabled user-level servers (alphabetical)
                 MINUS names disabled by a (source='user', enabled=false) row
-                MINUS names shadowed by a workspace-local server
-                PLUS  source='workspace' enabled rows (alphabetical, appended)
 
-Collision policy: built-in names are reserved (a user or workspace server can
-never shadow one); a workspace-local server shadows an inherited user server
-of the same name (the explicit local-fork affordance).
+Servers are installed per user and selected per workspace, so a name means
+the same server in every workspace of its user. Built-in names are reserved:
+a user server can never shadow one.
 
 User-level mutations bump every workspace of the user (one transaction), so
 the single per-workspace ``mcp_config_version`` remains the only drift signal
@@ -98,22 +96,19 @@ class Origin(StrEnum):
     """Which tier defined a server. Matches the wire value of ``origin``."""
 
     BUILTIN = "builtin"
-    WORKSPACE = "workspace"
     USER = "user"
 
 
 class State(StrEnum):
     """How a server participates in one workspace's effective set.
 
-    Only ``ACTIVE`` servers run. The other three are carried so the API can
-    render a re-enable affordance (``DISABLED``/``TOMBSTONED``) or flag the
-    local fork that hides an inherited server (``SHADOWED``).
+    Only ``ACTIVE`` servers run. The other two are carried so the API can
+    render a re-enable affordance.
     """
 
     ACTIVE = "active"
     DISABLED = "disabled"
     TOMBSTONED = "tombstoned"
-    SHADOWED = "shadowed"
 
 
 @dataclass(frozen=True)
@@ -178,8 +173,8 @@ class ResolvedMCP:
 
     ``entries`` is the single source of truth: one labelled row per server the
     workspace knows about, ordered so that filtering to ``ACTIVE`` yields the
-    effective run order (built-ins in config order, then inherited, then local
-    — both alphabetical). The projections below are derived from it, so the
+    effective run order (built-ins in config order, then user servers
+    alphabetically). The projections below are derived from it, so the
     partition can never disagree with itself. ``version`` is
     ``workspaces.mcp_config_version``.
     """
@@ -200,10 +195,6 @@ class ResolvedMCP:
     @cached_property
     def disabled_builtin_names(self) -> frozenset[str]:
         return self._names(Origin.BUILTIN, State.DISABLED)
-
-    @cached_property
-    def shadowed_inherited_names(self) -> frozenset[str]:
-        return self._names(Origin.USER, State.SHADOWED)
 
     @cached_property
     def binding_plans_by_name(self) -> dict[str, BindingPlan]:
@@ -236,9 +227,8 @@ class ResolvedMCP:
 class ServerRef:
     """A workspace-addressable MCP name, classified for the mutation endpoints.
 
-    ``row`` is the workspace row for local/tombstone/marker refs and the
-    Plugins row for a live inherited one — whichever tier the ref resolved
-    from.
+    ``row`` is the workspace row for tombstone/marker refs and the Plugins row
+    for a live inherited one, whichever tier the ref resolved from.
     """
 
     name: str
@@ -285,32 +275,12 @@ def reserved_catalog_names() -> set[str]:
 
     Both sets are joined to a shipped definition by name and then shown wearing
     it, so the reservation has to hold at every writer rather than at the one
-    the feature was built against — create, import and promote each mint a
-    catalog row, and a name is only reserved if all three agree it is.
+    the feature was built against: every create and import door mints a
+    catalog row, and a name is only reserved if all of them agree it is.
     """
     from src.server.services.brokerages import brokerage_names
 
     return builtin_names() | brokerage_names()
-
-
-def workspace_row_to_server_config(row: dict) -> MCPServerConfig:
-    """Convert a ``workspace_mcp_servers`` row into an ``MCPServerConfig``.
-
-    Defined ONCE; imported by the API and sandbox-sync lanes. ``source`` is
-    forced to ``"workspace"`` and any stored ``vault_blueprints`` key is
-    stripped (defense in depth — user servers never declare blueprints).
-    """
-    config = dict(row.get("config") or {})
-    config.pop("vault_blueprints", None)
-    config.pop("source", None)  # never trust a stored source tag
-    # A resolution OUTPUT, never an input: a stored blob must not be able to
-    # bind itself to someone's OAuth connection.
-    config.pop("oauth_connection_id", None)
-    # The row's name is authoritative over any name baked into the JSON blob.
-    config["name"] = row["name"]
-    config["source"] = "workspace"
-    config["enabled"] = bool(row.get("enabled", True))
-    return MCPServerConfig(**config)
 
 
 def user_row_to_server_config(
@@ -344,10 +314,8 @@ async def classify_server_name(
     Reads the two mutable tiers directly (workspace rows, then the Plugins
     catalog) rather than going through ``resolve_mcp_config`` — mutations need
     the raw row, not the merged set, and the built-in tier is checked by the
-    caller against the process config. A workspace-local row wins over an
-    inherited server of the same name (it is the fork); a stale
-    ``source='builtin'`` marker only classifies as ``BUILTIN`` once the
-    Plugins tier has been ruled out.
+    caller against the process config. A stale ``source='builtin'`` marker
+    only classifies as ``BUILTIN`` once the Plugins tier has been ruled out.
     """
     from src.server.database.mcp_servers import (
         get_catalog_server,
@@ -357,9 +325,6 @@ async def classify_server_name(
     rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
     row = rows.get(name)
     source = (row or {}).get("source")
-    if source == "workspace":
-        state = State.ACTIVE if row["enabled"] else State.DISABLED
-        return ServerRef(name, Origin.WORKSPACE, state, row)
     if source == "user":
         # A (source='user', enabled=false) marker: this workspace's tombstone
         # for an inherited server.
@@ -384,10 +349,8 @@ async def resolve_mcp_config(
     order); a ``(source='builtin', enabled=false)`` row, an account-wide
     ``user_mcp_builtin_disables`` row, or a disable of the bundle that ships
     it removes a built-in by name; enabled user-level servers are inherited
-    (alphabetical) unless tombstoned by a
-    ``(source='user', enabled=false)`` row or shadowed by a workspace-local
-    server; ``source='workspace'`` enabled rows are appended alphabetically.
-    A workspace with zero rows AND zero user-level state returns the built-in
+    (alphabetical) unless tombstoned by a ``(source='user', enabled=false)``
+    row. A workspace with zero rows AND zero user-level state returns the built-in
     objects unchanged (no copies) so the common case stays byte-identical
     downstream.
     """
@@ -397,7 +360,6 @@ async def resolve_mcp_config(
         list_enabled_user_servers,
     )
     from src.server.models.mcp_server import probe_ok, snapshot_probe
-    from src.server.services.brokerages import brokerage_names
 
     # Built-ins from the global config, enabled only, in declaration order.
     builtin_servers = [
@@ -405,18 +367,6 @@ async def resolve_mcp_config(
         if getattr(s, "enabled", True)
     ]
     builtin_name_set = {s.name for s in builtin_servers}
-    # Reserved at the WORKSPACE tier only, and deliberately not at the user tier
-    # below: at the user tier this name IS the brokerage, and skipping it would
-    # unplug the connector the reservation exists to protect.
-    #
-    # A local row shadows the inherited catalog row of the same name whether it
-    # is enabled or not, so a workspace `robinhood` silently replaces the broker
-    # the user actually connected: inside that workspace the agent's trade-shaped
-    # tools come from wherever the local row points, with its description
-    # reaching the prompt, while the Plugins page still reports it connected.
-    # The write paths refuse the name now; this is the backstop for a row that
-    # predates them, which a write-time rule can never reach.
-    brokerage_name_set = brokerage_names()
 
     # Version is read BEFORE the rows (READ COMMITTED, not a snapshot) so a
     # concurrent mutation can only skew toward (older version, newer rows) —
@@ -482,61 +432,17 @@ async def resolve_mcp_config(
 
     disabled_builtins: set[str] = set()
     tombstoned_user_names: set[str] = set()
-    local_servers: list[MCPServerConfig] = []
-    disabled_local_servers: list[MCPServerConfig] = []
-    local_names: set[str] = set()
     for row in rows:
         if row["source"] == "builtin":
             # Disable-marker: only acts when it turns a built-in off.
             if not row["enabled"]:
                 disabled_builtins.add(row["name"])
-            continue
-        if row["source"] == "user":
+        elif row["source"] == "user" and not row["enabled"]:
             # Tombstone: removes an inherited user server from THIS workspace.
-            if not row["enabled"]:
-                tombstoned_user_names.add(row["name"])
-            continue
-        # source == 'workspace'
-        if row["name"] in builtin_name_set:
-            # Backstop for the API's 409: a user server must never collide with
-            # a built-in name. Skip + log; do not let it shadow the built-in.
-            logger.warning(
-                "[MCP] Skipping workspace server %r in workspace %s: name "
-                "collides with a built-in (API should reject at write).",
-                row["name"], workspace_id,
-            )
-            continue
-        if row["name"] in brokerage_name_set:
-            logger.warning(
-                "[MCP] Skipping workspace server %r in workspace %s: the name is "
-                "reserved for a shipped brokerage connector and a local row would "
-                "shadow it (API should reject at write).",
-                row["name"], workspace_id,
-            )
-            continue
-        try:
-            cfg = workspace_row_to_server_config(row)
-        except Exception:
-            logger.error(
-                "[MCP] Failed to parse workspace server %r in workspace %s; "
-                "skipping.", row["name"], workspace_id, exc_info=True,
-            )
-            continue
-        # A workspace-local row shadows an inherited user server of the same
-        # name whether enabled or not — a disabled local fork must not fall
-        # back to running the inherited config the user explicitly forked.
-        local_names.add(cfg.name)
-        # Disabled workspace servers are excluded from the effective set (they
-        # don't run), but carried separately so the API keeps a re-enable
-        # toggle in the UI — mirrors the disabled built-in entries.
-        if row["enabled"]:
-            local_servers.append(cfg)
-        else:
-            disabled_local_servers.append(cfg)
+            tombstoned_user_names.add(row["name"])
 
     inherited_servers: list[MCPServerConfig] = []
     tombstoned_inherited: list[MCPServerConfig] = []
-    shadowed_inherited: list[MCPServerConfig] = []
     user_row_by_name = {row["name"]: row for row in user_rows}
     for row in user_rows:
         name = row["name"]
@@ -582,18 +488,13 @@ async def resolve_mcp_config(
                 name, user_id, exc_info=True,
             )
             continue
-        if name in local_names:
-            shadowed_inherited.append(cfg)
-        elif name in tombstoned_user_names:
+        if name in tombstoned_user_names:
             tombstoned_inherited.append(cfg)
         else:
             inherited_servers.append(cfg)
 
     inherited_servers.sort(key=lambda s: s.name)
     tombstoned_inherited.sort(key=lambda s: s.name)
-    shadowed_inherited.sort(key=lambda s: s.name)
-    local_servers.sort(key=lambda s: s.name)
-    disabled_local_servers.sort(key=lambda s: s.name)
 
     plugin_name_by_server = {
         row["name"]: row["plugin_name"]
@@ -686,7 +587,7 @@ async def resolve_mcp_config(
         )
 
     # Entry order IS the API's row order: the running set first (built-ins,
-    # inherited, local), then the carried-but-not-running rows.
+    # then inherited), then the carried-but-not-running rows.
     entries: list[ResolvedServer] = [
         *(
             ResolvedServer(config=s, origin=Origin.BUILTIN, state=State.ACTIVE)
@@ -695,10 +596,6 @@ async def resolve_mcp_config(
             and s.name not in user_disabled_builtins
         ),
         *(_user_entry(s, State.ACTIVE) for s in inherited_servers),
-        *(
-            ResolvedServer(config=s, origin=Origin.WORKSPACE, state=State.ACTIVE)
-            for s in local_servers
-        ),
         *(
             ResolvedServer(
                 config=s,
@@ -714,10 +611,5 @@ async def resolve_mcp_config(
             if s.name in disabled_builtins or s.name in user_disabled_builtins
         ),
         *(_user_entry(s, State.TOMBSTONED) for s in tombstoned_inherited),
-        *(
-            ResolvedServer(config=s, origin=Origin.WORKSPACE, state=State.DISABLED)
-            for s in disabled_local_servers
-        ),
-        *(_user_entry(s, State.SHADOWED) for s in shadowed_inherited),
     ]
     return ResolvedMCP(entries=tuple(entries), version=version)

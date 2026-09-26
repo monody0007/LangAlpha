@@ -15,13 +15,8 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from src.server.database.mcp_servers import (
-    MAX_CATALOG_SERVERS_PER_USER,
     create_catalog_server,
     list_catalog_servers,
-)
-from src.server.database.user_vault_secrets import (
-    create_user_secret,
-    get_user_secret_names,
 )
 from src.server.models.mcp_server import (
     McpServerInput,
@@ -29,8 +24,7 @@ from src.server.models.mcp_server import (
     isolation_warnings,
 )
 from src.server.models.plugin import ComponentResult, InstallReport
-from src.server.services.mcp_config import reserved_catalog_names
-from src.server.services.mcp_import import ImportScope, run_mcp_import
+from src.server.services.mcp_import import catalog_import_scope, run_mcp_import
 from src.server.services.mcp_oauth.discovery import schedule_catalog_discovery
 from src.server.services.plugins.mcp import McpEntryPlan
 
@@ -146,14 +140,6 @@ async def fan_out_servers(
     if not installable:
         return
 
-    existing_rows = await list_catalog_servers(user_id)
-    existing_names = {r["name"] for r in existing_rows}
-
-    async def create_secret(conn, secret) -> None:
-        await create_user_secret(
-            user_id, secret.name, secret.value, secret.description, conn=conn
-        )
-
     async def persist(
         conn, server: McpServerInput, entry: ParsedMcpServer
     ) -> bool:
@@ -180,20 +166,13 @@ async def fan_out_servers(
     ]
     mcp_report = await run_mcp_import(
         parsed,
-        scope=ImportScope(
-            reserved_names=reserved_catalog_names(),
-            existing_names=existing_names,
-            current_count=len(existing_names),
-            cap=MAX_CATALOG_SERVERS_PER_USER,
-            cap_message=(
-                f"Plugins server cap ({MAX_CATALOG_SERVERS_PER_USER}) reached"
-            ),
+        scope=await catalog_import_scope(
+            user_id,
+            existing_names={r["name"] for r in await list_catalog_servers(user_id)},
+            persist=persist,
             exists_message=(
                 "a server with this name already exists; left untouched"
             ),
-            existing_secret_names=set(await get_user_secret_names(user_id)),
-            create_secret=create_secret,
-            persist=persist,
         ),
     )
 

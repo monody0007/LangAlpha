@@ -22,7 +22,7 @@
       "servers": {
         "x_api": {
           "description": "Search X (Twitter) posts and fetch users, tweets, and reply threads. Read-only.",
-          "instruction": "Use for X/Twitter search and thread retrieval. Tools: search_posts, search_all_posts, get_conversation, get_user_by_username, get_tweet_by_id. For a single known X post URL, prefer web_fetch — reserve these tools for search, aggregation, and thread traversal. Every call needs bearer_token from the workspace vault: `from vault import get; token = get(\"X_BEARER_TOKEN\")`. Prefer search_posts by default; reach for search_all_posts only when the user needs posts older than ~7 days. See skills/x-api/ for usage and errors.",
+          "instruction": "Use for X/Twitter search and thread retrieval. Tools: search_posts, search_all_posts, get_conversation, get_user_by_username, get_tweet_by_id. For a single known X post URL, prefer web_fetch; reserve these tools for search, aggregation, and thread traversal. Every call needs bearer_token from the vault: `from vault import get; token = get(\"X_BEARER_TOKEN\")`. Prefer search_posts by default; reach for search_all_posts only when the user needs posts older than ~7 days. See skills/x-api/ for usage and errors.",
           "tool_exposure_mode": "summary",
           "vault_blueprints": [
             {

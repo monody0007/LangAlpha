@@ -5,11 +5,16 @@ rows, but a plugin's rows only land in its fan-out, well after that read. The
 refusal holds only if no other plugin write can take the name between one
 install's read and its own write, which is a property of the lock and so needs
 the real one.
+
+A plugin write that dies partway must also have moved every workspace's MCP
+config version past the server rows it already committed: a warm session keeps
+its config until that number changes, and nothing retries the write.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import io
 import json
@@ -370,3 +375,140 @@ async def test_an_sse_upgrade_that_waited_out_an_update_reads_the_new_package(
 
     assert await get_catalog_server(test_user_id, SERVER) is None
     assert [(c.key, c.status) for c in report.components] == [(SERVER, "error")]
+
+
+STDIO = {"type": "stdio", "command": "uvx", "args": ["mcp-server-time==0.6.2"]}
+STDIO_NEXT = {**STDIO, "args": ["mcp-server-time==0.6.3"]}
+
+
+class _Boom(RuntimeError):
+    """A failure, or the worker dying, after a plugin write's rows commit."""
+
+
+async def _version(workspace_id) -> int:
+    from src.server.database.workspace import get_workspace
+
+    return int((await get_workspace(workspace_id))["mcp_config_version"])
+
+
+@contextlib.contextmanager
+def _offline():
+    # Network: the held-back sse probe and the discovery after a create.
+    with (
+        patch(
+            "src.server.services.plugins.server_fanout._probe_sse_entries",
+            new=AsyncMock(return_value={}),
+        ),
+        patch("src.server.services.plugins.server_fanout.schedule_catalog_discovery"),
+    ):
+        yield
+
+
+@pytest.mark.parametrize(
+    "dies_in",
+    [
+        "fan_out_skills",
+        "stamp_plugin_content_hash",
+        "after_secrets_changed",
+        "pending_secret_declarations",
+    ],
+)
+async def test_an_install_that_fails_after_its_rows_commit_has_bumped(
+    dies_in, seed_workspace, patched_get_db_connection, test_user_id
+):
+    """The row is live the moment it commits, and nothing repairs a missed
+    bump: a retried install is refused as a duplicate, and update finds the
+    row it would write already there and reports it unchanged."""
+    from src.server.database.mcp_servers import get_catalog_server
+    from src.server.services.plugins import lifecycle
+
+    workspace_id = str(seed_workspace["workspace_id"])
+    before = await _version(workspace_id)
+    with (
+        _offline(),
+        patch.object(lifecycle, dies_in, new=AsyncMock(side_effect=_Boom)),
+        pytest.raises(_Boom),
+    ):
+        await _install(test_user_id, _package(FIRST, server=STDIO))
+
+    assert (await get_catalog_server(test_user_id, SERVER))["enabled"] is True
+    assert await _version(workspace_id) > before
+
+
+async def _update_dying_at_the_plugin_row(user_id: str, incoming) -> None:
+    from src.server.database.plugins import get_plugin
+    from src.server.services.plugins import update
+
+    plugin = await get_plugin(user_id, FIRST)
+    with (
+        patch.object(update, "update_plugin_row", new=AsyncMock(side_effect=_Boom)),
+        pytest.raises(_Boom),
+    ):
+        await update.update_plugin_package(user_id, plugin, incoming, source_ref=None)
+
+
+async def test_an_update_that_adds_a_server_bumps_with_the_row(
+    seed_workspace, patched_get_db_connection, test_user_id
+):
+    from src.server.database.mcp_servers import get_catalog_server
+
+    workspace_id = str(seed_workspace["workspace_id"])
+    with _offline():
+        await _install(test_user_id, _package(FIRST))
+        before = await _version(workspace_id)
+        await _update_dying_at_the_plugin_row(
+            test_user_id, _package(FIRST, server=STDIO)
+        )
+
+    assert (await get_catalog_server(test_user_id, SERVER))["enabled"] is True
+    assert await _version(workspace_id) > before
+
+
+@pytest.mark.parametrize("arm", ["in-place", "delete"])
+async def test_an_update_that_rewrites_or_drops_a_server_bumps_with_the_row(
+    arm, seed_workspace, patched_get_db_connection, test_user_id
+):
+    """The update's other two server arms, which write through the catalog
+    helpers that bump inside their own transaction."""
+    from src.server.database.mcp_servers import get_catalog_server
+
+    workspace_id = str(seed_workspace["workspace_id"])
+    incoming = (
+        _package(FIRST, server=STDIO_NEXT) if arm == "in-place" else _package(FIRST)
+    )
+    with _offline():
+        await _install(test_user_id, _package(FIRST, server=STDIO))
+        before = await _version(workspace_id)
+        await _update_dying_at_the_plugin_row(test_user_id, incoming)
+
+    row = await get_catalog_server(test_user_id, SERVER)
+    if arm == "in-place":
+        assert row["args"] == STDIO_NEXT["args"]
+    else:
+        assert row is None
+    assert await _version(workspace_id) > before
+
+
+async def test_an_sse_upgrade_bumps_with_the_row(
+    seed_workspace, patched_get_db_connection, test_user_id
+):
+    from src.server.database.mcp_servers import get_catalog_server
+    from src.server.database.plugins import get_plugin
+    from src.server.services.plugins import post_install
+
+    workspace_id = str(seed_workspace["workspace_id"])
+    with _offline():
+        await _install(test_user_id, _package(FIRST, server=SSE))
+        plugin = await get_plugin(test_user_id, FIRST)
+        before = await _version(workspace_id)
+        with (
+            patch.object(
+                post_install, "after_secrets_changed",
+                new=AsyncMock(side_effect=_Boom),
+            ),
+            pytest.raises(_Boom),
+        ):
+            await post_install.apply_sse_upgrades(test_user_id, plugin, [SERVER])
+
+    assert (await get_catalog_server(test_user_id, SERVER))["enabled"] is True
+    assert await _version(workspace_id) > before

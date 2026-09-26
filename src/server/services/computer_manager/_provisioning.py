@@ -201,7 +201,9 @@ class ProvisioningMixin:
                 self.config.skills.sandbox_skills_base,
                 workspace_id=workspace_id,
             )
-            _, vault_payloads = await self._vault_payloads(workspace_id, user_id)
+            vault_owner, vault_secrets, vault_fingerprint = await self._vault_snapshot(
+                workspace_id, user_id
+            )
             try:
                 workspace_dirs = await get_workspace_dir_names_for_computer(binding.computer_id)
             except Exception as exc:
@@ -211,7 +213,7 @@ class ProvisioningMixin:
                 with sandbox_assets.asset_sync_context(
                     mcp_registry=view.mcp_registry if view is not None else None,
                     mcp_servers=view.mcp_servers if view is not None else None,
-                    vault_payloads=vault_payloads,
+                    vault_secrets=vault_secrets,
                 ):
                     result = await sandbox.sync_sandbox_assets(
                         skill_dirs=skill_dirs,
@@ -226,8 +228,17 @@ class ProvisioningMixin:
                         workspace_dir_names=workspace_dirs,
                         **user_skill_params,
                     )
-            claim = ProjectContext(workspace_id, "").claim
-            sandbox.vault_secrets = dict(vault_payloads[claim])
+            if vault_owner is not None:
+                # The sync published a decrypt taken before it waited on the
+                # folder and the lock; a push may have landed newer meanwhile.
+                vault_secrets = await self._settle_vault(
+                    vault_owner,
+                    sandbox,
+                    vault_secrets,
+                    vault_fingerprint,
+                    published=True,
+                )
+            sandbox.vault_secrets = vault_secrets
             await self._stamp_layout_version(binding.computer_id, result)
             await self._stamp_mcp_config_version(binding.computer_id)
             return result

@@ -53,7 +53,7 @@ In practice, you create a workspace per research goal ("Q2 rebalance", "data cen
 - **Agent swarm** — Parallel async subagents with isolated context windows, preloaded toolset/skills, mid-execution steering, checkpoint-based resume, and live progress monitoring in the UI.
 - **Live steering** — Send follow-up messages while the agent/subagent is working to course-correct, clarify, or redirect without waiting for it to finish.
 - **Middleware stack** — a deep, composable middleware stack handling skill loading, plan mode, multimodal input, auto-compaction, and context management to support long-running agent sessions.
-- **Security & workspace vault** — Encryption at rest via pgcrypto, automatic credential leak detection and redaction, sandboxed execution, and per-workspace secret storage for safe agent access
+- **Security & vault** — Encryption at rest via pgcrypto, automatic credential leak detection and redaction, sandboxed execution, and per-account secret storage for safe agent access
 - **Channel integrations** — Use LangAlpha from Slack, Discord, Feishu, and Telegram, plus email delivery for scheduled results.
 - **Production-ready infrastructure** — SSE-streamed agent activity with Redis-buffered reconnection replay, background execution decoupled from HTTP connections, and PostgreSQL-backed state persistence.
 
@@ -171,7 +171,7 @@ While PTC excels at complex work like multi-step data processing, financial mode
 
 The agent picks the right layer automatically: native tools for fast lookups that fit in context, MCP tools when the task requires bulk data processing, charting, or multi-year trend analysis in the sandbox.
 
-MCP servers are configurable per workspace. Built-in servers can be disabled individually, and custom HTTP or stdio servers — including ones that read credentials from the [workspace vault](#workspace-vault) — can be added through the API or UI, taking effect within seconds without a restart.
+MCP servers are installed once on your account and selected per workspace. Built-in servers can be disabled individually, and custom HTTP or stdio servers, including ones that read credentials from the [vault](#vault), can be added through the API or UI and turned on or off in each workspace, taking effect within seconds without a restart.
 
 #### Data Provider Fallback Chain
 
@@ -344,7 +344,7 @@ PostgreSQL backs LangGraph checkpointing, conversation history, and user data (w
 
 Every external data source the agent touches is traced and surfaced. A provenance middleware records each web search, page fetch, SEC filing, market-data call, MCP tool invocation, and workspace file read — including accesses made by background subagents — and emits a `provenance` stream event per source, none of which enters the LLM context. The UI renders these as a Sources panel beside each turn: sources grouped by type, favicons for web origins, and a detail view exposing the provider, timestamp, captured arguments, a content fingerprint, and a snippet. A *This turn / All sources* toggle reveals the full data footprint across an entire thread, and clicking a file or memo source opens it directly in the workspace file panel — a fully auditable trail of the data behind every research output.
 
-## Security & Workspace Vault
+## Security & Vault
 
 LangAlpha applies a layered security model across credentials, code execution, and user-supplied secrets.
 
@@ -354,9 +354,9 @@ LangAlpha applies a layered security model across credentials, code execution, a
 
 **Sandboxed code execution** — Each workspace runs in its own [Daytona](https://www.daytona.io/) cloud sandbox with a dedicated filesystem and network boundary. Protected path guards prevent the agent from accessing internal system directories — blocking both tool input (short-circuiting the call before execution) and tool output (redacting leaked paths).
 
-### Workspace Vault
+### Vault
 
-Each workspace has a built-in secret vault for storing API keys and credentials that the agent can use during code execution — useful for accessing third-party data sources (brokerage APIs, external data vendors, etc.) or building LLM-powered workflows inside the workspace. Store a secret once in the UI, and it's available to every agent session in that workspace via a simple Python API:
+Each account has a built-in secret vault for storing API keys and credentials that the agent can use during code execution, useful for accessing third-party data sources (brokerage APIs, external data vendors, etc.) or building LLM-powered workflows inside a workspace. Store a secret once in the UI, and it's available to every agent session in each of your workspaces via a simple Python API:
 
 ```python
 from vault import get, list_names, load_env
@@ -366,7 +366,7 @@ names = list_names()               # list available secret names
 load_env()                         # bulk-load all secrets as env vars
 ```
 
-Vault secrets inherit every protection layer above — encrypted at rest, redacted from all agent and human-facing output, and blocked from direct file access. Only the workspace owner can create, update, reveal, or delete secrets.
+Vault secrets inherit every protection layer above: encrypted at rest, redacted from all agent and human-facing output, and blocked from direct file access. Only the account owner can create, update, reveal, or delete secrets.
 
 ## Frontend
 

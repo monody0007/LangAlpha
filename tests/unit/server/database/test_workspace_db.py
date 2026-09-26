@@ -8,6 +8,7 @@ batch sort order, status updates, and flash workspace upsert.
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -48,8 +49,21 @@ def mock_connection(mock_cursor):
 
 
 @pytest.fixture
-def ws_mock_db(mock_connection):
-    """Patch get_db_connection in the workspace module (its import location)."""
+def selection():
+    """The per-user lock and the MCP selection a new workspace starts with,
+    whose SQL is pinned against a real Postgres in
+    tests/integration/test_new_workspace_mcp_selection_db.py."""
+    lock, start = AsyncMock(), AsyncMock()
+    with (
+        patch("src.server.database.workspace.lock_user_writes", new=lock),
+        patch("src.server.database.workspace.start_new_workspace_selection", new=start),
+    ):
+        yield SimpleNamespace(lock=lock, start=start)
+
+
+@pytest.fixture
+def ws_mock_db(mock_connection, selection):
+    """Patch get_db_connection where the workspace module and its folder allocation import it."""
 
     @asynccontextmanager
     async def _fake(conn=None):
@@ -58,9 +72,9 @@ def ws_mock_db(mock_connection):
             return
         yield mock_connection
 
-    with patch(
-        "src.server.database.workspace.get_db_connection",
-        new=_fake,
+    with (
+        patch("src.server.database.workspace.get_db_connection", new=_fake),
+        patch("src.server.database.workspace_folders.get_db_connection", new=_fake),
     ):
         yield mock_connection
 
@@ -115,8 +129,10 @@ async def test_get_flash_workspace_id_deterministic():
 
 
 @pytest.mark.asyncio
-async def test_get_or_create_flash_workspace(ws_mock_db, mock_cursor):
-    """get_or_create_flash_workspace executes upsert SQL and returns dict."""
+async def test_an_existing_flash_workspace_costs_one_statement_and_no_lock(
+    ws_mock_db, mock_cursor, selection
+):
+    """Every Flash turn lands here, so the row that exists is only touched."""
     from src.server.database.workspace import get_or_create_flash_workspace
 
     row = _workspace_row(name="Flash", status="flash")
@@ -127,9 +143,79 @@ async def test_get_or_create_flash_workspace(ws_mock_db, mock_cursor):
     assert result["name"] == "Flash"
     assert result["status"] == "flash"
     mock_cursor.execute.assert_awaited_once()
+    assert mock_cursor.execute.call_args[0][0].split()[0] == "UPDATE"
+    selection.lock.assert_not_awaited()
+    selection.start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_first_flash_turn_upserts_and_starts_the_selection_once(
+    ws_mock_db, mock_cursor, selection
+):
+    """A concurrent first turn that inserted it first already started the
+    selection; the upsert says which of the two this one was."""
+    from src.server.database.workspace import (
+        get_flash_workspace_id,
+        get_or_create_flash_workspace,
+    )
+
+    row = _workspace_row(name="Flash", status="flash")
+    mock_cursor.fetchone.side_effect = [None, {**row, "inserted": True}]
+    result = await get_or_create_flash_workspace("user-1")
+
+    assert "inserted" not in result
     sql = mock_cursor.execute.call_args[0][0]
-    assert "INSERT INTO workspaces" in sql
-    assert "ON CONFLICT" in sql
+    assert "INSERT INTO workspaces" in sql and "ON CONFLICT" in sql
+    selection.lock.assert_awaited_once_with(mock_cursor, "user-1")
+    selection.start.assert_awaited_once_with(
+        mock_cursor, "user-1", get_flash_workspace_id("user-1")
+    )
+
+    mock_cursor.fetchone.side_effect = [None, {**row, "inserted": False}]
+    await get_or_create_flash_workspace("user-1")
+    selection.start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "create",
+    [
+        lambda W: W.create_workspace("user-1", "Research"),
+        lambda W: W.create_workspace_on_computer(
+            "user-1", "Research", "11111111-1111-1111-1111-111111111111"
+        ),
+        lambda W: W.get_or_create_flash_workspace("user-1"),
+    ],
+    ids=["create_workspace", "create_workspace_on_computer", "flash"],
+)
+async def test_the_user_lock_is_taken_before_the_workspace_insert(
+    create, ws_mock_db, mock_cursor, selection
+):
+    """As its own earlier statement: waiting on it after the INSERT would hold
+    the new row's name and folder slots, and a rename blocked on those slots
+    holds a row the lock holder's version bump needs, which deadlocks."""
+    from src.server.database import workspace as W
+
+    order: list[str] = []
+    selection.lock.side_effect = lambda *args: order.append("lock")
+
+    def execute(sql, *args, **kwargs):
+        order.append("insert" if "INSERT INTO workspaces" in sql else "other")
+
+    mock_cursor.execute.side_effect = execute
+    # Flash updates an existing row first; None sends it on to the insert.
+    mock_cursor.fetchone.side_effect = lambda: (
+        None
+        if order[-1] == "other"
+        else {**_workspace_row(dir_name="research"), "inserted": True}
+    )
+
+    # Which computers take name folders is read on its own connection.
+    with patch.object(W, "get_computer", AsyncMock(return_value=None)):
+        await create(W)
+
+    assert "insert" in order
+    assert order.index("lock") < order.index("insert")
 
 
 @pytest.mark.asyncio

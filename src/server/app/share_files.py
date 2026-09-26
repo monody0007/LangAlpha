@@ -320,7 +320,7 @@ async def read_shared_file(
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
     vault_secrets, resolved = await asyncio.gather(
-        get_vault_secrets_for_redaction(target.workspace_id),
+        get_vault_secrets_for_redaction(target.workspace["user_id"]),
         _shared_file_bytes(target, normalized_path),
     )
     if resolved is None:
@@ -366,7 +366,7 @@ async def download_shared_file(
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
     vault_secrets, resolved = await asyncio.gather(
-        get_vault_secrets_for_redaction(target.workspace_id),
+        get_vault_secrets_for_redaction(target.workspace["user_id"]),
         _shared_file_bytes(target, normalized_path),
     )
     if resolved is None:

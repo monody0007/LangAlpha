@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.server.models.plugin import InstallReport
+from src.server.services import mcp_import
 from src.server.services.plugins import server_fanout
 from src.server.services.plugins.mcp import McpEntryPlan
 
@@ -37,13 +38,16 @@ def created(monkeypatch):
     monkeypatch.setattr(
         "src.server.services.mcp_import.get_db_connection", connection
     )
+    monkeypatch.setattr(
+        server_fanout, "list_catalog_servers", AsyncMock(return_value=[]),
+        raising=True,
+    )
     for name, value in (
-        ("list_catalog_servers", []),
         ("get_user_secret_names", []),
         ("create_user_secret", None),
     ):
         monkeypatch.setattr(
-            server_fanout, name, AsyncMock(return_value=value), raising=True
+            mcp_import, name, AsyncMock(return_value=value), raising=True
         )
     monkeypatch.setattr(
         server_fanout, "schedule_catalog_discovery", lambda *a, **k: None,

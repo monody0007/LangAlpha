@@ -15,7 +15,6 @@ import logging
 from typing import Any
 
 from src.server.database.mcp_servers import (
-    bump_user_workspaces_mcp_version,
     delete_catalog_server,
     list_catalog_servers,
 )
@@ -54,10 +53,7 @@ from src.server.services.plugins.skill_fanout import (
     installs_under_dir,
 )
 from src.server.services.user_skills.materialize import drop_archive_if_unused
-from src.server.services.vault_invalidation import (
-    USER_TIER,
-    after_secrets_changed,
-)
+from src.server.services.vault_invalidation import after_secrets_changed
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +163,8 @@ async def install_plugin_package(
                     message=grants.disclosure_reason(),
                 )
             )
+        # Each server row commits enabled together with its version bump, so
+        # a failure anywhere after this leaves no live row a session misses.
         await fan_out_servers(user_id, plugin_id, package.entry_plans, report)
         await fan_out_skills(user_id, plugin_id, package.skill_plans, report)
 
@@ -183,15 +181,9 @@ async def install_plugin_package(
     # Embedded literals the import loop vaulted: their refs may complete a
     # dangling ${vault:NAME} on an already-enabled server.
     disclose_vaulted_literals(report)
-    await after_secrets_changed(
-        USER_TIER, user_id, report.secrets_created, user_id=user_id
-    )
+    await after_secrets_changed(user_id, report.secrets_created)
 
     report.secrets_required = await pending_secret_declarations(user_id, package)
-
-    if report.servers_created:
-        # Components land enabled, so every workspace's effective set changed.
-        await bump_user_workspaces_mcp_version(user_id)
 
     logger.info(
         f"[plugins] install user_id={user_id} name={package.name} "

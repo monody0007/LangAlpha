@@ -26,7 +26,6 @@ import json
 import posixpath
 import textwrap
 import uuid
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -34,9 +33,7 @@ import structlog
 from ..mcp_sanitize import is_untrusted_server, sanitize_tool_name
 from ..paths import SandboxLayout, WorkspaceLayout
 from ..project_context import ProjectContext
-from ..tool_generator import union_key
 from .retry import RetryPolicy
-from .vault_helper import VAULTS_DIR, workspace_vault_path
 
 if TYPE_CHECKING:
     from .ptc_sandbox import PTCSandbox
@@ -136,25 +133,18 @@ def overlay_link_plan(
     layout: SandboxLayout,
     workspace: WorkspaceLayout,
     server_names: list[str],
-    union_keys: Mapping[str, str] | None = None,
 ) -> list[tuple[str, str]]:
-    """``(link, relative target)`` for one workspace's wrappers and docs.
-
-    A link is named by the server's display name and points at the union file
-    named by its key, so ``from tools.crm import ...`` reads the same in every
-    workspace while two workspaces' ``crm`` stay two files.
-    """
+    """``(link, relative target)`` for one workspace's wrappers and docs."""
     plan: list[tuple[str, str]] = []
     docs_dir = workspace.tools_docs
     for name in server_names:
-        key = (union_keys or {}).get(name, name)
         link = f"{workspace.tools}/{name}.py"
-        plan.append((link, _relative_link_target(link, f"{layout.tools}/{key}.py")))
+        plan.append((link, _relative_link_target(link, f"{layout.tools}/{name}.py")))
         if docs_dir is None:
             continue
         doc_link = f"{docs_dir}/{name}"
         plan.append(
-            (doc_link, _relative_link_target(doc_link, f"{layout.tools_docs}/{key}"))
+            (doc_link, _relative_link_target(doc_link, f"{layout.tools_docs}/{name}"))
         )
     return plan
 
@@ -163,7 +153,7 @@ def overlay_link_plan(
 # in the same batch as the wrappers, and the whole script is base64-wrapped
 # into the exec command line, which sidesteps shell quoting entirely.
 _SCRIPT = textwrap.dedent(r'''
-import fcntl, json, os, shutil, sys, time
+import errno, fcntl, json, os, shutil, sys, time
 
 with open("__ARGS_PATH__", encoding="utf-8") as _fh:
     ARGS = json.load(_fh)
@@ -181,7 +171,6 @@ WS_TOOLS = ARGS["wsTools"]
 WS_DOCS = ARGS["wsDocs"]
 WS_KEEP = set(ARGS["wsKeep"])
 WS_DOCS_KEEP = set(ARGS.get("wsDocsKeep") or SERVERS)
-VAULTS_DIR = ARGS.get("vaultsDir") or ""
 WS_CONFIG_PATH = ARGS["wsConfigPath"]
 WS_CONFIG = ARGS["wsConfig"]
 EXPECTED_DOCS = ARGS["expectedDocs"]
@@ -288,9 +277,7 @@ def merge_ledger(ledger):
         "transport",
         "untrusted",
         "relay_bound",
-        "vault_file",
         "credential_files",
-        "name",
     )
     old_executable = {
         name: {key: entry.get(key) for key in executable_keys if key in entry}
@@ -330,7 +317,12 @@ def merge_ledger(ledger):
 
 
 def remove(path):
-    """Delete a file, a link or a whole tree; True when something went."""
+    """Delete a file, a link or a whole tree; True when something went.
+
+    Another writer on the computer can take the path first (ENOENT) or drop a
+    file into a tree mid-delete (ENOTEMPTY). Neither is this pass failing, so
+    both report what is on disk instead of ending the sync.
+    """
     try:
         if os.path.islink(path) or os.path.isfile(path):
             os.unlink(path)
@@ -339,6 +331,8 @@ def remove(path):
             shutil.rmtree(path)
             return True
     except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTEMPTY):
+            return not os.path.lexists(path)
         fail("cannot remove %s: %s" % (path, exc))
     return False
 
@@ -352,21 +346,14 @@ def listdir(path):
         fail("cannot list %s: %s" % (path, exc))
 
 
-def prune_union(orphaned, dead=()):
-    """Drop what lost its last claim, plus docs for tools no longer exposed.
-
-    A dead claim's vault goes with it: the folder that could still read those
-    secrets is gone, and nothing else on the computer is meant to.
-    """
+def prune_union(orphaned):
+    """Drop what lost its last claim, plus docs for tools no longer exposed."""
     gone = []
     for name in orphaned:
         for path in (os.path.join(UNION_TOOLS, name + ".py"),
                      os.path.join(UNION_DOCS, name)):
             if remove(path):
                 gone.append(path)
-    for claim in sorted(dead):
-        if VAULTS_DIR and remove(os.path.join(VAULTS_DIR, claim + ".json")):
-            gone.append(os.path.join(VAULTS_DIR, claim + ".json"))
     # Inside a server this workspace does own, capability consent can withdraw
     # individual tools. The wrapper module is rewritten whole, the doc
     # directory is not, and the tool guide sends the agent here to find out
@@ -385,6 +372,10 @@ def prune_union(orphaned, dead=()):
     # absolute name; the copy beside them is unreachable.
     if remove(LEGACY_CLIENT):
         gone.append(LEGACY_CLIENT)
+    # _internal/vaults, the per-workspace vault files of the version before
+    # every workspace read the root one, stays: that version keeps serving
+    # this computer until its last turn drains, and reads them. The release
+    # after this one removes the directory here.
     return gone
 
 
@@ -428,17 +419,11 @@ def link_overlay():
 
 handle = acquire_flock()
 try:
-    before = read_ledger()
-    dead = dead_claims({
-        claim: dir_name
-        for claim, dir_name in (before.get("dirs") or {}).items()
-        if isinstance(dir_name, str)
-    })
-    ledger, orphaned = merge_ledger(before)
+    ledger, orphaned = merge_ledger(read_ledger())
     config = dict(WS_CONFIG)
     config["computer_config_version"] = ledger["config_version"]
     write_json(WS_CONFIG_PATH, config)
-    pruned = prune_union(orphaned, dead)
+    pruned = prune_union(orphaned)
     swept = sweep_overlay()
     linked = link_overlay()
     if ARGS.get("toolVersion"):
@@ -496,14 +481,6 @@ async def install_tool_modules(
     assert sandbox.runtime is not None
     tools_by_server = sandbox.mcp_registry.get_all_tools()
     server_names = sorted(tools_by_server)
-    # Union keys: a workspace-local server is filed under its owner's claim so
-    # a sibling's same-named server never replaces it. The overlay links the
-    # display name to the keyed file.
-    keys_by_name = {
-        s.name: union_key(s, project.claim) for s in sandbox.config.mcp.servers
-    }
-    key_of = {name: keys_by_name.get(name, name) for name in server_names}
-    vault_file = workspace_vault_path(layout.root, project.claim)
 
     uploads: list[tuple[bytes, str]] = []
 
@@ -515,16 +492,12 @@ async def install_tool_modules(
         server for server in sandbox.config.mcp.servers if server.enabled
     ]
     my_config = sandbox.tool_generator.generate_client_config(
-        enabled_servers,
-        working_dir=sandbox._work_dir,
-        claim=project.claim,
-        vault_file=vault_file,
+        enabled_servers, working_dir=sandbox._work_dir
     )
-    my_keys = set(key_of.values())
     my_entries = {
-        key: entry
-        for key, entry in (my_config.get("servers") or {}).items()
-        if key in my_keys
+        name: entry
+        for name, entry in (my_config.get("servers") or {}).items()
+        if name in tools_by_server
     }
     uploads.append(
         (
@@ -539,13 +512,12 @@ async def install_tool_modules(
         # trust map (config drift mid-sync) is treated as untrusted -- a wrong
         # guess here costs sanitization, not a docstring breakout.
         untrusted = untrusted_by_name.get(server_name, True)
-        key = key_of[server_name]
         uploads.append(
             (
                 sandbox.tool_generator.generate_tool_module(
-                    server_name, tools, untrusted=untrusted, union_key=key
+                    server_name, tools, untrusted=untrusted
                 ).encode("utf-8"),
-                f"{layout.tools}/{key}.py",
+                f"{layout.tools}/{server_name}.py",
             )
         )
         names: list[str] = []
@@ -557,10 +529,10 @@ async def install_tool_modules(
                     sandbox.tool_generator.generate_tool_documentation(
                         tool, untrusted=untrusted
                     ).encode("utf-8"),
-                    f"{layout.tools_docs}/{key}/{name}",
+                    f"{layout.tools_docs}/{server_name}/{name}",
                 )
             )
-        expected_docs[key] = names
+        expected_docs[server_name] = names
 
     # ``__init__.py`` for the union directory. Nothing imports it by that name
     # any more (the wrappers reach the client as a top-level ``mcp_client``),
@@ -587,19 +559,13 @@ async def install_tool_modules(
             | {"__init__.py", _WS_DOCS_DIRNAME, _WS_CONFIG_BASENAME}
         ),
         "wsDocsKeep": server_names,
-        "vaultsDir": f"{layout.root}/{VAULTS_DIR}",
         "wsConfigPath": workspace.mcp_client_config,
         "wsConfig": sandbox.tool_generator.generate_workspace_tool_config(
-            project.workspace_id,
-            project.dir_name or "",
-            sorted(my_keys),
-            labels={key: name for name, key in key_of.items()},
-            vault_file=vault_file,
+            project.workspace_id, project.dir_name or "", server_names
         ),
         "expectedDocs": expected_docs,
         "links": [
-            list(pair)
-            for pair in overlay_link_plan(layout, workspace, server_names, key_of)
+            list(pair) for pair in overlay_link_plan(layout, workspace, server_names)
         ],
         "legacyClient": f"{layout.tools}/mcp_client.py",
     }

@@ -39,7 +39,7 @@ from ..mcp_sanitize import (
 from ..tool_generator import MCP_CLIENT_CODEGEN_VERSION
 from ..project_context import ProjectContext, current_project
 from .tool_overlay import read_union_ledger
-from .vault_helper import workspace_vault_path
+from .vault_helper import VAULT_MODULE_SOURCE
 from ptc_agent.core.sandbox._shared import (
     _LOCK_VOLATILE_KEYS,
     _MCP_SHARED_RUNTIME_FILES,
@@ -58,9 +58,8 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
-ROOT_VAULT_CLAIM = "_root"
 _ASSET_SYNC_CONTEXT: ContextVar[
-    tuple[Any, tuple[Any, ...] | None, Mapping[str, Mapping[str, str]]] | None
+    tuple[Any, tuple[Any, ...] | None, Mapping[str, str] | None] | None
 ] = ContextVar("asset_sync_context", default=None)
 
 
@@ -69,9 +68,9 @@ def asset_sync_context(
     *,
     mcp_registry: Any,
     mcp_servers: tuple[Any, ...] | None,
-    vault_payloads: Mapping[str, Mapping[str, str]],
+    vault_secrets: Mapping[str, str] | None,
 ):
-    token = _ASSET_SYNC_CONTEXT.set((mcp_registry, mcp_servers, vault_payloads))
+    token = _ASSET_SYNC_CONTEXT.set((mcp_registry, mcp_servers, vault_secrets))
     try:
         yield
     finally:
@@ -105,80 +104,82 @@ async def _tool_sync_context(
             sandbox.config.mcp.servers = previous_servers
 
 
-async def _publish_changed_vaults(
+#: What :func:`_read_vault_digest` returns when the file could not be read:
+#: equal to no digest, so the file is written again rather than trusted.
+_VAULT_UNREADABLE = ""
+
+
+async def _read_vault_digest(sandbox: "PTCSandbox") -> str | None:
+    """sha256 of the root vault file as it sits on disk; None when absent.
+
+    The file is the truth, not a digest recorded beside it: the earlier
+    version writes the same path while it drains, and anything with a shell
+    can remove it, and either leaves a recorded digest describing a file that
+    is not there.
+    """
+    assert sandbox.runtime is not None
+    path = shlex.quote(sandbox.layout.vault_secrets)
+    result = await sandbox._runtime_call(
+        sandbox.runtime.exec,
+        f"if [ -e {path} ]; then sha256sum {path}; else echo absent; fi",
+        retry_policy=RetryPolicy.SAFE,
+    )
+    words = (result.stdout or "").split() if result.exit_code == 0 else []
+    if words[:1] == ["absent"]:
+        return None
+    if words and len(words[0]) == 64:
+        return words[0]
+    return _VAULT_UNREADABLE
+
+
+async def _publish_changed_vault(
     sandbox: "PTCSandbox",
-    vault_payloads: Mapping[str, Mapping[str, str]],
-    remote_manifest: dict[str, Any] | None,
-    local_manifest: dict[str, Any],
+    vault_secrets: Mapping[str, str] | None,
+    on_disk: str | None,
 ) -> bool:
-    prior = dict((remote_manifest or {}).get("vaults") or {})
-    published = dict(prior)
-    changed = False
-    if prior:
-        local_manifest["vaults"] = published
-    if not vault_payloads:
+    """Rewrite the root vault file unless it holds this content; True when it did.
+
+    ``None`` is a caller with nothing to say about the vault. ``on_disk`` is
+    :func:`_read_vault_digest`'s answer.
+    """
+    if vault_secrets is None:
+        return False
+    content = _canonical_vault_json(vault_secrets)
+    # No file rather than an empty one, so vault.list_names() is [].
+    wanted = hashlib.sha256(content).hexdigest() if vault_secrets else None
+    if on_disk == wanted:
         return False
     assert sandbox.runtime is not None
-
-    for claim, secrets in vault_payloads.items():
-        content = _canonical_vault_json(secrets)
-        digest = hashlib.sha256(content).hexdigest()
-        if prior.get(claim) == digest:
-            continue
-
-        path = (
-            sandbox.layout.vault_secrets
-            if claim == ROOT_VAULT_CLAIM
-            else workspace_vault_path(sandbox.layout.root, claim)
+    path = sandbox.layout.vault_secrets
+    if vault_secrets:
+        await sandbox._runtime_call(
+            sandbox.runtime.upload_file,
+            content,
+            path,
+            retry_policy=RetryPolicy.SAFE,
         )
-        if secrets:
-            if claim != ROOT_VAULT_CLAIM:
-                await sandbox._runtime_call(
-                    sandbox.runtime.exec,
-                    f"mkdir -p {shlex.quote(str(Path(path).parent))}",
-                    retry_policy=RetryPolicy.SAFE,
-                )
-            await sandbox._runtime_call(
-                sandbox.runtime.upload_file,
-                content,
-                path,
-                retry_policy=RetryPolicy.SAFE,
-            )
-        else:
-            await sandbox._runtime_call(
-                sandbox.runtime.exec,
-                f"rm -f {shlex.quote(path)}",
-                retry_policy=RetryPolicy.SAFE,
-            )
-        published[claim] = digest
-        changed = True
+    else:
+        await sandbox._runtime_call(
+            sandbox.runtime.exec,
+            f"rm -f {shlex.quote(path)}",
+            retry_policy=RetryPolicy.SAFE,
+        )
+    return True
 
-    if published:
-        local_manifest["vaults"] = published
-    return changed
+
+async def _no_vault_digest() -> None:
+    return None
 
 
 async def publish_vault_secrets(
-    sandbox: "PTCSandbox", vault_payloads: Mapping[str, Mapping[str, str]]
+    sandbox: "PTCSandbox", vault_secrets: Mapping[str, str]
 ) -> bool:
-    """Publish changed vault files while preserving the shared manifest."""
+    """Publish the root vault file unless it already holds this content."""
     await sandbox._wait_ready()
     async with sandbox._tool_refresh_lock:
-        remote = await sandbox._read_unified_manifest()
-        manifest = dict(
-            remote
-            or {
-                "schema_version": 1,
-                "layout_version": CURRENT_LAYOUT_VERSION,
-                "modules": {},
-            }
+        return await _publish_changed_vault(
+            sandbox, vault_secrets, await _read_vault_digest(sandbox)
         )
-        changed = await _publish_changed_vaults(
-            sandbox, vault_payloads, remote, manifest
-        )
-        if changed:
-            await sandbox._write_unified_manifest(manifest)
-        return changed
 
 
 def _compute_tool_schema_hash(sandbox: "PTCSandbox") -> str:
@@ -200,7 +201,7 @@ def _compute_tool_schema_hash(sandbox: "PTCSandbox") -> str:
 
 
 def _compute_user_mcp_config_hash(sandbox: "PTCSandbox") -> str:
-    """Hash untrusted (``source`` 'workspace'/'user') server CONFIG — never secrets.
+    """Hash untrusted (non-builtin) server CONFIG, never secrets.
 
     Captures transport/command/args/url, the full env/header maps (literal
     values AND ``${vault:NAME}`` ref strings — the stored values are never
@@ -233,8 +234,6 @@ def _compute_user_mcp_config_hash(sandbox: "PTCSandbox") -> str:
         # rotates on every reconnect and would force uploads that change
         # nothing. Written only when bound, so an unbound workspace's hash stays
         # byte-identical to a pre-binding sandbox and never re-uploads.
-        # Always absent for 'workspace' servers: only catalog rows can carry a
-        # connection, and a stored workspace blob has the field stripped.
         if getattr(server, "oauth_connection_id", None):
             payload["oauth_bound"] = True
         parts.append(json.dumps(payload, sort_keys=True))
@@ -418,6 +417,13 @@ async def _compute_sandbox_manifest(
     internal_files = {
         str(rel): _sha256_file(local) for local, rel in _internal_package_files(src_dir)
     }
+    if internal_files:
+        # The vault helper ships in the same upload but is generated rather
+        # than read from a file, so its source is hashed here; otherwise an
+        # edit to it never reaches a warm sandbox.
+        internal_files["vault.py"] = hashlib.sha256(
+            VAULT_MODULE_SOURCE.encode("utf-8")
+        ).hexdigest()
     modules["internal_packages"] = {
         "version": _hash_dict(internal_files),
         "files": internal_files,
@@ -672,7 +678,7 @@ async def sync_sandbox_assets(
     on_progress: Callable[[str], None] | None = None,
     mcp_registry: Any = None,
     mcp_servers: tuple[Any, ...] | None = None,
-    vault_payloads: Mapping[str, Mapping[str, str]] | None = None,
+    vault_secrets: Mapping[str, str] | None = None,
 ) -> SyncResult:
     """Sync all sandbox assets using a single unified manifest.
 
@@ -717,8 +723,8 @@ async def sync_sandbox_assets(
             mcp_registry = bound[0]
         if mcp_servers is None:
             mcp_servers = bound[1]
-        if vault_payloads is None:
-            vault_payloads = bound[2]
+        if vault_secrets is None:
+            vault_secrets = bound[2]
 
     # Fold the managed user tier into the source list (last, so it can never
     # be overridden); which root is managed travels separately.
@@ -758,7 +764,13 @@ async def sync_sandbox_assets(
         # _read_unified_manifest → sandbox HTTP GET
         skill_roots = [d for d, _ in skill_dirs] if skill_dirs else None
 
-        _, local_manifest, remote_manifest, union_ledger = await asyncio.gather(
+        (
+            _,
+            local_manifest,
+            remote_manifest,
+            union_ledger,
+            vault_on_disk,
+        ) = await asyncio.gather(
             sandbox._prune_disabled_tool_modules(project=project),
             sandbox._compute_sandbox_manifest(
                 skill_roots=skill_roots,
@@ -769,9 +781,12 @@ async def sync_sandbox_assets(
                 workspace_id=workspace_id,
             ),
             sandbox._read_unified_manifest(),
-            # The claim read rides along with the manifest's, so it costs no
-            # wall time.
+            # The claim and vault reads ride along with the manifest's, so
+            # they cost no wall time.
             read_union_ledger(sandbox, SandboxLayout(sandbox._work_dir)),
+            _read_vault_digest(sandbox)
+            if vault_secrets is not None
+            else _no_vault_digest(),
         )
         tool_version = local_manifest["modules"]["tool_modules"]["version"]
         # The shared manifest may describe a sibling that discovered identical
@@ -797,9 +812,7 @@ async def sync_sandbox_assets(
         # Only stamp after every migration succeeds; failure leaves the old
         # manifest intact so the next acquisition retries the move.
         local_manifest["layout_version"] = layout_version
-        vault_changed = await _publish_changed_vaults(
-            sandbox, vault_payloads or {}, remote_manifest, local_manifest
-        )
+        await _publish_changed_vault(sandbox, vault_secrets, vault_on_disk)
 
         # 3. Determine which modules changed (pure CPU)
         if force_refresh or remote_manifest is None or not reusing_sandbox:
@@ -843,7 +856,7 @@ async def sync_sandbox_assets(
                         )
                 if sandbox._skills_manifest is None:
                     sandbox._skills_manifest = skills_mod
-            if not (layout_moved or overlay_missing or vault_changed):
+            if not (layout_moved or overlay_missing):
                 return SyncResult(
                     refreshed_modules=[],
                     forced=False,

@@ -53,7 +53,11 @@ def _no_secret_db_lookup(monkeypatch):
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        "src.server.database.vault_secrets.get_effective_secrets",
+        "src.server.database.workspace.get_workspace",
+        AsyncMock(return_value=_make_workspace()),
+    )
+    monkeypatch.setattr(
+        "src.server.database.user_vault_secrets.get_user_secrets_decrypted",
         AsyncMock(return_value={}),
     )
 

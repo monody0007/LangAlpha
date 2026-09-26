@@ -20,6 +20,7 @@ from src.server.models.mcp_server import (
     isolation_warnings,
     normalize_transport,
     parse_mcp_servers_payload,
+    sandbox_name_error,
     validate_remote_url,
 )
 
@@ -51,7 +52,7 @@ def test_name_accepts_valid(name):
 
 
 @pytest.mark.parametrize(
-    "name", ["1bad", "has-dash", "has.dot", "", "a" * 65, "has space"]
+    "name", ["1bad", "has-dash", "has.dot", "", "a" * 65, "has space", "trailing\n"]
 )
 def test_name_rejects_invalid(name):
     with pytest.raises(ValidationError):
@@ -66,21 +67,28 @@ def test_name_rejects_invalid(name):
         ("__private", "must not start with '__'"),
         ("class", "Python keyword"),
         ("None", "Python keyword"),
-        ("match", "Python keyword"),
-        ("type", "Python keyword"),
-        ("_", "Python keyword"),
+        ("await", "Python keyword"),
     ],
 )
-def test_name_rejects_what_the_sandbox_reserves(name, reason):
+def test_sandbox_reserves_the_runtime_dunders_and_hard_keywords(name, reason):
     # The name becomes a module in the sandbox's tools package, so the message
     # has to say that rather than restate the shape rule the name passes.
-    with pytest.raises(ValidationError, match=reason):
-        McpServerInput(**_stdio(name=name))
+    assert reason in (sandbox_name_error(name) or "")
 
 
-@pytest.mark.parametrize("name", ["class_server", "mcp_client_v2", "_private", "Type"])
-def test_name_near_a_reserved_one_is_accepted(name):
+@pytest.mark.parametrize(
+    "name", ["match", "case", "type", "_", "class_server", "mcp_client_v2", "_private", "Type"]
+)
+def test_sandbox_accepts_soft_keywords_and_near_misses(name):
+    # ``from tools.match import ...`` parses: a soft keyword is a legal module.
+    assert sandbox_name_error(name) is None
     assert McpServerInput(**_stdio(name=name)).name == name
+
+
+def test_the_model_checks_shape_only_so_an_edit_keeps_a_reserved_name():
+    # The doors that introduce a name refuse a reserved one; the model also
+    # carries edits of rows saved before their name was reserved.
+    assert McpServerInput(**_stdio(name="class")).name == "class"
 
 
 # ---------------------------------------------------------------------------
@@ -509,22 +517,30 @@ def test_coerce_mcp_name_passthrough_when_already_legal():
     "raw,expected",
     [
         ("class", "class_server"),
-        ("match", "match_server"),
         ("mcp_client", "mcp_client_server"),
         ("mcp-client", "mcp_client_server"),
         ("__init__", "init__"),
         ("__class", "class_server"),
         ("__3d", "_3d"),
-        ("_", "server"),
         ("---", "server"),
     ],
 )
 def test_coerce_mcp_name_renames_what_the_sandbox_reserves(raw, expected):
     # Import and plugin install rename rather than drop the entry, and what
-    # they produce has to pass the same validator a hand-typed name does.
+    # they produce has to pass the same check a hand-typed name does.
     name, renamed = coerce_mcp_name(raw)
     assert (name, renamed) == (expected, True)
-    assert McpServerInput(**_stdio(name=name)).name == expected
+    assert sandbox_name_error(name) is None
+
+
+@pytest.mark.parametrize("raw", ["match", "type", "_"])
+def test_coerce_mcp_name_keeps_a_soft_keyword(raw):
+    assert coerce_mcp_name(raw) == (raw, False)
+
+
+def test_coerce_mcp_name_counts_an_astral_character_once():
+    # One code point, one underscore: the web preview has to agree.
+    assert coerce_mcp_name("rocket\U0001F680mcp") == ("rocket_mcp", True)
 
 
 def test_parse_reports_a_reserved_key_as_renamed():
@@ -689,15 +705,21 @@ def test_probe_input_rejects_a_transport():
         ProbeInput(url="https://api.example.com/mcp", transport="sse")
 
 
+def test_probe_input_accepts_the_workspace_an_earlier_form_sends():
+    """A page loaded from the previous web build still sends one, and a 422
+    there would break the add form until the page reloads."""
+    parsed = ProbeInput(url="https://api.example.com/mcp", workspace_id="ws-1")
+
+    assert parsed.url == "https://api.example.com/mcp"
+
+
 def test_probe_input_keeps_the_fields_the_route_does_read():
     parsed = ProbeInput(
         url="https://api.example.com/mcp",
         headers={"Authorization": "${vault:API_KEY}"},
-        workspace_id="ws-1",
     )
 
     assert parsed.headers == {"Authorization": "${vault:API_KEY}"}
-    assert parsed.workspace_id == "ws-1"
 
 
 def test_the_verdict_vocabulary_matches_the_client_copy():

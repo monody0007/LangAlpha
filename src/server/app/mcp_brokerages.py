@@ -33,6 +33,7 @@ from src.server.models.mcp_server import (
     EnabledInput,
     McpServerInput,
     brokerage_to_response,
+    sandbox_name_error,
 )
 from src.server.services.brand_icons import icon_response
 from src.server.services.brokerages import (
@@ -74,6 +75,9 @@ async def _create_brokerage_row(user_id: str, brokerage: Brokerage) -> None:
             status_code=409,
             detail=f"{brokerage.name!r} collides with a built-in server name",
         )
+    # A create like any other, so the names the sandbox reserves hold here too.
+    if reason := sandbox_name_error(brokerage.name):
+        raise HTTPException(status_code=422, detail=reason)
     try:
         # Through the same validator every user-written row passes, so our own
         # definition cannot be the one payload that skips the URL policy. Its

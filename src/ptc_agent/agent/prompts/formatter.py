@@ -23,7 +23,7 @@ TOOL_SUMMARY_TEMPLATE = """
 
 TOOL_ITEM_TEMPLATE = "  - {tool_name}({parameters}) -> {return_type}: {description}"
 
-# Hard caps for untrusted (source 'workspace' or 'user') server-level text
+# Hard caps for untrusted (source 'user') server-level text
 # rendered into the prompt. Match the API write-time caps so a user can't
 # balloon the prompt.
 WORKSPACE_DESCRIPTION_MAX_LEN = 512

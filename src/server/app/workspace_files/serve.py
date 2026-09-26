@@ -414,7 +414,7 @@ async def serve_workspace_file(
     # route. Genuine binary fails to decode and is served verbatim, so we also
     # skip the per-asset vault fetch for it.
     if _is_text_content_type(content_type) or _is_utf8(content):
-        vault_secrets = await get_vault_secrets_for_redaction(workspace_id)
+        vault_secrets = await get_vault_secrets_for_redaction(workspace["user_id"])
         content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
     if inject_theme and _is_html_content_type(content_type):

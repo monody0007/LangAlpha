@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 
 from src.server.database.computer import get_computer_for_workspace
+from src.server.database.session_lock import await_settled
 from src.server.database.workspace import (
     get_workspace as db_get_workspace,
     get_workspace_identity as db_get_workspace_identity,
@@ -41,30 +42,62 @@ from src.server.services.user_skills.reconcile import reconcile_workspace_skills
 
 logger = logging.getLogger(__name__)
 
+_VAULT_SETTLE_ATTEMPTS = 5
+
 
 class McpSecretsMixin:
-    async def _vault_payloads(
+    async def _vault_snapshot(
         self, workspace_id: str, user_id: str | None
-    ) -> tuple[str | None, dict[str, dict[str, str]]]:
-        from ptc_agent.core.sandbox.assets import ROOT_VAULT_CLAIM
-        from src.server.database.user_vault_secrets import get_user_secrets_decrypted
-        from src.server.database.vault_secrets import get_effective_secrets
+    ) -> tuple[str | None, dict[str, str], str]:
+        """The workspace owner, whose vault every workspace on the computer
+        reads, with that vault and its fingerprint; no owner reads as empty."""
+        from src.server.database.user_vault_secrets import get_user_vault_snapshot
 
         if user_id is None:
             workspace = await db_get_workspace(workspace_id)
             user_id = (workspace or {}).get("user_id")
+        if not user_id:
+            return None, {}, ""
+        secrets, fingerprint = await get_user_vault_snapshot(user_id)
+        return user_id, secrets, fingerprint
 
-        effective, user_tier = await asyncio.gather(
-            get_effective_secrets(workspace_id, user_id),
-            get_user_secrets_decrypted(user_id)
-            if user_id
-            else asyncio.sleep(0, result={}),
+    async def _settle_vault(
+        self,
+        user_id: str,
+        sandbox: "PTCSandbox",
+        secrets: dict[str, str],
+        fingerprint: str,
+        *,
+        published: bool = False,
+    ) -> dict[str, str]:
+        """Publish ``secrets`` until the committed vault stops moving; returns
+        what the file was left holding. ``published``: the caller already wrote it.
+
+        Writers decrypt outside the sandbox's lock, which is per worker anyway,
+        so an older decrypt can land last. The last write to the file is always
+        followed by its writer's re-read, which sees a committed state at least
+        as new as anything an earlier writer decrypted, and every commit also
+        pushes, so the file converges on the committed vault.
+        """
+        from ptc_agent.core.sandbox.assets import publish_vault_secrets
+        from src.server.database.user_vault_secrets import (
+            get_user_vault_fingerprint,
+            get_user_vault_snapshot,
         )
-        claim = ProjectContext(workspace_id, "").claim
-        return user_id, {
-            ROOT_VAULT_CLAIM: dict(user_tier),
-            claim: dict(effective),
-        }
+
+        if not published:
+            await publish_vault_secrets(sandbox, secrets)
+        for _ in range(_VAULT_SETTLE_ATTEMPTS):
+            if await get_user_vault_fingerprint(user_id) == fingerprint:
+                return secrets
+            secrets, fingerprint = await get_user_vault_snapshot(user_id)
+            await publish_vault_secrets(sandbox, secrets)
+        logger.warning(
+            f"[vault] still changing after {_VAULT_SETTLE_ATTEMPTS} republishes; "
+            "leaving it to the next change's push",
+            extra={"user_id": user_id},
+        )
+        return secrets
 
     async def _apply_session_platform_secret(
         self,
@@ -104,44 +137,55 @@ class McpSecretsMixin:
         if applied is not None:
             session.platform_secret_version = applied
 
-    async def push_vault_secrets(
-        self,
-        workspace_id: str,
-        sandbox: "PTCSandbox | None" = None,
-        user_id: str | None = None,
-    ) -> None:
-        """Pass the sandbox during startup, before the session enters the cache.
+    async def push_user_vault(self, user_id: str, workspace_ids: list[str]) -> int:
+        """Publish the owner's vault once to each computer this worker serves.
 
-        Two files on the computer: the root vault carries the owner's user tier,
-        which every server shared across the machine's workspaces reads, and the
-        workspace's own file carries its effective set (get_effective_secrets
-        owns that precedence: workspace secrets shadow user secrets), which its
-        workspace-local servers and the ``vault`` helper read. One file for all
-        would let each workspace's push overwrite its siblings' credentials."""
-        if sandbox is None:
-            # Mutation fan-outs report no failure; a stale handle would silently update
-            # the wrong sandbox. Decline and let the version bump drive convergence.
+        Every workspace on a computer reads its one root file, so siblings on a
+        computer share one publish, and the vault is decrypted once, only when
+        a live session will receive it. A handle whose sandbox the workspace no
+        longer names is skipped: mutation fan-outs report no failure, and the
+        version bump drives convergence there. Returns the computers reached.
+        """
+        sandboxes: dict[str, "PTCSandbox"] = {}
+        for workspace_id in workspace_ids:
+            computer_id = self._live_session_computer(workspace_id)
+            if computer_id is None or computer_id in sandboxes:
+                continue
             identity = await db_get_workspace_identity(workspace_id)
             session = self.get_session_if_ready(
                 workspace_id, expected_sandbox_id=(identity or {}).get("sandbox_id")
             )
-            if session is None:
-                return
-            sandbox = session.sandbox
+            if session is not None:
+                sandboxes[computer_id] = session.sandbox
+        if not sandboxes:
+            return 0
 
-        from ptc_agent.core.sandbox.assets import publish_vault_secrets
+        from src.server.database.user_vault_secrets import get_user_vault_snapshot
 
-        user_id, payloads = await self._vault_payloads(workspace_id, user_id)
-        await publish_vault_secrets(sandbox, payloads)
-        claim = ProjectContext(workspace_id, "").claim
-        secrets = payloads[claim]
-        user_tier = payloads[next(iter(payloads))]
-        sandbox.vault_secrets = dict(secrets)
+        secrets, fingerprint = await get_user_vault_snapshot(user_id)
+        reached = 0
+        for computer_id, sandbox in sandboxes.items():
+            try:
+                # Outlives the route's cancellation: a write left without its
+                # re-read is exactly the stale write the settle is there to catch.
+                published = await await_settled(
+                    asyncio.ensure_future(
+                        self._settle_vault(user_id, sandbox, secrets, fingerprint)
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    f"[vault] push to computer {computer_id} failed",
+                    exc_info=True,
+                )
+                continue
+            sandbox.vault_secrets = dict(published)
+            reached += 1
         logger.debug(
-            f"[vault] Pushed {len(secrets)} workspace and {len(user_tier)} "
-            "user-tier secret(s) to sandbox",
-            extra={"workspace_id": workspace_id},
+            f"[vault] Pushed {len(secrets)} secret(s) to {reached} computer(s)",
+            extra={"user_id": user_id},
         )
+        return reached
 
     @staticmethod
     async def _mint_sandbox_tokens(

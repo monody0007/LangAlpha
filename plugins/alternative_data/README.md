@@ -6,10 +6,10 @@ scraping.
 ## `x_api` ships with an empty `env` on purpose
 
 The bearer token reaches the tool as a per-call argument read from the
-workspace vault (`from vault import get; get("X_BEARER_TOKEN")`), never from
-the MCP subprocess environment. In a multi-tenant deployment every workspace
-gets its own token that way; putting it in `env` would hand one host-wide
-token to all of them.
+vault (`from vault import get; get("X_BEARER_TOKEN")`), never from the MCP
+subprocess environment. In a multi-tenant deployment every user gets their own
+token that way; putting it in `env` would hand one host-wide token to all of
+them.
 
 A single-tenant self-host that wants the convenience can add
 `"X_BEARER_TOKEN": "${X_BEARER_TOKEN}"` to the server's `env` in `mcp.json`.

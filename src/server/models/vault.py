@@ -10,7 +10,7 @@ import re
 
 from pydantic import BaseModel, Field, field_validator
 
-_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 
 _NUL_MESSAGE = "Value must not contain a null byte"
 

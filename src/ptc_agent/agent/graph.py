@@ -279,12 +279,13 @@ async def build_ptc_graph_with_session(
         _read_workspace_naming(workspace_id),
     )
 
-    if workspace_id:
-        from src.server.database.vault_secrets import get_effective_secrets
+    if workspace_id and user_id:
+        from src.server.database.user_vault_secrets import get_user_secrets_decrypted
 
-        # Snapshot this project's credentials for this graph. The shared sandbox's
-        # mutable value may already belong to a sibling that acquired it later.
-        vault_secrets = await get_effective_secrets(workspace_id, user_id=user_id)
+        # Leak detection redacts the owner's whole vault, read fresh: every
+        # workspace can read every secret, and the sandbox's cached copy is
+        # process-local, so a rotation handled by another worker leaves it stale.
+        vault_secrets = await get_user_secrets_decrypted(user_id)
     else:
         vault_secrets = dict(getattr(session.sandbox, "vault_secrets", None) or {})
 

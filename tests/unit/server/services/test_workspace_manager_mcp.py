@@ -11,9 +11,11 @@ here is a computer id and every entry point takes a ``ComputerBinding``.
 """
 
 import asyncio
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -123,7 +125,7 @@ def _make_session(*, version=None, summary=None, config_owner="ws"):
     return session
 
 
-def _srv(name, *, source="workspace", oauth_connection_id=None):
+def _srv(name, *, source="user", oauth_connection_id=None):
     """A stand-in server config (MagicMock: only the read fields matter)."""
     server = MagicMock()
     server.name = name
@@ -133,8 +135,8 @@ def _srv(name, *, source="workspace", oauth_connection_id=None):
 
 
 def _resolved(version, servers=None):
-    """A real ResolvedMCP whose ``servers`` are workspace-local entries."""
-    return resolved_mcp(version=version, local=list(servers or []))
+    """A real ResolvedMCP whose ``servers`` are active user entries."""
+    return resolved_mcp(version=version, inherited=list(servers or []))
 
 
 def _patch_certify():
@@ -926,9 +928,9 @@ class TestVersionDeltaBackgroundDiscovery:
             transport="stdio",
             command="npx",
             args=["-y", "zero-tool-server"],
-            source="workspace",
+            source="user",
         )
-        resolved = resolved_mcp(version=2, local=[server])
+        resolved = resolved_mcp(version=2, inherited=[server])
 
         with (
             patch(
@@ -971,9 +973,9 @@ class TestVersionDeltaBackgroundDiscovery:
             transport="stdio",
             command="npx",
             args=["-y", "flaky-server"],
-            source="workspace",
+            source="user",
         )
-        resolved = resolved_mcp(version=2, local=[server])
+        resolved = resolved_mcp(version=2, inherited=[server])
 
         with (
             patch(
@@ -1790,9 +1792,12 @@ class TestSetComputerSpecDiskGuard:
         assert self._settled_error() == "disk_too_small"
 
 
-class TestVaultPushWritesEachTier:
-    """One file per tier: the root carries the user's secrets every shared
-    server reads, the workspace file carries its own effective set."""
+_VAULT_DB = "src.server.database.user_vault_secrets"
+
+
+class TestVaultPushPublishesTheOwnersVault:
+    """Every workspace on a computer reads the one root file, so a push
+    publishes the owner's vault once per computer this worker serves."""
 
     def setup_method(self):
         from src.server.services.computer_manager import ComputerManager
@@ -1804,63 +1809,136 @@ class TestVaultPushWritesEachTier:
 
         ComputerManager.reset_instance()
 
+    @staticmethod
+    def _serving(manager, computers: dict[str, str], ready: set[str]):
+        """Workspaces live on *computers*; the ones in *ready* have a session."""
+        sandboxes = {c: MagicMock(name=c) for c in set(computers.values())}
+        manager._live_session_computer = MagicMock(side_effect=computers.get)
+        manager.get_session_if_ready = MagicMock(
+            side_effect=lambda wid, expected_sandbox_id: (
+                SimpleNamespace(sandbox=sandboxes[computers[wid]])
+                if wid in ready
+                else None
+            )
+        )
+        return sandboxes
+
     @pytest.mark.asyncio
-    async def test_the_user_tier_and_the_workspace_set_land_in_their_own_files(
-        self,
-    ):
+    async def test_siblings_share_one_publish_and_one_decrypt(self):
         from src.server.services.computer_manager import ComputerManager
 
         manager = ComputerManager.get_instance(config=_make_config())
-        sandbox = MagicMock()
-        sandbox.layout.root = "/home/workspace"
-        effective = AsyncMock(return_value={"API_KEY": "ws-value", "SEC": "user"})
-        user_tier = AsyncMock(return_value={"API_KEY": "user-value", "SEC": "user"})
+        sandboxes = self._serving(
+            manager,
+            {"ws-a": "comp-1", "ws-b": "comp-1", "ws-c": "comp-2"},
+            ready={"ws-a", "ws-b", "ws-c"},
+        )
+        vault = AsyncMock(return_value=({"API_KEY": "user-value"}, "fp-1"))
         publish = AsyncMock(return_value=True)
         with (
-            patch("src.server.database.vault_secrets.get_effective_secrets", effective),
             patch(
-                "src.server.database.user_vault_secrets.get_user_secrets_decrypted",
-                user_tier,
+                "src.server.services.computer_manager._mcp.db_get_workspace_identity",
+                AsyncMock(return_value={"sandbox_id": "sb"}),
+            ),
+            patch(f"{_VAULT_DB}.get_user_vault_snapshot", vault),
+            patch(
+                f"{_VAULT_DB}.get_user_vault_fingerprint",
+                AsyncMock(return_value="fp-1"),
             ),
             patch("ptc_agent.core.sandbox.assets.publish_vault_secrets", publish),
         ):
-            await manager.push_vault_secrets("ws-a", sandbox, user_id="user-1")
+            reached = await manager.push_user_vault("user-1", ["ws-a", "ws-b", "ws-c"])
 
-        effective.assert_awaited_once_with("ws-a", "user-1")
-        user_tier.assert_awaited_once_with("user-1")
-        publish.assert_awaited_once_with(
-            sandbox,
-            {
-                "_root": {"API_KEY": "user-value", "SEC": "user"},
-                "ws-a": {"API_KEY": "ws-value", "SEC": "user"},
-            },
-        )
+        assert reached == 2
+        vault.assert_awaited_once_with("user-1")
+        assert [c.args[0] for c in publish.await_args_list] == [
+            sandboxes["comp-1"], sandboxes["comp-2"],
+        ]
+        # Kept for the redactor.
+        assert sandboxes["comp-1"].vault_secrets == {"API_KEY": "user-value"}
 
     @pytest.mark.asyncio
-    async def test_the_owner_is_read_off_the_workspace_when_not_given(self):
+    async def test_nothing_is_decrypted_without_a_live_session(self):
         from src.server.services.computer_manager import ComputerManager
 
         manager = ComputerManager.get_instance(config=_make_config())
-        sandbox = MagicMock()
-        sandbox.layout.root = "/home/workspace"
-        user_tier = AsyncMock(return_value={})
-        publish = AsyncMock(return_value=False)
+        self._serving(manager, {"ws-a": "comp-1"}, ready=set())
+        vault = AsyncMock(return_value=({}, ""))
+        publish = AsyncMock()
         with (
             patch(
-                "src.server.services.computer_manager._mcp.db_get_workspace",
-                AsyncMock(return_value={"user_id": "owner-9"}),
+                "src.server.services.computer_manager._mcp.db_get_workspace_identity",
+                AsyncMock(return_value={"sandbox_id": "sb"}),
             ),
-            patch(
-                "src.server.database.vault_secrets.get_effective_secrets",
-                AsyncMock(return_value={}),
-            ),
-            patch(
-                "src.server.database.user_vault_secrets.get_user_secrets_decrypted",
-                user_tier,
-            ),
+            patch(f"{_VAULT_DB}.get_user_vault_snapshot", vault),
             patch("ptc_agent.core.sandbox.assets.publish_vault_secrets", publish),
         ):
-            await manager.push_vault_secrets("ws-a", sandbox)
+            reached = await manager.push_user_vault("user-1", ["ws-a", "ws-z"])
 
-        user_tier.assert_awaited_once_with("owner-9")
-        publish.assert_awaited_once_with(sandbox, {"_root": {}, "ws-a": {}})
+        assert reached == 0
+        vault.assert_not_awaited()
+        publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_older_decrypt_that_lands_last_is_replaced(self):
+        """Two workers, each with its own lock, push to one sandbox: the one
+        holding the retired value decrypts first and uploads last."""
+        from ptc_agent.core.sandbox.assets import _canonical_vault_json
+        from src.server.services.computer_manager._mcp import McpSecretsMixin
+
+        path, files = "/root/_internal/.vault_secrets.json", {}
+        committed = {"vault": {"API_KEY": "v1-retired"}, "fp": "fp-1"}
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def run(cmd):
+            digest = (
+                hashlib.sha256(files[path]).hexdigest() if path in files else "absent"
+            )
+            return SimpleNamespace(exit_code=0, stdout=f"{digest} {path}")
+
+        def worker(slow: bool):
+            async def upload(content, target):
+                if slow and not release.is_set():
+                    held.set()
+                    await release.wait()
+                files[target] = content
+
+            sandbox = SimpleNamespace(
+                runtime=SimpleNamespace(exec=run, upload_file=upload),
+                layout=SimpleNamespace(vault_secrets=path),
+                _tool_refresh_lock=asyncio.Lock(),
+                _wait_ready=AsyncMock(),
+                _runtime_call=lambda fn, *args, **_: fn(*args),
+            )
+            manager = McpSecretsMixin()
+            manager._live_session_computer = lambda wid: "comp-1"
+            manager.get_session_if_ready = lambda wid, expected_sandbox_id: (
+                SimpleNamespace(sandbox=sandbox)
+            )
+            return manager, sandbox
+
+        fingerprint = AsyncMock(side_effect=lambda uid: committed["fp"])
+        (older, older_sandbox), (newer, _) = worker(slow=True), worker(slow=False)
+        with (
+            patch(
+                "src.server.services.computer_manager._mcp.db_get_workspace_identity",
+                AsyncMock(return_value={"sandbox_id": "sb"}),
+            ),
+            patch(
+                f"{_VAULT_DB}.get_user_vault_snapshot",
+                AsyncMock(
+                    side_effect=lambda uid: (dict(committed["vault"]), committed["fp"])
+                ),
+            ),
+            patch(f"{_VAULT_DB}.get_user_vault_fingerprint", fingerprint),
+        ):
+            first = asyncio.create_task(older.push_user_vault("user-1", ["ws-a"]))
+            await held.wait()
+            committed.update(vault={"API_KEY": "v2-current"}, fp="fp-2")
+            await newer.push_user_vault("user-1", ["ws-a"])
+            release.set()
+            await first
+
+        assert files[path] == _canonical_vault_json({"API_KEY": "v2-current"})
+        assert fingerprint.await_count == 3  # one re-read after each of three writes
+        assert older_sandbox.vault_secrets == {"API_KEY": "v2-current"}

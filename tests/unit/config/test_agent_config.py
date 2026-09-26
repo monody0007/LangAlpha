@@ -234,7 +234,7 @@ class TestAgentConfigToCoreConfig:
         assert core.filesystem is not config.filesystem
         # Mutating the per-workspace copy leaves the source AgentConfig untouched.
         core.mcp.servers.append(
-            MCPServerConfig(name="injected", source="workspace")
+            MCPServerConfig(name="injected", source="user")
         )
         assert config.mcp.servers == []
 

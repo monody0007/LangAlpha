@@ -322,3 +322,40 @@ async def test_a_row_that_drifted_is_still_rewritten():
     assert edit.await_args.args[2]["args"] == ["thing@1.0.0"]
     result = next(c for c in report.components if c.kind == "mcp")
     assert result.status == "updated"
+
+
+@pytest.mark.asyncio
+async def test_a_row_under_a_since_reserved_name_still_updates():
+    """The update arm writes under the row's own name, so a row installed
+    before that name was reserved has to pass. Refusing it left delete and
+    reinstall, which takes the OAuth connection, tool schemas, per-workspace
+    switches and plugin ownership with the row."""
+    package = _package(mcp={"class": _STDIO_ENTRY["svc"]})
+    existing = {**_SETTLED_ROW, "name": "class", "args": ["thing@0.9.0"]}
+    edit = AsyncMock(return_value={"name": "class"})
+    report = InstallReport()
+    with (
+        patch(
+            "src.server.services.plugins.update.list_plugin_server_names",
+            new=AsyncMock(
+                return_value=[{"name": "class", "plugin_server_key": "class"}]
+            ),
+        ),
+        patch(
+            "src.server.services.plugins.update.get_catalog_server",
+            new=AsyncMock(return_value=existing),
+        ),
+        patch(
+            "src.server.services.plugins.update.get_user_secret_names",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "src.server.services.plugins.update.apply_catalog_edit", new=edit
+        ),
+    ):
+        await _update_servers(USER, PLUGIN_ID, package, report)
+
+    edit.assert_awaited_once()
+    assert edit.await_args.args[1] == "class"
+    result = next(c for c in report.components if c.kind == "mcp")
+    assert (result.status, result.name) == ("updated", "class")

@@ -5,6 +5,7 @@ detection, and untrusted-text neutralization for user MCP servers.
 """
 
 import ast
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,13 +36,7 @@ class _Tool:
 class TestIsUserServer:
     """The trust-boundary predicate: everything user-configured is untrusted."""
 
-    def test_workspace_source_is_untrusted(self):
-        srv = MCPServerConfig(name="s", transport="stdio", command="npx", source="workspace")
-        assert is_untrusted_server(srv) is True
-
     def test_user_source_is_untrusted(self):
-        # Inherited (Connectors) servers must sanitize exactly like
-        # workspace-local ones — user-supplied either way.
         srv = MCPServerConfig(name="s", transport="stdio", command="npx", source="user")
         assert is_untrusted_server(srv) is True
 
@@ -55,13 +50,19 @@ class TestIsUserServer:
 
         assert is_untrusted_server(Bare()) is False
 
+    @pytest.mark.parametrize("source", ["workspace", "plugin", "", None])
+    def test_an_unknown_source_is_untrusted(self, source):
+        # Trust is granted by name, so a tier this code does not know gets the
+        # scoped environment rather than the sandbox's whole one.
+        assert is_untrusted_server(SimpleNamespace(source=source)) is True
+
 
 class TestDiscoveryShouldUseSecrets:
     """Effective discovery-secret gating (auth'd remote servers self-enable)."""
 
     def test_explicit_flag_wins(self):
         srv = MCPServerConfig(
-            name="s", transport="stdio", command="npx", source="workspace",
+            name="s", transport="stdio", command="npx", source="user",
             discovery_uses_secrets=True,
         )
         assert discovery_should_use_secrets(srv) is True
@@ -69,14 +70,14 @@ class TestDiscoveryShouldUseSecrets:
     def test_remote_vault_header_auto_enables(self):
         srv = MCPServerConfig(
             name="s", transport="http", url="https://api.example.com/m",
-            headers={"Authorization": "${vault:K}"}, source="workspace",
+            headers={"Authorization": "${vault:K}"}, source="user",
         )
         assert discovery_should_use_secrets(srv) is True
 
     def test_remote_without_vault_header_stays_off(self):
         srv = MCPServerConfig(
             name="s", transport="http", url="https://api.example.com/m",
-            headers={"X-Trace": "literal"}, source="workspace",
+            headers={"X-Trace": "literal"}, source="user",
         )
         assert discovery_should_use_secrets(srv) is False
 
@@ -84,7 +85,7 @@ class TestDiscoveryShouldUseSecrets:
         # Stdio runs untrusted code — the flag must stay opt-in there.
         srv = MCPServerConfig(
             name="s", transport="stdio", command="npx",
-            env={"TOK": "${vault:K}"}, source="workspace",
+            env={"TOK": "${vault:K}"}, source="user",
         )
         assert discovery_should_use_secrets(srv) is False
 

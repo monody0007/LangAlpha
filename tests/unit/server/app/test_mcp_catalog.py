@@ -19,7 +19,6 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from src.server.database.mcp_servers import MAX_CATALOG_SERVERS_PER_USER
-from src.server.services.vault_invalidation import USER_TIER
 from tests.conftest import create_test_app
 
 
@@ -135,25 +134,32 @@ async def test_list_reports_hash_gated_tool_counts(client):
 
 
 @pytest.mark.asyncio
-async def test_all_scopes_asks_for_live_workspaces_only(client):
-    """The shared query defaults to every workspace a user ever had, because
-    vault invalidation has to sweep snapshots a soft-deleted workspace left
-    behind. This view renders scopes to a person, so it wants the live ones."""
-    local = AsyncMock(return_value=[])
+async def test_all_scopes_lists_the_workspaces_each_server_is_off_in(client):
+    """Selection is the only per-workspace state a server has, so the scope
+    view is each row's tombstones. A builtin marker is not one of them: it
+    switches off a built-in, never a Plugins row of the same name."""
+    markers = [
+        {"workspace_id": "ws-b", "name": "remote_server", "source": "user"},
+        {"workspace_id": "ws-a", "name": "remote_server", "source": "user"},
+        {"workspace_id": "ws-c", "name": "remote_server", "source": "builtin"},
+    ]
     with (
         patch(
             "src.server.app.mcp_catalog.list_catalog_servers",
-            new=AsyncMock(return_value=[]),
+            new=AsyncMock(return_value=[_row(), _row(name="everywhere")]),
         ),
         patch(
             "src.server.app.mcp_catalog.list_scope_markers_for_user",
-            new=AsyncMock(return_value=[]),
+            new=AsyncMock(return_value=markers),
         ),
-        patch("src.server.app.mcp_catalog.list_local_servers_for_user", new=local),
     ):
         resp = await client.get("/api/v1/mcp/servers?all_scopes=true")
     assert resp.status_code == 200
-    assert local.await_args.kwargs["live_only"] is True
+    body = resp.json()
+    by_name = {s["name"]: s for s in body["servers"]}
+    assert by_name["remote_server"]["disabled_workspace_ids"] == ["ws-a", "ws-b"]
+    assert by_name["everywhere"]["disabled_workspace_ids"] == []
+    assert "workspace_servers" not in body
 
 
 @pytest.mark.asyncio
@@ -348,6 +354,95 @@ async def test_update_name_mismatch_409(client):
         json={"name": "different", "transport": "stdio", "command": "npx"},
     )
     assert resp.status_code == 409
+
+
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        ("class", "Python keyword"),
+        ("mcp_client", "MCP runtime module"),
+        ("__init__", "must not start with '__'"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_create_refuses_a_name_the_sandbox_reserves(client, name, reason):
+    create = AsyncMock()
+    with patch("src.server.app.mcp_catalog.create_catalog_server", new=create):
+        resp = await client.post(
+            "/api/v1/mcp/servers",
+            json={"name": name, "transport": "stdio", "command": "npx"},
+        )
+    assert resp.status_code == 422
+    assert reason in resp.json()["detail"]
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_accepts_a_soft_keyword(client):
+    with (
+        patch(
+            "src.server.app.mcp_catalog.create_catalog_server",
+            new=AsyncMock(return_value=_row(name="match")),
+        ),
+        patch(
+            "src.server.app.mcp_catalog.get_connection",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        resp = await client.post(
+            "/api/v1/mcp/servers",
+            json={"name": "match", "transport": "http", "url": "https://api.example.com/mcp"},
+        )
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_update_keeps_a_name_the_sandbox_reserves(client):
+    """A row saved before its name was reserved stays editable: the only other
+    way out is a delete that loses its connection, schemas and switches."""
+    update = AsyncMock(return_value=_row(name="class"))
+    with (
+        patch("src.server.services.mcp_catalog.update_catalog_server", new=update),
+        patch(
+            "src.server.services.mcp_catalog.get_catalog_server",
+            new=AsyncMock(return_value=_row(name="class")),
+        ),
+        patch(
+            "src.server.app.mcp_catalog.get_connection",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "src.server.database.mcp_oauth.get_connection",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "src.server.services.mcp_oauth.discovery.schedule_post_edit_rediscovery"
+        ),
+    ):
+        resp = await client.put(
+            "/api/v1/mcp/servers/class",
+            json={
+                "name": "class",
+                "transport": "http",
+                "url": "https://api.example.com/mcp",
+                "description": "edited",
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "class"
+    update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_update_refuses_a_rename_to_a_reserved_name(client):
+    update = AsyncMock()
+    with patch("src.server.services.mcp_catalog.update_catalog_server", new=update):
+        resp = await client.put(
+            "/api/v1/mcp/servers/remote_server",
+            json={"name": "class", "transport": "stdio", "command": "npx"},
+        )
+    assert resp.status_code == 409
+    update.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -945,6 +1040,48 @@ async def test_enable_kicks_the_probe_an_inert_row_never_got(client):
 
 
 # ---------------------------------------------------------------------------
+# PATCH new-workspaces: where a server starts in workspaces created later
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_new_workspace_default_is_set_and_echoed(client):
+    """The Plugins page switches it for a server added from one workspace, and
+    reads it back off the list, so both shapes carry the stored value."""
+    setter = AsyncMock(return_value=_row(enabled_in_new_workspaces=True))
+    with patch(
+        "src.server.app.mcp_catalog.set_catalog_server_new_workspace_default",
+        new=setter,
+    ):
+        resp = await client.patch(
+            "/api/v1/mcp/servers/remote_server/new-workspaces", json={"enabled": True}
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"name": "remote_server", "enabled_in_new_workspaces": True}
+    setter.assert_awaited_once_with("test-user-123", "remote_server", True)
+
+    with patch(
+        "src.server.app.mcp_catalog.list_catalog_servers",
+        new=AsyncMock(return_value=[_row(enabled_in_new_workspaces=False)]),
+    ):
+        listed = await client.get("/api/v1/mcp/servers")
+    assert listed.json()["servers"][0]["enabled_in_new_workspaces"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_new_workspace_default_of_a_missing_server_is_404(client):
+    with patch(
+        "src.server.app.mcp_catalog.set_catalog_server_new_workspace_default",
+        new=AsyncMock(return_value=None),
+    ):
+        resp = await client.patch(
+            "/api/v1/mcp/servers/ghost/new-workspaces", json={"enabled": False}
+        )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "MCP server not found"
+
+
+# ---------------------------------------------------------------------------
 # POST import — created secrets must converge like the vault routes' do
 # ---------------------------------------------------------------------------
 
@@ -969,6 +1106,9 @@ def _import_txn():
         yield conn
 
 
+_SCOPE_ATTRS = {"get_user_secret_names", "create_user_secret"}
+
+
 @asynccontextmanager
 async def _import_patches(**extra):
     patches = {
@@ -980,9 +1120,13 @@ async def _import_patches(**extra):
     }
     with ExitStack() as stack:
         for attr, mock in patches.items():
-            stack.enter_context(
-                patch(f"src.server.app.mcp_catalog.{attr}", new=mock)
+            # The account's vault reads and writes live in the shared scope.
+            module = (
+                "src.server.services.mcp_import"
+                if attr in _SCOPE_ATTRS
+                else "src.server.app.mcp_catalog"
             )
+            stack.enter_context(patch(f"{module}.{attr}", new=mock))
         yield patches
 
 
@@ -993,7 +1137,7 @@ async def test_import_converges_each_created_secret(client, _import_txn):
     nothing else on this path purges its snapshot, bumps the version, or
     reaches a live sandbox."""
     after = AsyncMock()
-    async with _import_patches(after_secret_change=after) as mocks:
+    async with _import_patches(after_secrets_changed=after) as mocks:
         resp = await client.post(
             "/api/v1/mcp/servers/import",
             json={
@@ -1016,18 +1160,15 @@ async def test_import_converges_each_created_secret(client, _import_txn):
     created = resp.json()["secrets_created"]
     assert len(created) == 2
     assert mocks["create_user_secret"].await_count == 2
-    # One convergence per created name, entered with the USER tier exactly as
-    # the dedicated secret routes enter it.
-    assert after.await_args_list == [
-        call(USER_TIER, "test-user-123", name, user_id="test-user-123")
-        for name in created
-    ]
+    # One convergence for the batch: a vault push per secret would reach every
+    # live sandbox once for each name.
+    after.assert_awaited_once_with("test-user-123", created)
 
 
 @pytest.mark.asyncio
 async def test_import_without_created_secrets_skips_convergence(client, _import_txn):
     after = AsyncMock()
-    async with _import_patches(after_secret_change=after) as mocks:
+    async with _import_patches(after_secrets_changed=after) as mocks:
         resp = await client.post(
             "/api/v1/mcp/servers/import",
             json={"mcpServers": {"plain": {"command": "npx", "args": ["-y", "@foo/bar"]}}},
@@ -1037,7 +1178,7 @@ async def test_import_without_created_secrets_skips_convergence(client, _import_
     assert resp.json()["created"] == 1
     assert resp.json()["secrets_created"] == []
     mocks["create_user_secret"].assert_not_awaited()
-    after.assert_not_awaited()
+    assert [n for c in after.await_args_list for n in c.args[1]] == []
 
 
 @pytest.mark.asyncio
@@ -1150,7 +1291,7 @@ async def test_import_dials_only_a_row_the_user_switched_on(
         ),
         patch.object(discovery, "bounded_probe", new=probe),
     ):
-        async with _import_patches(after_secret_change=AsyncMock()):
+        async with _import_patches(after_secrets_changed=AsyncMock()):
             resp = await client.post(
                 "/api/v1/mcp/servers/import",
                 json={
@@ -1307,7 +1448,7 @@ def _probe_patches(outcome=None, secrets=None):
     stack = ExitStack()
     stack.enter_context(
         patch(
-            "src.server.app.mcp_catalog.effective_secrets_for_probe",
+            "src.server.app.mcp_catalog.get_user_secrets_decrypted",
             new=AsyncMock(return_value=secrets or {}),
         )
     )
@@ -1425,7 +1566,7 @@ async def test_probe_decrypts_only_the_secrets_its_headers_name(client):
     user_vault = AsyncMock(return_value={"API_KEY": "sk-abc"})
     with (
         patch(
-            "src.server.database.user_vault_secrets.get_user_secrets_decrypted",
+            "src.server.app.mcp_catalog.get_user_secrets_decrypted",
             new=user_vault,
         ),
         patch("src.server.services.mcp_probe._probe", new=AsyncMock(
@@ -1556,6 +1697,26 @@ async def test_probe_refuses_a_transport(client):
         )
 
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_probe_ignores_the_workspace_an_earlier_form_sends(client):
+    """Refs resolve against the user's one vault from every workspace, but a
+    page loaded from the previous web build still sends one. Ignored rather
+    than refused, so that page's add form keeps working until it reloads."""
+    stack, probe = _probe_patches(secrets={"API_KEY": "sk-live"})
+    with stack:
+        resp = await client.post(
+            "/api/v1/mcp/servers/probe",
+            json={
+                "url": "https://api.example.com/mcp",
+                "headers": {"Authorization": "Bearer ${vault:API_KEY}"},
+                "workspace_id": "ws-1",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert probe.await_args.args[1] == {"Authorization": "Bearer sk-live"}
 
 
 # ---------------------------------------------------------------------------

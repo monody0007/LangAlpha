@@ -54,7 +54,7 @@
 - **Agent 集群** — 并行的异步 subagent，各自拥有隔离的上下文窗口、预加载的工具集与 skill，支持执行中途 steering、基于 checkpoint 的恢复，以及界面上的实时进度监控。
 - **实时 steering** — agent 或 subagent 运行时，你可以随时追加消息来纠偏、澄清或改变方向，不用等任务结束。
 - **Middleware 栈** — 一套深层、可组合的 middleware stack，负责 skill 加载、plan mode、多模态输入、自动 compaction 和上下文管理，支撑长时间运行的 agent session。
-- **安全与 workspace vault** — 用 pgcrypto 做静态加密，自动检测并脱敏泄露的 credential；代码在 sandbox 里执行，每个 workspace 都有独立的 secret 存储，供 agent 安全取用。
+- **安全与 vault** — 用 pgcrypto 做静态加密，自动检测并脱敏泄露的 credential；代码在 sandbox 里执行，每个账户都有独立的 secret 存储，供 agent 安全取用。
 - **渠道集成** — 在 Slack、Discord、飞书、Telegram 里直接用 LangAlpha，定时结果还能通过邮件送达。
 - **生产级基础设施** — agent 活动通过 SSE 流式输出，断线重连时靠 Redis 缓冲回放，后台执行与 HTTP 连接解耦，状态由 PostgreSQL 持久化。
 
@@ -108,7 +108,7 @@ LangAlpha 运行在与具体 provider 解耦的模型层上，统一封装多个
 - **PTC 模式**：用于深度、多步骤的投资研究。强推理模型负责规划分析路径、梳理金融数据，并写代码完成复杂分析。长上下文让它能在一次处理中交叉比对 SEC 文件和研报。
 - **Flash 模式**：用于快速的对话响应和 workspace 调度——快速查行情、在 MarketView 里边看图边聊、轻量问答，还有一个秘书角色，帮你管理 workspace、在后台派发深度 PTC 分析，再用自然对话把结果带回来。
 
-**使用你自己的模型和 API key（BYOK）** — 直接用你已有的 AI 订阅和 API key。通过 OAuth 接入 ChatGPT 或 Claude 订阅（OpenAI Codex OAuth、Claude Code OAuth），使用 Kimi（月之暗面）、GLM（智谱）、MiniMax 或豆包（火山引擎）的 coding plan，或者通过 BYOK 为任何受支持的 provider 填入自己的 API key。所有 key 都用 PostgreSQL 的 pgcrypto 做静态加密（详见[安全](#安全与-workspace-vault)）。
+**使用你自己的模型和 API key（BYOK）** — 直接用你已有的 AI 订阅和 API key。通过 OAuth 接入 ChatGPT 或 Claude 订阅（OpenAI Codex OAuth、Claude Code OAuth），使用 Kimi（月之暗面）、GLM（智谱）、MiniMax 或豆包（火山引擎）的 coding plan，或者通过 BYOK 为任何受支持的 provider 填入自己的 API key。所有 key 都用 PostgreSQL 的 pgcrypto 做静态加密（详见[安全](#安全与-vault)）。
 
 **模型容错** — 遇到瞬时错误自动重试，之后 failover 到配置好的备用模型。推理力度（`low`/`medium`/`high`）会在各家 provider 之间自动对齐。
 
@@ -172,7 +172,7 @@ PTC 擅长多步数据处理、金融建模、画图这类复杂任务，但每�
 
 agent 会自动选择合适的层级：能快速查询且适合放进上下文的任务使用 native 工具；需要在 sandbox 里做批量数据处理、画图或多年趋势分析时，则使用 MCP 工具。
 
-MCP server 可按 workspace 配置。内置 server 能逐个禁用，自定义的 HTTP 或 stdio server——包括那些从 [workspace vault](#workspace-vault) 读取凭据的——可以通过 API 或界面添加，几秒内生效，无需重启。
+MCP server 在账户里安装一次，再按 workspace 选择启用。内置 server 能逐个禁用，自定义的 HTTP 或 stdio server（包括从 [vault](#vault) 读取凭据的）可以通过 API 或界面添加，并在每个 workspace 里单独开关，几秒内生效，无需重启。
 
 #### 数据 Provider 回退链
 
@@ -345,7 +345,7 @@ PostgreSQL 承载 LangGraph 的 checkpoint、对话历史和用户数据（自�
 
 agent 访问过的每个外部数据源都会被记录并呈现。一层溯源 middleware 会记录每一次网页搜索、页面抓取、SEC 文件、行情调用、MCP 工具调用和 workspace 文件读取——包括后台 subagent 的访问——并为每个来源发出一个 `provenance` 流事件；这些事件不会进入 LLM 上下文。界面会把它们渲染成每轮旁边的 Sources 面板：来源按类型分组，网页来源配 favicon，详情视图里展示 provider、时间戳、捕获的参数、内容指纹和一段摘录。一个 *本轮 / 全部来源* 开关可以展开整个 thread 的完整数据足迹；点击文件或 memo 来源，就会直接在 workspace 文件面板里打开。每一份研究成果背后的数据，都保留可审计的记录。
 
-## 安全与 Workspace Vault
+## 安全与 Vault
 
 LangAlpha 围绕凭据、代码执行和用户提供的 secret 采用分层安全模型。
 
@@ -355,9 +355,9 @@ LangAlpha 围绕凭据、代码执行和用户提供的 secret 采用分层安�
 
 **沙箱化代码执行** — 每个 workspace 都运行在自己的 [Daytona](https://www.daytona.io/) 云 sandbox 里，有专属的文件系统和网络边界。受保护路径的守卫会阻止 agent 访问内部系统目录——工具输入侧会在执行前短路调用，工具输出侧会脱敏泄露路径。
 
-### Workspace Vault
+### Vault
 
-每个 workspace 都有一个内置的 secret vault，用来存放 agent 在代码执行时会用到的 API key 和凭据——无论是访问第三方数据源（券商 API、外部数据供应商等），还是在 workspace 里构建由 LLM 驱动的工作流，都用得上。在界面里存一次 secret，就能通过一个简单的 Python API，供该 workspace 里的每一个 agent session 取用：
+每个账户都有一个内置的 secret vault，用来存放 agent 在代码执行时会用到的 API key 和凭据。无论是访问第三方数据源（券商 API、外部数据供应商等），还是在 workspace 里构建由 LLM 驱动的工作流，都用得上。在界面里存一次 secret，就能通过一个简单的 Python API，供你每个 workspace 里的 agent session 取用：
 
 ```python
 from vault import get, list_names, load_env
@@ -367,7 +367,7 @@ names = list_names()               # 列出所有可用的 secret 名称
 load_env()                         # 把所有 secret 批量加载为环境变量
 ```
 
-vault secret 继承上面的每一层防护：静态加密、从所有面向 agent 和面向人的输出里脱敏，并禁止直接文件访问。只有 workspace 的拥有者能创建、更新、查看或删除 secret。
+vault secret 继承上面的每一层防护：静态加密、从所有面向 agent 和面向人的输出里脱敏，并禁止直接文件访问。只有账户的拥有者能创建、更新、查看或删除 secret。
 
 ## 前端
 

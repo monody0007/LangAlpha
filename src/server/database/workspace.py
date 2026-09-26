@@ -19,12 +19,14 @@ from src.server.database.computer import (
     COMPUTER_STATUSES,
     get_computer,
 )
+from src.server.database.mcp_servers import start_new_workspace_selection
 from src.server.database.pool import get_db_connection
 from src.server.database.sql_fences import (
     FENCE_LIVE_WORKSPACE,
     FENCE_NOT_DELETED,
     shadowed_write,
 )
+from src.server.database.user_lock import lock_user_writes
 from src.server.database.workspace_folders import (
     MOVING_DIR,
     WorkspaceFolderMoving,
@@ -116,12 +118,29 @@ async def _ws_cursor(conn=None):
             yield cur
 
 
+@asynccontextmanager
+async def _ws_transaction(conn=None):
+    """A cursor in a transaction of its own, or in a savepoint of the caller's.
+
+    The pool's connections are autocommit, and a workspace INSERT has to
+    commit with the MCP selection it starts with.
+    """
+    async with get_db_connection(conn) as owned, owned.transaction():
+        async with owned.cursor(row_factory=dict_row) as cur:
+            yield cur
+
+
 def get_flash_workspace_id(user_id: str) -> str:
     return str(uuid.uuid5(FLASH_WORKSPACE_NAMESPACE, user_id))
 
 
 async def get_or_create_flash_workspace(user_id: str, conn=None) -> Dict[str, Any]:
-    """Deterministic identity and ON CONFLICT make concurrent creation idempotent."""
+    """Deterministic identity and ON CONFLICT make concurrent creation idempotent.
+
+    Every Flash turn lands here, so a row that exists is touched in one
+    statement with no lock. Only a miss opens a transaction and takes the
+    lock, so the workspace commits with the MCP selection it starts with.
+    """
     from psycopg.types.json import Json
 
     workspace_id = get_flash_workspace_id(user_id)
@@ -131,21 +150,37 @@ async def get_or_create_flash_workspace(user_id: str, conn=None) -> Dict[str, An
         async with _ws_cursor(conn) as cur:
             await cur.execute(
                 f"""
-                INSERT INTO workspaces (workspace_id, user_id, name, description, config, status, is_pinned)
-                VALUES (%s, %s, %s, %s, %s, %s, TRUE)
-                ON CONFLICT (workspace_id) DO UPDATE SET updated_at = NOW(), is_pinned = TRUE
+                UPDATE workspaces SET updated_at = NOW(), is_pinned = TRUE
+                WHERE workspace_id = %s
                 RETURNING {_WS_COLS}
                 """,
-                (
-                    workspace_id,
-                    user_id,
-                    "Flash",
-                    "Flash mode conversations",
-                    config_json,
-                    "flash",
-                ),
+                (workspace_id,),
             )
             result = await cur.fetchone()
+        if result is None:
+            async with _ws_transaction(conn) as cur:
+                await lock_user_writes(cur, user_id)
+                await cur.execute(
+                    f"""
+                    INSERT INTO workspaces (workspace_id, user_id, name, description, config, status, is_pinned)
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT (workspace_id) DO UPDATE SET updated_at = NOW(), is_pinned = TRUE
+                    RETURNING {_WS_COLS}, (xmax = 0) AS inserted
+                    """,
+                    (
+                        workspace_id,
+                        user_id,
+                        "Flash",
+                        "Flash mode conversations",
+                        config_json,
+                        "flash",
+                    ),
+                )
+                result = dict(await cur.fetchone())
+                # False when a concurrent first turn inserted it while this
+                # one waited on the lock; that one started the selection.
+                if result.pop("inserted"):
+                    await start_new_workspace_selection(cur, user_id, workspace_id)
 
         logger.info(f"Upserted flash workspace: {workspace_id} for user: {user_id}")
         return dict(result)
@@ -174,7 +209,8 @@ async def create_workspace(
     try:
         config_json = Json(config) if config else Json({})
 
-        async with _ws_cursor(conn) as cur:
+        async with _ws_transaction(conn) as cur:
+            await lock_user_writes(cur, user_id)
             if workspace_id:
                 # Flash mode may supply thread_id as workspace_id.
                 await cur.execute(
@@ -195,6 +231,9 @@ async def create_workspace(
                     (user_id, name, name_key, description, config_json, status),
                 )
             result = await cur.fetchone()
+            await start_new_workspace_selection(
+                cur, user_id, str(result["workspace_id"])
+            )
 
         logger.info(f"Created workspace: {result['workspace_id']} for user: {user_id}")
         return dict(result)
@@ -555,6 +594,7 @@ async def create_workspace_on_computer(
     description: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
     workspace_id: Optional[str] = None,
+    selection_from: Optional[str] = None,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Create a complete shadow atomically so failed binding cannot leave an unbound project.
@@ -568,6 +608,8 @@ async def create_workspace_on_computer(
     case (a deleted workspace awaiting cleanup, or a sibling renamed away that
     has not moved yet) gets this one a placeholder, which the next folder
     settle replaces.
+    The row commits with the MCP selection it starts with; ``selection_from``
+    is a duplicate's source, whose switched-off servers the copy keeps.
     """
     from psycopg.errors import UniqueViolation
     from psycopg.types.json import Json
@@ -581,8 +623,9 @@ async def create_workspace_on_computer(
 
     try:
         # The pool autocommits, and the row must not be visible before its
-        # folder's release commits with it.
+        # folder's release and its MCP selection commit with it.
         async with folder_allocation(computer_id, conn=conn) as owned, _ws_cursor(owned) as cur:
+            await lock_user_writes(cur, user_id)
             held = await get_workspace_dir_names_for_computer(computer_id, conn=owned)
             computer = await get_computer(computer_id, conn=owned)
             own_folder = computer is None or takes_name_folders(computer)
@@ -629,6 +672,9 @@ async def create_workspace_on_computer(
                         if row is not None:
                             await release_former_folder(
                                 cur, computer_id=computer_id, workspace_id=workspace_id, folder=dir_name
+                            )
+                            await start_new_workspace_selection(
+                                cur, user_id, workspace_id, like_workspace_id=selection_from
                             )
                     break
                 except UniqueViolation as e:
@@ -678,7 +724,8 @@ async def duplicate_workspace_on_computer(
         async with conn.transaction():
             workspace = await create_workspace_on_computer(
                 user_id, name, computer_id,
-                description=description, config=config, conn=conn,
+                description=description, config=config,
+                selection_from=source_id, conn=conn,
             )
             if workspace is not None:
                 await copy_workspace_files(

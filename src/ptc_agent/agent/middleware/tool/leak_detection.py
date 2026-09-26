@@ -46,8 +46,9 @@ class LeakDetectionMiddleware(AgentMiddleware):
             mcp_servers: List of MCPServerConfig objects. Each server's
                 env dict is scanned for ${VAR} placeholders, which are
                 resolved from os.environ to get the actual secret values.
-            vault_secrets: Per-workspace user vault secrets (name→value).
-                Merged into the redaction list alongside MCP secrets.
+            vault_secrets: The owner's whole vault (name→value), which every
+                workspace on their computers can read. Merged into the
+                redaction list alongside MCP secrets.
         """
         secrets: dict[str, str] = {}
 
@@ -98,8 +99,9 @@ class LeakDetectionMiddleware(AgentMiddleware):
             if gh_token and len(gh_token) >= 8:
                 secrets["GITHUB_TOKEN"] = gh_token
 
-        # Merge vault secrets (user-provided API keys stored per-workspace)
-        # Use same >=8 threshold as MCP secrets to avoid false-positive redaction
+        # Merge the owner's vault secrets (user-provided API keys, one vault
+        # for all of their workspaces). Same >=8 threshold as MCP secrets to
+        # avoid false-positive redaction.
         for name, value in (vault_secrets or {}).items():
             if value and len(value) >= 8:
                 secrets[name] = value

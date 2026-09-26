@@ -32,10 +32,7 @@ from ptc_agent.core.sandbox.tool_overlay import (
     _relative_link_target,
     overlay_link_plan,
 )
-from ptc_agent.core.sandbox.vault_helper import (
-    VAULT_MODULE_SOURCE,
-    workspace_vault_path,
-)
+from ptc_agent.core.sandbox.vault_helper import VAULT_MODULE_SOURCE
 from ptc_agent.core.tool_generator import (
     MCP_CLIENT_CODEGEN_VERSION,
     ToolFunctionGenerator,
@@ -452,96 +449,14 @@ class TestOverlayIsAgentReadable:
 
 
 # ---------------------------------------------------------------------------
-# Same-name servers from different workspaces, and each workspace's own vault.
+# Several workspaces syncing onto one computer, and the vault they share.
 # ---------------------------------------------------------------------------
-
-
-def _ws_server(name, url):
-    return MCPServerConfig(
-        name=name,
-        transport="http",
-        url=url,
-        source="workspace",
-        headers={"Authorization": "Bearer ${vault:API_KEY}"},
-    )
 
 
 def _user_server(name, url):
     return MCPServerConfig(
         name=name, transport="http", url=url, source="user", headers={"X-K": "k"}
     )
-
-
-class TestUnionKeys:
-    """A workspace-local server is keyed by its owner; everything shared is not."""
-
-    def test_only_a_workspace_local_server_is_qualified(self):
-        assert tg.union_key(_ws_server("crm", "https://a"), "ws-a") == "crm@ws-a"
-        assert tg.union_key(_user_server("crm", "https://a"), "ws-a") == "crm"
-        builtin = MCPServerConfig(name="market", transport="stdio", command="uv")
-        assert tg.union_key(builtin, "ws-a") == "market"
-
-    def test_the_link_keeps_the_display_name_and_targets_the_key(self):
-        layout = SandboxLayout(ROOT)
-        workspace = layout.for_workspace(DIR_NAME)
-        plan = overlay_link_plan(layout, workspace, ["crm"], {"crm": "crm@ws-a"})
-        assert [link for link, _ in plan] == [
-            f"{ROOT}/{DIR_NAME}/.agents/tools/crm.py",
-            f"{ROOT}/{DIR_NAME}/.agents/tools/docs/crm",
-        ]
-        layout = SandboxLayout(ROOT)
-        assert [_resolve(link, target) for link, target in plan] == [
-            f"{layout.tools}/crm@ws-a.py",
-            f"{layout.tools_docs}/crm@ws-a",
-        ]
-
-    def test_the_wrapper_calls_the_key_and_documents_the_name(self):
-        gen = ToolFunctionGenerator()
-        code = gen.generate_tool_module(
-            "crm", [_tool()], untrusted=True, union_key="crm@ws-a"
-        )
-        assert "_call_mcp_tool('crm@ws-a', 'get_quote', arguments)" in code
-        assert "MCP server: crm\n" in code
-        assert "crm@ws-a MCP server" not in code
-
-    def test_the_client_config_keys_by_claim_and_names_the_vault(self):
-        gen = ToolFunctionGenerator()
-        cfg = gen.generate_client_config(
-            [_ws_server("crm", "https://a"), _user_server("sec", "https://s")],
-            working_dir=ROOT,
-            claim="ws-a",
-            vault_file=f"{ROOT}/_internal/vaults/ws-a.json",
-        )
-        assert set(cfg["servers"]) == {"crm@ws-a", "sec"}
-        assert cfg["servers"]["crm@ws-a"]["name"] == "crm"
-        assert cfg["servers"]["crm@ws-a"]["vault_file"] == (
-            f"{ROOT}/_internal/vaults/ws-a.json"
-        )
-        # A shared server reads the root vault, so it carries no file of its own.
-        assert "name" not in cfg["servers"]["sec"]
-        assert "vault_file" not in cfg["servers"]["sec"]
-        assert cfg["fold_union"] is True
-
-    def test_without_a_claim_the_config_keeps_bare_names(self):
-        cfg = ToolFunctionGenerator().generate_client_config(
-            [_ws_server("crm", "https://a")], working_dir=ROOT, fold_union=False
-        )
-        assert set(cfg["servers"]) == {"crm"}
-        assert cfg["fold_union"] is False
-
-    def test_the_workspace_view_labels_keys_and_names_the_vault(self):
-        view = ToolFunctionGenerator().generate_workspace_tool_config(
-            "ws-a",
-            DIR_NAME,
-            ["crm@ws-a", "sec"],
-            labels={"crm@ws-a": "crm", "sec": "sec"},
-            vault_file=f"{ROOT}/_internal/vaults/ws-a.json",
-        )
-        assert view["servers"] == {
-            "crm@ws-a": {"enabled": True, "name": "crm"},
-            "sec": {"enabled": True},
-        }
-        assert view["vault_file"] == f"{ROOT}/_internal/vaults/ws-a.json"
 
 
 class _Computer:
@@ -551,6 +466,7 @@ class _Computer:
         self.root = root
         self.layout = SandboxLayout(root)
         self.gen = ToolFunctionGenerator()
+        self.legacy_vaults = f"{self.layout.internal}/vaults"
         for path in (
             self.layout.tools,
             self.layout.tools_docs,
@@ -567,20 +483,12 @@ class _Computer:
     ) -> dict:
         ws = self.layout.for_workspace(project.dir_name)
         os.makedirs(ws.tools, exist_ok=True)
-        keys = {s.name: tg.union_key(s, project.claim) for s in servers}
-        names = sorted(keys)
-        vault_file = workspace_vault_path(self.root, project.claim)
-        cfg = self.gen.generate_client_config(
-            servers, working_dir=self.root, claim=project.claim, vault_file=vault_file
-        )
-        for name, key in keys.items():
-            with open(f"{self.layout.tools}/{key}.py", "w", encoding="utf-8") as fh:
-                fh.write(
-                    self.gen.generate_tool_module(
-                        name, [_tool()], untrusted=True, union_key=key
-                    )
-                )
-            os.makedirs(f"{self.layout.tools_docs}/{key}", exist_ok=True)
+        names = sorted(s.name for s in servers)
+        cfg = self.gen.generate_client_config(servers, working_dir=self.root)
+        for name in names:
+            with open(f"{self.layout.tools}/{name}.py", "w", encoding="utf-8") as fh:
+                fh.write(self.gen.generate_tool_module(name, [_tool()], untrusted=True))
+            os.makedirs(f"{self.layout.tools_docs}/{name}", exist_ok=True)
         args = {
             "ledger": self.layout.union_ledger,
             "lock": self.layout.union_lock,
@@ -598,19 +506,12 @@ class _Computer:
                 | {"__init__.py", "docs", "mcp_client_config.json"}
             ),
             "wsDocsKeep": names,
-            "vaultsDir": f"{self.root}/_internal/vaults",
             "wsConfigPath": ws.mcp_client_config,
             "wsConfig": self.gen.generate_workspace_tool_config(
-                project.workspace_id,
-                project.dir_name or "",
-                sorted(keys.values()),
-                labels={v: k for k, v in keys.items()},
-                vault_file=vault_file,
+                project.workspace_id, project.dir_name or "", names
             ),
-            "expectedDocs": {key: [] for key in keys.values()},
-            "links": [
-                list(pair) for pair in overlay_link_plan(self.layout, ws, names, keys)
-            ],
+            "expectedDocs": {name: [] for name in names},
+            "links": [list(pair) for pair in overlay_link_plan(self.layout, ws, names)],
             "legacyClient": f"{self.layout.tools}/mcp_client.py",
         }
         args_path = f"{self.layout.internal}/.union_args.json"
@@ -639,7 +540,7 @@ def computer(tmp_path) -> _Computer:
     return _Computer(root)
 
 
-class TestSameNameServersAcrossWorkspaces:
+class TestWorkspacesShareOneUnion:
     def test_failed_link_does_not_publish_install_version(self, computer, monkeypatch):
         server = _user_server("sec", "https://s")
         computer.sync(A, [server], tool_version="installed")
@@ -672,21 +573,6 @@ class TestSameNameServersAcrossWorkspaces:
         computer.sync(B, [server], tool_version="discovered-b")
         assert computer.ledger()["tool_versions"] == {B.claim: "discovered-b"}
 
-    def test_both_workspaces_keep_their_own_crm(self, computer):
-        computer.sync(A, [_ws_server("crm", "https://a.example/mcp")])
-        computer.sync(B, [_ws_server("crm", "https://b.example/mcp")])
-
-        servers = computer.ledger()["servers"]
-        assert servers["crm@ws-a"]["url"] == "https://a.example/mcp"
-        assert servers["crm@ws-b"]["url"] == "https://b.example/mcp"
-        for project in (A, B):
-            link = f"{computer.root}/{project.dir_name}/.agents/tools/crm.py"
-            assert os.path.realpath(link) == (
-                f"{computer.layout.tools}/crm@{project.workspace_id}.py"
-            )
-            with open(link, encoding="utf-8") as fh:
-                assert f"_call_mcp_tool('crm@{project.workspace_id}'" in fh.read()
-
     def test_a_shared_server_stays_one_entry(self, computer):
         computer.sync(A, [_user_server("sec", "https://s")])
         computer.sync(B, [_user_server("sec", "https://s")])
@@ -699,64 +585,157 @@ class TestSameNameServersAcrossWorkspaces:
             assert json.load(fh)["computer_config_version"] == 1
         assert ledger["claims"]["sec"] == ["ws-a", "ws-b"]
 
-    def test_a_deleted_workspace_takes_its_vault_and_its_wrapper(self, computer):
-        os.makedirs(f"{computer.root}/_internal/vaults")
-        for project in (A, B):
-            with open(workspace_vault_path(computer.root, project.claim), "w") as fh:
-                json.dump({"API_KEY": project.workspace_id}, fh)
-        computer.sync(A, [_ws_server("crm", "https://a")])
-        computer.sync(B, [_ws_server("crm", "https://b")])
+    def test_a_deleted_workspace_takes_its_wrapper(self, computer):
+        computer.sync(A, [_user_server("crm", "https://a")])
+        computer.sync(B, [_user_server("sec", "https://s")])
 
         shutil.rmtree(f"{computer.root}/{A.dir_name}")
-        computer.sync(B, [_ws_server("crm", "https://b")])
+        computer.sync(B, [_user_server("sec", "https://s")])
 
-        assert not os.path.exists(workspace_vault_path(computer.root, "ws-a"))
-        assert os.path.exists(workspace_vault_path(computer.root, "ws-b"))
-        assert not os.path.exists(f"{computer.layout.tools}/crm@ws-a.py")
-        assert os.path.exists(f"{computer.layout.tools}/crm@ws-b.py")
+        assert set(computer.ledger()["servers"]) == {"sec"}
+        assert not os.path.exists(f"{computer.layout.tools}/crm.py")
+        assert os.path.exists(f"{computer.layout.tools}/sec.py")
 
 
-class TestRuntimeReadsEachWorkspacesVault:
-    """The client resolves a keyed server against its owner's vault, a shared
-    one against the root, and the daemon's rotation stamp covers both."""
+class TestAnOlderUnionHeals:
+    """What a warm computer carries from when a workspace could hold its own
+    copy of a server: wrappers keyed ``name@<claim>`` and a vault file per
+    workspace. Each workspace's own sync retires its keyed entries through the
+    claim ledger. The vault files stay: the version that reads them can still
+    be serving the computer."""
 
-    def _apply(self, computer, project, servers, **options):
-        cfg = computer.gen.generate_client_config(
-            servers,
-            working_dir=computer.root,
-            claim=project.claim,
-            vault_file=workspace_vault_path(computer.root, project.claim),
-            **options,
+    @staticmethod
+    def _plant_keyed(computer, project, name):
+        key = f"{name}@{project.claim}"
+        ws = computer.layout.for_workspace(project.dir_name)
+        os.makedirs(ws.tools_docs, exist_ok=True)
+        with open(f"{computer.layout.tools}/{key}.py", "w", encoding="utf-8") as fh:
+            fh.write("# keyed wrapper\n")
+        os.makedirs(f"{computer.layout.tools_docs}/{key}")
+        for link, target in (
+            (f"{ws.tools}/{name}.py", f"{computer.layout.tools}/{key}.py"),
+            (f"{ws.tools_docs}/{name}", f"{computer.layout.tools_docs}/{key}"),
+        ):
+            os.symlink(_relative_link_target(link, target), link)
+        vault_file = f"{computer.legacy_vaults}/{project.claim}.json"
+        with open(ws.mcp_client_config, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "workspace_id": project.workspace_id,
+                    "servers": {key: {"enabled": True, "name": name}},
+                    "vault_file": vault_file,
+                },
+                fh,
+            )
+        with open(vault_file, "w", encoding="utf-8") as fh:
+            json.dump({"API_KEY": project.workspace_id}, fh)
+        return key, {**_HTTP_ENTRY, "name": name, "vault_file": vault_file}
+
+    def test_each_workspace_retires_its_own_keyed_entry(self, computer):
+        os.makedirs(computer.legacy_vaults)
+        key_a, entry_a = self._plant_keyed(computer, A, "crm")
+        key_b, entry_b = self._plant_keyed(computer, B, "crm")
+        with open(computer.layout.union_ledger, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "union_version": 3,
+                    "config_version": 3,
+                    "claims": {key_a: [A.claim], key_b: [B.claim]},
+                    "dirs": {A.claim: A.dir_name, B.claim: B.dir_name},
+                    "servers": {key_a: entry_a, key_b: entry_b},
+                    "tool_versions": {A.claim: "old", B.claim: "old"},
+                },
+                fh,
+            )
+
+        # The migration promoted B's copy under a new name; A kept "crm".
+        result = computer.sync(A, [_user_server("crm", "https://a")])
+
+        assert result["orphaned"] == [key_a]
+        ledger = computer.ledger()
+        assert set(ledger["servers"]) == {"crm", key_b}
+        # The executable set moved, so a supervisor holding the old one
+        # learns it is superseded.
+        assert ledger["config_version"] == 4
+        assert not os.path.exists(f"{computer.layout.tools}/{key_a}.py")
+        assert not os.path.exists(f"{computer.layout.tools_docs}/{key_a}")
+        ws_a = computer.layout.for_workspace(A.dir_name)
+        assert os.path.realpath(f"{ws_a.tools}/crm.py") == (
+            f"{computer.layout.tools}/crm.py"
         )
-        runtime._apply_config_dict(cfg)
+        assert os.path.realpath(f"{ws_a.tools_docs}/crm") == (
+            f"{computer.layout.tools_docs}/crm"
+        )
+        with open(ws_a.mcp_client_config, encoding="utf-8") as fh:
+            view = json.load(fh)
+        assert view["servers"] == {"crm": {"enabled": True}}
+        assert "vault_file" not in view
+        assert computer.legacy_vaults not in result["pruned"]
+        assert os.path.exists(f"{computer.legacy_vaults}/{B.claim}.json")
+        # B's folder is alive, so its keyed wrapper keeps serving it until B
+        # syncs for itself.
+        assert os.path.exists(f"{computer.layout.tools}/{key_b}.py")
 
-    def test_secret_names_shadow_per_workspace(self, computer):
-        os.makedirs(f"{computer.root}/_internal/vaults")
+        result = computer.sync(B, [_user_server("crm_2", "https://b")])
+
+        assert result["orphaned"] == [key_b]
+        assert set(computer.ledger()["servers"]) == {"crm", "crm_2"}
+        assert not os.path.exists(f"{computer.layout.tools}/{key_b}.py")
+        ws_b = computer.layout.for_workspace(B.dir_name)
+        assert not os.path.lexists(f"{ws_b.tools}/crm.py")
+        assert os.path.realpath(f"{ws_b.tools}/crm_2.py") == (
+            f"{computer.layout.tools}/crm_2.py"
+        )
+
+
+class TestRuntimeReadsTheRootVault:
+    """Every server resolves ``${vault:NAME}`` against the computer root's one
+    file, and the daemon's rotation stamp watches that file."""
+
+    def test_a_stale_entry_gets_no_vault(self, computer):
+        # A sibling's entry an older host wrote into the ledger, still naming
+        # a per-workspace file. The root vault is the account's, where the
+        # same name can hold another value, so the call fails instead.
+        stale_vault = f"{computer.legacy_vaults}/ws-a.json"
+        os.makedirs(computer.legacy_vaults)
+        with open(stale_vault, "w") as fh:
+            json.dump({"API_KEY": "a-tier"}, fh)
         with open(computer.layout.vault_secrets, "w") as fh:
             json.dump({"API_KEY": "user-tier"}, fh)
-        with open(workspace_vault_path(computer.root, "ws-a"), "w") as fh:
-            json.dump({"API_KEY": "a-tier"}, fh)
+        entry = {
+            **_HTTP_ENTRY,
+            "headers": {"Authorization": "${vault:API_KEY}"},
+            "name": "crm",
+            "vault_file": stale_vault,
+        }
+        claimed = {**entry}
+        del claimed["vault_file"]
+        servers = {"crm@ws-a": entry, "crm": {**entry, "name": "crm"}, "erp@ws-a": claimed}
+        with open(computer.layout.union_ledger, "w", encoding="utf-8") as fh:
+            json.dump({"config_version": 1, "servers": servers}, fh)
         try:
-            self._apply(
-                computer,
-                A,
-                [_ws_server("crm", "https://a"), _ws_server("sec", "https://s")],
-            )
-            keyed = runtime._server_cfg("crm@ws-a")
-            assert keyed.label == "crm"
-            assert runtime._resolve_all(keyed, ["${vault:API_KEY}"]) == ["a-tier"]
-            shared = runtime._normalize("sec", {"transport": "http", "url": "u"})
-            assert runtime._resolve_all(shared, ["${vault:API_KEY}"]) == ["user-tier"]
+            runtime._apply_config_dict({"working_dir": computer.root})
+            for name in servers:
+                cfg = runtime._server_cfg(name)
+                with pytest.raises(RuntimeError, match="earlier version"):
+                    runtime._resolve_all(cfg, ["${vault:API_KEY}"])
+                assert runtime._resolve_all(
+                    cfg, ["${vault:API_KEY}"], discovery=True
+                ) == [""]
+            assert runtime.server_secret_dependencies("crm@ws-a") == [
+                computer.layout.vault_secrets
+            ]
             stamped = [row[0] for row in runtime.secret_fingerprint()]
-            assert workspace_vault_path(computer.root, "ws-a") in stamped
             assert computer.layout.vault_secrets in stamped
+            assert stale_vault not in stamped
         finally:
             runtime._apply_config_dict({})
 
     def test_a_discovery_client_does_not_fold_the_union(self, computer):
-        computer.sync(A, [_ws_server("crm", "https://a.example/pre-edit")])
+        computer.sync(A, [_user_server("crm", "https://a.example/pre-edit")])
+        edited = _user_server("crm", "https://a.example/edited")
         try:
-            edited = _ws_server("crm", "https://a.example/edited")
             runtime._apply_config_dict(
                 computer.gen.generate_client_config(
                     [edited], working_dir=computer.root, fold_union=False
@@ -764,15 +743,15 @@ class TestRuntimeReadsEachWorkspacesVault:
             )
             assert set(runtime._SERVER_CONFIGS) == {"crm"}
             assert runtime._server_cfg("crm").url == "https://a.example/edited"
-            # The default still folds the ledger in.
-            self._apply(computer, A, [edited])
-            assert "crm@ws-a" in runtime._SERVER_CONFIGS
+            # Folding the ledger in reads the pre-edit copy back over it.
+            runtime._apply_config_dict(
+                computer.gen.generate_client_config([edited], working_dir=computer.root)
+            )
+            assert runtime._server_cfg("crm").url == "https://a.example/pre-edit"
         finally:
             runtime._apply_config_dict({})
 
     def test_secret_dependencies_are_per_server(self, computer):
-        vault_a = workspace_vault_path(computer.root, "ws-a")
-        vault_b = workspace_vault_path(computer.root, "ws-b")
         try:
             runtime._apply_config_dict(
                 {
@@ -784,14 +763,12 @@ class TestRuntimeReadsEachWorkspacesVault:
                             "untrusted": True,
                             "command": "a",
                             "env": {"TOKEN": "${vault:A}"},
-                            "vault_file": vault_a,
                         },
                         "b": {
                             "transport": "http",
                             "untrusted": True,
                             "url": "https://b",
                             "headers": {"Authorization": "${vault:B}"},
-                            "vault_file": vault_b,
                         },
                         "public": {
                             "transport": "http",
@@ -813,8 +790,9 @@ class TestRuntimeReadsEachWorkspacesVault:
                 }
             )
 
-            assert runtime.server_secret_dependencies("a") == [vault_a]
-            assert runtime.server_secret_dependencies("b") == [vault_b]
+            vault = computer.layout.vault_secrets
+            assert runtime.server_secret_dependencies("a") == [vault]
+            assert runtime.server_secret_dependencies("b") == [vault]
             assert runtime.server_secret_dependencies("public") == []
             assert runtime.server_secret_dependencies("file-auth") == [
                 f"{computer.root}/x.json"
@@ -849,29 +827,43 @@ class TestRuntimeReadsEachWorkspacesVault:
         assert seen["owned"] is True
 
 
-class TestVaultHelperFollowsTheFolder:
-    def test_a_folder_reads_its_own_vault_and_the_root_reads_the_users(self, computer):
-        os.makedirs(f"{computer.root}/_internal/vaults")
+class TestVaultHelperReadsTheRootVault:
+    def test_every_current_folder_reads_the_root_vault(self, computer):
         with open(computer.layout.vault_secrets, "w") as fh:
             json.dump({"API_KEY": "user-tier"}, fh)
-        with open(workspace_vault_path(computer.root, "ws-a"), "w") as fh:
+        # A folder view an older host wrote still names a per-workspace file,
+        # while its sibling's view is the current shape.
+        stale_vault = f"{computer.legacy_vaults}/ws-a.json"
+        os.makedirs(computer.legacy_vaults)
+        with open(stale_vault, "w") as fh:
             json.dump({"API_KEY": "a-tier"}, fh)
-        computer.sync(A, [_ws_server("crm", "https://a")])
+        for spec, view in (
+            (A, {"servers": {}, "vault_file": stale_vault}),
+            (B, {"servers": {}}),
+        ):
+            ws = computer.layout.for_workspace(spec.dir_name)
+            os.makedirs(ws.tools)
+            with open(ws.mcp_client_config, "w") as fh:
+                json.dump(view, fh)
+            os.makedirs(f"{computer.root}/{spec.dir_name}/reports/q3")
         with open(f"{computer.layout.internal_src}/vault.py", "w") as fh:
             fh.write(VAULT_MODULE_SOURCE)
-        deep = f"{computer.root}/{A.dir_name}/reports/q3"
-        os.makedirs(deep)
 
         def read(cwd):
-            out = subprocess.run(
+            return subprocess.run(
                 [sys.executable, "-c", "import vault; print(vault.get('API_KEY'))"],
                 cwd=cwd,
                 env={**os.environ, "PYTHONPATH": computer.layout.internal_src},
                 capture_output=True,
                 text=True,
             )
-            assert out.returncode == 0, out.stderr
-            return out.stdout.strip()
 
-        assert read(deep) == "a-tier"
-        assert read(computer.root) == "user-tier"
+        for cwd in (f"{computer.root}/{B.dir_name}/reports/q3", computer.root):
+            out = read(cwd)
+            assert out.returncode == 0, out.stderr
+            assert out.stdout.strip() == "user-tier"
+        # Neither the account's value nor the old file answers for the stale
+        # folder: the first can differ from the workspace's own.
+        out = read(f"{computer.root}/{A.dir_name}/reports/q3")
+        assert out.returncode != 0
+        assert "earlier version" in out.stderr

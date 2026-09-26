@@ -1,13 +1,14 @@
-"""Scope-neutral bulk import of standard ``mcpServers`` JSON.
+"""Bulk import of standard ``mcpServers`` JSON into the user's Plugins catalog.
 
-Both import surfaces (per-workspace servers and the user-level Plugins
-catalog) accept the same blob with inline credentials and run the same
-per-entry gauntlet: skip reserved/duplicate names, enforce the scope's cap,
-rewrite credential-looking literals to ``${vault:NAME}`` refs, validate — all
-of it pure, writing nothing — then commit the entry's vault secrets and its
+Every door that lands servers from a blob (a workspace's MCP tab, the Plugins
+page, a plugin install) accepts the same inline credentials and runs the same
+per-entry gauntlet: skip reserved or duplicate names, enforce the account cap,
+rewrite credential-looking literals to ``${vault:NAME}`` refs and validate, all
+of it pure and writing nothing, then commit the entry's vault secrets and its
 server row in ONE transaction. An entry either lands whole or not at all, and
-its failure never touches the others. A scope supplies only what genuinely
-differs (its cap, its prose, its two writers).
+its failure never touches the others. ``catalog_import_scope`` builds what the
+doors share; a door supplies only its server writer and the prose for a name
+that is taken.
 """
 
 from __future__ import annotations
@@ -29,7 +30,13 @@ from ptc_agent.core.mcp_sanitize import (
     looks_like_placeholder,
     looks_like_secret,
 )
+from src.server.database.mcp_servers import MAX_CATALOG_SERVERS_PER_USER
 from src.server.database.pool import get_db_connection
+from src.server.database.user_vault_secrets import (
+    create_user_secret,
+    get_user_secret_names,
+)
+from src.server.services.mcp_config import reserved_catalog_names
 from src.server.utils.error_sanitization import validation_error_text
 
 if TYPE_CHECKING:
@@ -76,11 +83,8 @@ class ImportScope:
     """What one import surface contributes to the shared per-entry loop."""
 
     reserved_names: set[str]
+    # Every row already counted against ``cap``.
     existing_names: set[str]
-    # Rows already counted against ``cap`` (the workspace surface counts only
-    # its OWN servers, not inherited/marker rows, so it can't be derived from
-    # ``existing_names``).
-    current_count: int
     cap: int
     cap_message: str
     exists_message: str
@@ -88,6 +92,33 @@ class ImportScope:
     existing_secret_names: set[str]
     create_secret: SecretWriter
     persist: ServerWriter
+
+
+async def catalog_import_scope(
+    user_id: str,
+    *,
+    existing_names: set[str],
+    persist: ServerWriter,
+    exists_message: str,
+) -> ImportScope:
+    """The scope of an import into ``user_id``'s catalog, whichever door it
+    came through: one account cap, one vault, one set of reserved names."""
+
+    async def create_secret(conn: Any, secret: PlannedSecret) -> None:
+        await create_user_secret(
+            user_id, secret.name, secret.value, secret.description, conn=conn
+        )
+
+    return ImportScope(
+        reserved_names=reserved_catalog_names(),
+        existing_names=existing_names,
+        cap=MAX_CATALOG_SERVERS_PER_USER,
+        cap_message=f"Plugins server cap ({MAX_CATALOG_SERVERS_PER_USER}) reached",
+        exists_message=exists_message,
+        existing_secret_names=set(await get_user_secret_names(user_id)),
+        create_secret=create_secret,
+        persist=persist,
+    )
 
 
 @dataclass
@@ -118,7 +149,7 @@ async def run_mcp_import(parsed: list[Any], *, scope: ImportScope) -> ImportRepo
     place (``invalid`` / ``skipped`` / ``exists`` / ``error``) and the rest
     continue, so one bad server never aborts the blob.
     """
-    from src.server.models.mcp_server import McpServerInput
+    from src.server.models.mcp_server import McpServerInput, sandbox_name_error
 
     report = ImportReport()
     seen_names: set[str] = set()
@@ -138,6 +169,13 @@ async def run_mcp_import(parsed: list[Any], *, scope: ImportScope) -> ImportRepo
         if entry.error:
             report.results.append({**base, "status": "invalid", "error": entry.error})
             continue
+        # Every import and install door mints its names here, and the model
+        # leaves this check to the doors. Parsing renames a reserved key
+        # already; this holds for a caller handing over a name it did not
+        # coerce.
+        if reason := sandbox_name_error(entry.name):
+            report.results.append({**base, "status": "invalid", "error": reason})
+            continue
         if entry.name in scope.reserved_names:
             report.results.append(
                 {**base, "status": "skipped", "reason": "collides with a name this build reserves"}
@@ -155,7 +193,7 @@ async def run_mcp_import(parsed: list[Any], *, scope: ImportScope) -> ImportRepo
                 ),
             })
             continue
-        if scope.current_count + report.created >= scope.cap:
+        if len(scope.existing_names) + report.created >= scope.cap:
             report.results.append(
                 {**base, "status": "error", "error": scope.cap_message}
             )

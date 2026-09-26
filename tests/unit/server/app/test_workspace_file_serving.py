@@ -490,6 +490,9 @@ async def test_redaction_applied_to_text(mock_ws, mock_fp, _wd, mock_vault):
     resp = await serve_workspace_file(WS_ID, "results/report.html", inject_theme=False)
     assert secret.encode() not in resp.body
     assert b"[REDACTED:API_KEY]" in resp.body
+    # The owner the route resolved, not a second lookup that a deletion
+    # mid-request could turn into "no owner, nothing to redact".
+    mock_vault.assert_awaited_once_with(OWNER)
 
 
 @pytest.mark.asyncio

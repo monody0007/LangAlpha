@@ -2952,7 +2952,7 @@ async def test_layout_failure_is_not_downgraded_to_best_effort_asset_sync():
 
     manager = _make_manager()
     binding = _make_binding(dir_name="project-ab12")
-    manager._vault_payloads = AsyncMock(return_value=(None, {}))
+    manager._vault_snapshot = AsyncMock(return_value=(None, {}, ""))
     manager._layout_root_owner_dir = AsyncMock(return_value=binding.dir_name)
     sandbox = SimpleNamespace(sync_sandbox_assets=AsyncMock(
         side_effect=LayoutMigrationError("partial move")

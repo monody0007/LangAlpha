@@ -1,10 +1,8 @@
-"""User-level Vault Secrets API Router (Plugins backing store).
+"""Vault Secrets API Router (Plugins backing store).
 
-CRUD for per-user encrypted secrets. These back inherited (source='user') MCP
-servers the same way workspace secrets back workspace-local ones: at sandbox
-push the two sets are merged, workspace winning on name collision. Convergence
-after a mutation is ``services/vault_invalidation`` — the same code the
-workspace tier runs, entered with the user tier's descriptor.
+CRUD for per-user encrypted secrets, the one vault every workspace of the user
+resolves ``${vault:NAME}`` refs against. Convergence after a mutation is
+``services/vault_invalidation``.
 
 Endpoints:
 - GET    /api/v1/mcp/vault/secrets
@@ -30,12 +28,47 @@ from src.server.database.user_vault_secrets import (
     update_user_secret,
 )
 from src.server.models.vault import CreateSecretRequest, UpdateSecretRequest
-from src.server.services.vault_invalidation import USER_TIER, after_secret_change
+from src.server.services.vault_invalidation import after_secret_change
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/mcp", tags=["User Vault Secrets"])
+
+
+def _collect_config_blueprints() -> dict[str, dict]:
+    """Vault blueprints declared by the enabled builtin MCP servers, by name.
+
+    First-declaration wins on metadata; duplicate blueprint names across
+    servers are treated as aliases: the second server's description/docs_url/
+    regex are discarded, but its name is appended to `sources` so the UI can
+    show which integrations share the credential.
+    """
+    # Lazy import to avoid circular dependency between `setup` module and router
+    # registration. `setup.agent_config` is populated in `lifespan()` at startup.
+    from src.server.app import setup
+
+    collected: dict[str, dict] = {}
+    if setup.agent_config is None:
+        # Startup race: request landed before lifespan completed.
+        return collected
+    for server in setup.agent_config.mcp.servers:
+        if not server.enabled:
+            continue
+        for bp in server.vault_blueprints:
+            entry = collected.get(bp.name)
+            if entry is None:
+                collected[bp.name] = {
+                    "name": bp.name,
+                    "label": bp.label,
+                    "description": bp.description,
+                    "docs_url": bp.docs_url,
+                    "regex": bp.regex,
+                    "sources": [server.name],
+                }
+            else:
+                entry["sources"].append(server.name)
+    return collected
 
 
 @router.get("/vault/secrets")
@@ -51,14 +84,13 @@ async def list_secrets(user_id: CurrentUserId):
 @router.get("/vault/blueprints")
 @handle_api_exceptions("list user vault blueprints", logger)
 async def list_blueprints(user_id: CurrentUserId):
-    """The user-tier 'recommended but not yet set' credential list.
+    """The 'recommended but not yet set' credential list.
 
     Config blueprints (builtin MCP servers) plus every enabled plugin's
-    declared ``ai.langalpha`` secrets, minus what the user vault already
-    holds. First declaration wins on metadata; later declarers just extend
-    ``sources``. Mirrors the workspace blueprints endpoint.
+    declared ``ai.langalpha`` secrets, minus what the vault already holds.
+    First declaration wins on metadata; later declarers just extend
+    ``sources``.
     """
-    from src.server.app.vault import _collect_config_blueprints
     from src.server.database.plugins import list_plugins
     from src.server.database.user_vault_secrets import get_user_secret_names
     from src.server.services.plugins.errors import PluginFatal
@@ -110,7 +142,7 @@ async def create_secret(body: CreateSecretRequest, user_id: CurrentUserId):
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
-    await after_secret_change(USER_TIER, user_id, body.name, user_id=user_id)
+    await after_secret_change(user_id, body.name)
     return {"name": body.name}
 
 
@@ -123,11 +155,7 @@ async def update_secret(name: str, body: UpdateSecretRequest, user_id: CurrentUs
     if not found:
         raise HTTPException(status_code=404, detail="Secret not found")
 
-    await after_secret_change(
-        USER_TIER, user_id, name,
-        user_id=user_id,
-        value_changed=body.value is not None,
-    )
+    await after_secret_change(user_id, name, value_changed=body.value is not None)
     return {"name": name}
 
 
@@ -147,5 +175,5 @@ async def delete_secret(name: str, user_id: CurrentUserId):
     if not found:
         raise HTTPException(status_code=404, detail="Secret not found")
 
-    await after_secret_change(USER_TIER, user_id, name, user_id=user_id)
+    await after_secret_change(user_id, name)
     return {"ok": True}

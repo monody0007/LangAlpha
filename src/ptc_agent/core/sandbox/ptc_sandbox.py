@@ -3,7 +3,6 @@
 import asyncio
 import json
 import secrets
-import posixpath
 import shlex
 import time
 from collections.abc import AsyncIterator, Callable, Iterable
@@ -31,6 +30,7 @@ from ptc_agent.core.sandbox.runtime import (
     SandboxRuntime,
     SandboxTransientError,
 )
+from ptc_agent.core.sandbox.vault_helper import VAULT_MODULE_SOURCE
 
 from ..mcp_registry import MCPRegistry
 from ..mcp_sanitize import (
@@ -129,6 +129,10 @@ class PTCSandbox:
         # Cached standard preview link info per port (avoids repeated Daytona API calls)
         self._preview_link_cache: dict[int, PreviewInfo] = {}
 
+        # The owner's vault as last published to this sandbox, kept so the
+        # leak redactor needs no database read of its own.
+        self.vault_secrets: dict[str, str] = {}
+
         logger.debug("Initialized PTCSandbox")
 
     @property
@@ -176,7 +180,7 @@ class PTCSandbox:
     #
     # ``self.config.mcp.servers`` holds the per-workspace EFFECTIVE set the
     # WorkspaceManager installs at session build: built-ins (minus disables) plus
-    # untrusted (``source`` 'workspace' or 'user') servers. Most host-side
+    # the user's own (``source="user"``, untrusted) servers. Most host-side
     # operations must see ONLY the built-ins — user stdio servers are fetched by
     # npx/uvx at call time inside the sandbox, never pre-installed/pre-started on
     # the host path, and their secrets resolve vault-only (never host os.environ).
@@ -188,7 +192,7 @@ class PTCSandbox:
         return [s for s in self.config.mcp.servers if not is_untrusted_server(s)]
 
     def _user_servers(self) -> list:
-        """Untrusted servers (``source`` 'workspace' or 'user') from the effective set."""
+        """The user's own (``source="user"``, untrusted) servers from the effective set."""
         return [s for s in self.config.mcp.servers if is_untrusted_server(s)]
 
     async def _wait_ready(self) -> None:
@@ -544,53 +548,6 @@ class PTCSandbox:
             logger.debug("Uploaded sandbox token file", path=self._token_file_path)
         except Exception as e:
             logger.warning("Failed to upload sandbox token file", error=str(e))
-
-    async def upload_vault_secrets(
-        self, secrets: dict[str, str], *, path: str | None = None
-    ) -> None:
-        """Write (or remove) one vault file in the sandbox.
-
-        The root file (the default) is the user tier every shared server reads;
-        ``path`` names a workspace's own file, which the vault helper and that
-        workspace's servers read instead. Called by the vault API on every CRUD
-        mutation. Also caches the secrets dict on ``self`` so the server can
-        pass them to ``LeakDetectionMiddleware`` without an extra DB call.
-        """
-        self.vault_secrets: dict[str, str] = secrets
-
-        if not self.runtime:
-            return
-
-        vault_path = path or self.layout.vault_secrets
-
-        if not secrets:
-            # Remove the file so vault.list_names() returns []
-            try:
-                await self._runtime_call(
-                    self.runtime.exec,
-                    f"rm -f {shlex.quote(vault_path)}",
-                    retry_policy=RetryPolicy.SAFE,
-                )
-            except Exception as e:
-                logger.warning("Failed to remove vault secrets file", error=str(e))
-            return
-
-        try:
-            if path is not None:
-                await self._runtime_call(
-                    self.runtime.exec,
-                    f"mkdir -p {shlex.quote(posixpath.dirname(vault_path))}",
-                    retry_policy=RetryPolicy.SAFE,
-                )
-            await self._runtime_call(
-                self.runtime.upload_file,
-                json.dumps(secrets).encode("utf-8"),
-                vault_path,
-                retry_policy=RetryPolicy.SAFE,
-            )
-            logger.info("Uploaded vault secrets file", path=vault_path)
-        except Exception as e:
-            logger.warning("Failed to upload vault secrets file", error=str(e))
 
     async def upload_egress_relay_credentials(self, payload: dict | None) -> bool:
         """Write (or remove) the egress-relay credential file in the sandbox.
@@ -1083,11 +1040,16 @@ class PTCSandbox:
             retry_policy=RetryPolicy.SAFE,
         )
 
-        # Batch upload — source is a local file path string
-        batch: list[tuple[str, str]] = [
+        batch: list[tuple[bytes | str, str]] = [
             (str(local_path), str(internal_root / rel_path))
             for local_path, rel_path in files
         ]
+        # The vault helper ships even with no secrets, so `from vault import
+        # get` always imports. Its source is stamped with this set, so it goes
+        # up in the same batch: a failed upload must not be recorded as applied.
+        batch.append(
+            (VAULT_MODULE_SOURCE.encode("utf-8"), str(internal_root / "vault.py"))
+        )
         await self._runtime_call(
             sandbox.upload_files,
             batch,
@@ -1095,25 +1057,9 @@ class PTCSandbox:
         )
         logger.debug(
             "Uploaded internal packages to sandbox",
-            uploaded_files=len(files),
+            uploaded_files=len(batch),
             sandbox_root=str(internal_root),
         )
-
-        # Upload vault helper module so `from vault import get` is always
-        # importable, even if no secrets exist yet.
-        try:
-            from ptc_agent.core.sandbox.vault_helper import VAULT_MODULE_SOURCE
-
-            vault_dest = str(internal_root / "vault.py")
-            await self._runtime_call(
-                sandbox.upload_file,
-                VAULT_MODULE_SOURCE.encode("utf-8"),
-                vault_dest,
-                retry_policy=RetryPolicy.SAFE,
-            )
-            logger.debug("Uploaded vault helper module", path=vault_dest)
-        except Exception as e:
-            logger.warning("Failed to upload vault helper module", error=str(e))
 
     # ── Unified manifest helpers ────────────────────────────────────────
 

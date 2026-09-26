@@ -140,9 +140,8 @@ async def _header_credential(grant: Mapping[str, Any]) -> VendorCredential:
     if not same_consented_url(row.get("url"), grant.get("destination_url")):
         raise _unconfigured(name, "the row now points somewhere else")
     refs = vault_ref_names(row.get("headers"))
-    # The user tier alone, which is what host-side discovery resolved to earn
-    # this row's verdict: a workspace entry of the same name shadowing it here
-    # would put a value on the wire that no probe ever tried.
+    # The vault, which is what host-side discovery resolved to earn this row's
+    # verdict.
     try:
         headers, missing = resolve_header_refs(
             row.get("headers"),

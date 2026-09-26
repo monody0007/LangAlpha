@@ -54,7 +54,7 @@
 - **Agent swarm** — 分離された context window、事前ロードされた toolset/skills、実行中 steering、checkpoint ベースの resume、UI でのライブ進捗監視を備えた、並列非同期 subagent 群です。
 - **Live steering** — agent や subagent の作業中に追加メッセージを送り、完了を待たずに方向修正、補足、リダイレクトができます。
 - **Middleware stack** — skill loading、plan mode、マルチモーダル入力、auto-compaction、context management を扱う深く composable な middleware stack により、長時間の agent session を支えます。
-- **Security & workspace vault** — pgcrypto による保存時暗号化、credential 漏えいの自動検出と redaction、sandboxed execution、agent が安全に利用できる workspace ごとの secret storage を提供します。
+- **Security & vault** — pgcrypto による保存時暗号化、credential 漏えいの自動検出と redaction、sandboxed execution、agent が安全に利用できる account ごとの secret storage を提供します。
 - **Channel integrations** — Slack、Discord、Feishu、Telegram から LangAlpha を使えます。スケジュール結果はメール配信もできます。
 - **Production-ready infrastructure** — Redis buffer による再接続 replay 付きの SSE-streamed agent activity、HTTP 接続から切り離された background execution、PostgreSQL-backed state persistence を備えます。
 
@@ -106,7 +106,7 @@ LangAlpha は、複数の LLM backend を抽象化する provider-agnostic な�
 - **PTC mode** は、深い多段階の投資リサーチ向けです。強い推論能力を使って分析方針を立て、金融データを整理し、複雑な分析のためのコードを書きます。長い context により、SEC filings とリサーチレポートを一度に突き合わせられます。
 - **Flash mode** は、素早い会話応答と workspace orchestration 向けです。簡単な市場参照、MarketView での chart-and-chat、軽量 Q&A、workspace 管理やバックグラウンド PTC 分析の dispatch と結果通知を行う secretary として使えます。
 
-**自分のモデルを持ち込む** — 既存の AI subscription や API key を直接使えます。OAuth で ChatGPT や Claude subscription（OpenAI Codex OAuth、Claude Code OAuth）を接続したり、Kimi（Moonshot）、GLM（Zhipu）、MiniMax、Doubao（Volcengine）の coding plan を使ったり、BYOK で任意の対応 provider の API key を設定できます。すべての key は PostgreSQL pgcrypto で保存時に暗号化されます（[セキュリティ](#セキュリティと-workspace-vault) を参照）。
+**自分のモデルを持ち込む** — 既存の AI subscription や API key を直接使えます。OAuth で ChatGPT や Claude subscription（OpenAI Codex OAuth、Claude Code OAuth）を接続したり、Kimi（Moonshot）、GLM（Zhipu）、MiniMax、Doubao（Volcengine）の coding plan を使ったり、BYOK で任意の対応 provider の API key を設定できます。すべての key は PostgreSQL pgcrypto で保存時に暗号化されます（[セキュリティ](#セキュリティと-vault) を参照）。
 
 **モデル耐障害性** — 一時的なエラーでは自動 retry し、その後は設定済み fallback model に failover します。reasoning effort（`low`/`medium`/`high`）は provider 間で自動的に正規化されます。
 
@@ -168,7 +168,7 @@ PTC は多段階のデータ処理、金融モデリング、チャート作成�
 
 agent は適切な layer を自動で選びます。context に収まる素早い lookup には native tools を使い、bulk data processing、charting、sandbox 内での複数年 trend analysis が必要な場合は MCP tools を使います。
 
-MCP server は workspace ごとに設定できます。built-in server は個別に無効化できます。custom HTTP または stdio server（[workspace vault](#workspace-vault) から credential を読むものを含む）は API や UI から追加でき、restart なしで数秒以内に反映されます。
+MCP server は account に一度 install し、workspace ごとに選択します。built-in server は個別に無効化できます。custom HTTP または stdio server（[vault](#vault) から credential を読むものを含む）は API や UI から追加でき、workspace ごとに on / off を切り替えられ、restart なしで数秒以内に反映されます。
 
 #### Data Provider フォールバックチェーン
 
@@ -333,7 +333,7 @@ PostgreSQL は LangGraph checkpointing、conversation history、user data（watc
 
 agent が触れた外部 data source はすべて trace され、表示されます。provenance middleware は、web search、page fetch、SEC filing、market-data call、MCP tool invocation、workspace file read を記録します。background subagents による access も含まれます。各 source につき `provenance` stream event が発行されますが、これらは LLM context には入りません。UI は各 turn の横に Sources panel として表示します。source は type ごとに group 化され、web origin には favicon が付き、detail view では provider、timestamp、captured arguments、content fingerprint、snippet を確認できます。*This turn / All sources* toggle により thread 全体の data footprint を表示できます。file や memo source をクリックすると workspace file panel で直接開けます。すべての research output の背後に、監査可能な data trail が残ります。
 
-## セキュリティと Workspace Vault
+## セキュリティと Vault
 
 LangAlpha は credential、code execution、user-supplied secrets に対し、layered security model を適用します。
 
@@ -343,9 +343,9 @@ LangAlpha は credential、code execution、user-supplied secrets に対し、la
 
 **Sandboxed code execution** — 各 workspace は、専用 filesystem と network boundary を持つ [Daytona](https://www.daytona.io/) cloud sandbox で動作します。protected path guards は agent が internal system directories に access するのを防ぎます。tool input は実行前に short-circuit され、tool output は leaked paths を redact します。
 
-### Workspace Vault
+### Vault
 
-各 workspace には、code execution 中に agent が使う API keys や credentials を保存する secret vault が組み込まれています。third-party data sources（brokerage APIs、external data vendors など）への access や、workspace 内での LLM-powered workflow 構築に役立ちます。UI で一度 secret を保存すると、その workspace のすべての agent session から簡単な Python API で利用できます。
+各 account には、code execution 中に agent が使う API keys や credentials を保存する secret vault が組み込まれています。third-party data sources（brokerage APIs、external data vendors など）への access や、workspace 内での LLM-powered workflow 構築に役立ちます。UI で一度 secret を保存すると、すべての workspace の agent session から簡単な Python API で利用できます。
 
 ```python
 from vault import get, list_names, load_env
@@ -355,7 +355,7 @@ names = list_names()               # list available secret names
 load_env()                         # bulk-load all secrets as env vars
 ```
 
-vault secrets は上記すべての保護層を継承します。保存時暗号化、agent および human-facing output からの redaction、direct file access の block が適用されます。secret の作成、更新、表示、削除ができるのは workspace owner のみです。
+vault secrets は上記すべての保護層を継承します。保存時暗号化、agent および human-facing output からの redaction、direct file access の block が適用されます。secret の作成、更新、表示、削除ができるのは account owner のみです。
 
 ## フロントエンド
 

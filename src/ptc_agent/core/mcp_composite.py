@@ -132,7 +132,7 @@ def build_composite_registry(
 ) -> Any:
     """Append user-server schemas onto the frozen built-in registry.
 
-    ``user_servers`` are the untrusted (``source`` 'workspace' or 'user'),
+    ``user_servers`` are the untrusted (``source`` 'user'),
     enabled servers the CALLER selected — the filter lives in
     ``WorkspaceManager``, not here — in resolver order (built-ins
     config-order, then user servers alphabetical). ``tool_schemas``

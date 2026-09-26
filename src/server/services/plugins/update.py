@@ -20,7 +20,6 @@ from pydantic import ValidationError
 
 from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
 from src.server.database.mcp_servers import (
-    bump_user_workspaces_mcp_version,
     delete_catalog_server,
     get_catalog_server,
 )
@@ -69,10 +68,7 @@ from src.server.services.user_skills.validate import (
     SkillValidationError,
     validate_skill_archive,
 )
-from src.server.services.vault_invalidation import (
-    USER_TIER,
-    after_secrets_changed,
-)
+from src.server.services.vault_invalidation import after_secrets_changed
 from src.server.utils.error_sanitization import validation_error_text
 
 logger = logging.getLogger(__name__)
@@ -160,9 +156,13 @@ async def _update_servers(
     plugin_id: str,
     package: ValidatedPackage,
     report: InstallReport,
-) -> bool:
-    """Reconcile owned server rows against the package. True if the
-    effective set changed (a bump is needed)."""
+) -> None:
+    """Reconcile owned server rows against the package.
+
+    Each arm writes through a catalog helper that bumps every workspace's MCP
+    config version in the same transaction as a live row, so no bump is left
+    for after the update, where a later failure could skip it.
+    """
     if package.mcp_document_invalid:
         # The new tree ships an mcp.json that failed document-level
         # validation, so it yields no entry plans. That is not the same claim
@@ -170,13 +170,12 @@ async def _update_servers(
         # would delete every owned row over an upstream typo. The diagnostics
         # already say what is wrong; the rows stay until a readable document
         # says otherwise.
-        return False
+        return
     owned = {
         s["plugin_server_key"] or s["name"]: s["name"]
         for s in await list_plugin_server_names(user_id, plugin_id)
     }
     incoming = {p.key: p for p in package.entry_plans}
-    changed = False
     # Shared across the update arms for the same reason the import loop shares
     # them across entries: two entries shipping the same literal get one
     # secret, and no allocation collides with a name already in the vault.
@@ -186,7 +185,6 @@ async def _update_servers(
     async def delete(key: str, row_name: str) -> None:
         # Delete through the helper that owns the purges, inside the same
         # OAuth fence the catalog DELETE endpoint uses.
-        nonlocal changed
         # Ownership first, because entering the fence is itself destructive:
         # it disconnects the server's OAuth connection and drops its schema
         # snapshots. The predicate below would then correctly refuse to delete
@@ -214,7 +212,6 @@ async def _update_servers(
                 user_id, row_name, owned_by_plugin=plugin_id
             ):
                 return
-        changed = True
         # renamed is a property of the key, never of the row: the component
         # must report the same flag here as it did at install.
         report.components.append(
@@ -227,7 +224,6 @@ async def _update_servers(
     async def update(key: str, row_name: str, plan) -> None:
         # In place, or keep the row when the new version of the entry doesn't
         # validate.
-        nonlocal changed
         report.diagnostics.extend(plan.diagnostics)
         if not plan.installable:
             report.components.append(
@@ -356,7 +352,6 @@ async def _update_servers(
                     )
                 )
             return
-        changed = True
         allocated.update(entry_plan.refs)
         used_secret_names.update(s.name for s in entry_plan.secrets)
         report.secrets_created.extend(s.name for s in entry_plan.secrets)
@@ -386,10 +381,7 @@ async def _update_servers(
     async def create(plans: list[Any]) -> None:
         # New keys go through the install fan-out, which also reports skipped
         # and sse-held-back plans.
-        nonlocal changed
-        before = report.servers_created
         await fan_out_servers(user_id, plugin_id, plans, report)
-        changed = changed or report.servers_created > before
 
     await reconcile(
         owned,
@@ -398,7 +390,6 @@ async def _update_servers(
             delete=delete, update=update, create=create, detached=detached
         ),
     )
-    return changed
 
 
 async def _replace_skill(
@@ -641,7 +632,7 @@ async def update_plugin_package(
             raise ValueError(
                 f"Plugin {plugin['name']!r} was uninstalled while this update waited"
             )
-        changed = await _update_servers(user_id, plugin_id, package, report)
+        await _update_servers(user_id, plugin_id, package, report)
         await _update_skills(user_id, plugin_id, package, report)
 
         # An unreadable mcp.json left the servers untouched above, so the stored
@@ -665,11 +656,7 @@ async def update_plugin_package(
         )
 
     disclose_vaulted_literals(report)
-    await after_secrets_changed(
-        USER_TIER, user_id, report.secrets_created, user_id=user_id
-    )
-    if changed:
-        await bump_user_workspaces_mcp_version(user_id)
+    await after_secrets_changed(user_id, report.secrets_created)
     logger.info(
         f"[plugins] update user_id={user_id} name={plugin['name']} "
         f"components={len(report.components)} complete={report.landed_whole}"

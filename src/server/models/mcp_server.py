@@ -20,7 +20,6 @@ round-trip them; ``env_refs``/``header_refs`` carry just the vault names.
 from __future__ import annotations
 
 import ipaddress
-import keyword
 import re
 import socket
 from dataclasses import asdict, dataclass, field as dataclass_field
@@ -41,21 +40,35 @@ from src.server.services.tool_binding import order_approval_map
 # in the frontend Zod schema; keep the two in sync).
 # ---------------------------------------------------------------------------
 
-NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
+NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}\Z")
 
 # A server name is also the module its tool wrappers are generated into,
 # imported from the sandbox's tools package beside the runtime's own
 # ``mcp_client``. NAME_RE admits three kinds of name that cannot hold that
 # role: the runtime's module, a dunder (``__init__`` is the package itself),
-# and a keyword (``from tools.class import ...`` does not parse). Soft keywords
-# are refused with the rest, the same line the tool-name sanitizer draws.
+# and a hard keyword (``from tools.class import ...`` does not parse). Soft
+# keywords stay legal, since ``from tools.match import ...`` parses. The
+# keywords are Python 3.13's ``keyword.kwlist`` written out, so which names
+# are refused does not move with the interpreter. The web form keeps a copy
+# (``mcpSchemas.ts``).
 _RUNTIME_MODULE = "mcp_client"
-_PY_KEYWORDS = frozenset(keyword.kwlist + keyword.softkwlist)
+_PY_KEYWORDS = frozenset({
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break",
+    "class", "continue", "def", "del", "elif", "else", "except", "finally",
+    "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal",
+    "not", "or", "pass", "raise", "return", "try", "while", "with", "yield",
+})
 
 
 def sandbox_name_error(name: str) -> Optional[str]:
-    """The validation message for a name the sandbox reserves, else ``None``."""
+    """The refusal for a name the sandbox reserves, else ``None``.
+
+    Checked where a name is introduced, not by ``McpServerInput``: a row saved
+    before its name was reserved has to stay editable, since the only other
+    way out is a delete that takes its OAuth connection, tool schemas,
+    per-workspace switches and plugin ownership with it.
+    """
     if name == _RUNTIME_MODULE:
         return (
             f"name {name!r} is reserved: the sandbox's MCP runtime module "
@@ -77,11 +90,10 @@ def sandbox_name_error(name: str) -> Optional[str]:
 def _unreserve(name: str) -> str:
     """Rename a NAME_RE-legal name the sandbox reserves into one it accepts.
 
-    A lone ``_`` goes the dunder way because suffixing it would open with
-    ``__`` again; a name with nothing left after its underscores has no
-    content to keep, so it takes a generic one.
+    A name with nothing left after its underscores has no content to keep, so
+    it takes a generic one.
     """
-    if name.startswith("__") or name == "_":
+    if name.startswith("__"):
         name = name.lstrip("_")
         if not name:
             return "server"
@@ -130,7 +142,7 @@ INSTRUCTION_MAX = 1024
 _FORBIDDEN_KEYS = ("vault_blueprints", "source")
 
 # A bare host-env placeholder like ``${VAR}`` or ``$VAR`` — never resolves for
-# workspace servers (only ``${vault:NAME}`` does), so fail fast at the API.
+# user servers (only ``${vault:NAME}`` does), so fail fast at the API.
 _BARE_ENV_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
 
 
@@ -250,8 +262,8 @@ def validate_remote_url(url: str) -> str:
         raise ValueError("url is required for sse/http transports")
     # Brace forms only (`${vault:NAME}`, `${VAR}`, unclosed `${`): bare `$word`
     # is a legitimate URL convention (OData `/$batch`, `?$filter=`) and is inert
-    # downstream — workspace URLs resolve `${vault:...}` refs exclusively, never
-    # host env vars.
+    # downstream: user server URLs resolve `${vault:...}` refs exclusively,
+    # never host env vars.
     if "${" in url:
         raise ValueError("url must not contain secrets or placeholders; put credentials in headers")
 
@@ -337,14 +349,14 @@ class McpServerInput(BaseModel):
 
     @model_validator(mode="after")
     def _validate_all(self) -> "McpServerInput":
+        # Shape only: the sandbox's reserved names are refused by the doors
+        # that introduce a name (``sandbox_name_error``), because this model
+        # also carries edits to rows that already hold theirs.
         if not NAME_RE.match(self.name):
             raise ValueError(
                 "name must be 1-64 chars: letter/underscore then "
                 "letters/digits/underscores"
             )
-        reserved = sandbox_name_error(self.name)
-        if reserved:
-            raise ValueError(reserved)
 
         # Transport ↔ field coherence.
         if self.transport == "stdio":
@@ -379,8 +391,8 @@ class McpServerInput(BaseModel):
         return self
 
     def to_config_blob(self) -> dict[str, Any]:
-        """Serialize to the JSON blob persisted in ``workspace_mcp_servers.config``
-        / the catalog columns. Reference strings only — never resolved secrets."""
+        """Serialize the definition as reference strings, never resolved
+        secrets."""
         return {
             "name": self.name,
             "transport": self.transport,
@@ -462,9 +474,9 @@ class ProbeInput(BaseModel):
 
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
-    # A workspace whose vault should also answer the refs, for the workspace
-    # tab's form. Ownership is checked by the route.
-    workspace_id: Optional[str] = None
+    # Sent by the earlier web build's workspace form and ignored: every probe
+    # now resolves refs from the caller's own vault. Drop it next release.
+    workspace_id: Optional[str] = Field(None, deprecated=True)
 
     model_config = {"extra": "forbid"}
 
@@ -536,21 +548,6 @@ class EnabledInput(BaseModel):
     """PATCH body for the enabled toggle."""
 
     enabled: bool
-
-    model_config = {"extra": "forbid"}
-
-
-class PromoteInput(BaseModel):
-    """POST body for promoting a workspace server into the user template catalog.
-
-    ``overwrite`` replaces an existing template of the same name; without it a
-    name clash is a 409 so the UI can confirm before clobbering. ``remove_source``
-    turns the copy into a move: the workspace row is deleted after the catalog
-    write, so it does not shadow the template it just created.
-    """
-
-    overwrite: bool = False
-    remove_source: bool = False
 
     model_config = {"extra": "forbid"}
 
@@ -734,10 +731,10 @@ class ToolSummary(BaseModel):
 class EffectiveServer(BaseModel):
     """One row in the effective per-workspace MCP list.
 
-    ``env``/``headers`` echo the stored reference maps for workspace-origin
-    servers (``${vault:NAME}`` ref strings or owner-supplied literals — never
-    resolved secrets) so the edit form can round-trip them; built-ins keep them
-    empty. ``env_refs``/``header_refs`` carry just the vault names for display.
+    ``env``/``headers`` echo the stored reference maps for user servers
+    (``${vault:NAME}`` ref strings or owner-supplied literals, never resolved
+    secrets) so the edit form can round-trip them; built-ins keep them empty.
+    ``env_refs``/``header_refs`` carry just the vault names for display.
     """
 
     name: str
@@ -745,7 +742,6 @@ class EffectiveServer(BaseModel):
     transport: str
     enabled: bool
     editable: bool
-    deletable: bool
     status: McpStatus
     error: str = ""
     tool_count: int = 0
@@ -763,10 +759,6 @@ class EffectiveServer(BaseModel):
     args: list[str] = Field(default_factory=list)
     url: Optional[str] = None
     config_version: int = 0
-    # True on a workspace-local row that shadows an inherited user server of
-    # the same name (the local-fork affordance) — deleting the local row
-    # reveals the inherited one again.
-    shadows_inherited: bool = False
     # Inherited (origin='user') rows only: the owner's OAuth connection status
     # for this server while a connection still claims it, so the UI can say
     # "reconnect in Plugins" instead of waiting on a discovery that can never
@@ -814,6 +806,10 @@ class CatalogServer(BaseModel):
     name: str
     transport: str
     enabled: bool = False
+    # Whether a workspace created from now on starts with this server on. Off
+    # for a server added from inside a workspace; a Plugins-page create, a
+    # plugin install and a brokerage start on.
+    enabled_in_new_workspaces: bool = True
     oauth_status: Optional[ConnectionStatus] = None
     # The capability groups in force on this connection, in the order they were
     # stored: a group whose requirement was not granted is left out, since its
@@ -862,9 +858,9 @@ class CatalogServer(BaseModel):
     header_refs: list[str] = Field(default_factory=list)
     # Echo the stored reference maps (``${vault:NAME}`` ref strings or the
     # owner's own literals — never resolved secrets) so the edit form can
-    # round-trip them, exactly as ``EffectiveServer`` does for workspace-origin
-    # rows. A PUT replaces the whole row, so a response that dropped them would
-    # make every unrelated edit a silent wipe.
+    # round-trip them, exactly as ``EffectiveServer`` does for user rows. A PUT
+    # replaces the whole row, so a response that dropped them would make every
+    # unrelated edit a silent wipe.
     env: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
     description: str = ""
@@ -898,29 +894,11 @@ class CatalogServer(BaseModel):
     plugin_enabled: Optional[bool] = None
 
 
-class WorkspaceScopedServer(BaseModel):
-    """A workspace-local server row surfaced in the all-scopes catalog view.
-
-    A summary, not an editable config: editing stays on the workspace
-    endpoints. ``shadows_inherited`` marks a name that also exists in the
-    catalog (the local fork hides the inherited copy in its workspace).
-    """
-
-    name: str
-    workspace_id: str
-    transport: str = "stdio"
-    enabled: bool = True
-    description: str = ""
-    shadows_inherited: bool = False
-
-
 class CatalogServerList(BaseModel):
     """GET /api/v1/mcp/servers payload."""
 
     servers: list[CatalogServer]
     max_servers: int
-    # all_scopes=true only: workspace-local servers across the user's workspaces.
-    workspace_servers: list[WorkspaceScopedServer] = Field(default_factory=list)
 
 
 class BuiltinServer(BaseModel):
@@ -1109,6 +1087,7 @@ def catalog_row_to_response(
         name=row["name"],
         transport=row["transport"],
         enabled=bool(row.get("enabled", False)),
+        enabled_in_new_workspaces=bool(row.get("enabled_in_new_workspaces", True)),
         oauth_status=oauth_status,
         granted_capabilities=granted_capabilities,
         remembered_capabilities=remembered_capabilities,

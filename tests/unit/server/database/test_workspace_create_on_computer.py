@@ -62,13 +62,21 @@ def cursor():
 
 @pytest.fixture
 def db(cursor):
+    """The insert's own statements only: the MCP selection a new workspace
+    starts with is pinned against a real Postgres in
+    tests/integration/test_new_workspace_mcp_selection_db.py."""
     conn = AsyncMock()
 
     @asynccontextmanager
     async def _cursor_cm(**kwargs):
         yield cursor
 
+    @asynccontextmanager
+    async def _transaction_cm():
+        yield
+
     conn.cursor = _cursor_cm
+    conn.transaction = _transaction_cm
 
     @asynccontextmanager
     async def _transaction():
@@ -85,6 +93,11 @@ def db(cursor):
         patch("src.server.database.workspace_folders.get_db_connection", new=_fake),
         patch.object(W, "get_workspace_dir_names_for_computer", AsyncMock(return_value=())),
         patch.object(W, "get_computer", AsyncMock(return_value={"provider_ref": "sbx", "layout_version": 4})),
+        patch("src.server.database.workspace.lock_user_writes", new=AsyncMock()),
+        patch(
+            "src.server.database.workspace.start_new_workspace_selection",
+            new=AsyncMock(),
+        ),
     ):
         yield cursor
 

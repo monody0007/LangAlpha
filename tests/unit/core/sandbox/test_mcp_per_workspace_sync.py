@@ -8,6 +8,8 @@ errors + parses file-IPC output.
 """
 
 import ast
+import errno
+import hashlib
 import json
 import os
 import shutil
@@ -37,6 +39,7 @@ from ptc_agent.core.sandbox.tool_overlay import (
     install_tool_modules,
     overlay_claim_missing,
 )
+from ptc_agent.core.sandbox.vault_helper import VAULT_MODULE_SOURCE
 
 
 def _make_config(servers=None) -> CoreConfig:
@@ -54,7 +57,7 @@ def _builtin(name, **kw):
 
 
 def _user(name, **kw):
-    return MCPServerConfig(name=name, source="workspace", **kw)
+    return MCPServerConfig(name=name, source="user", **kw)
 
 
 def _connector(name, **kw):
@@ -448,6 +451,11 @@ class TestManifestRegression:
         assert any(f.startswith("market_protocol/") and f.endswith(".py") for f in files)
         # …and the load-bearing non-.py seed is hashed, so it can't drop silently.
         assert "market_protocol/instruments.yaml" in files
+        # The generated vault helper rides the same upload, so an edit to its
+        # source has to move this module's version too.
+        assert files["vault.py"] == hashlib.sha256(
+            VAULT_MODULE_SOURCE.encode("utf-8")
+        ).hexdigest()
         assert manifest["modules"]["internal_packages"]["version"]
 
 
@@ -533,6 +541,55 @@ class TestWarmSandboxOAuthBinding:
 
         assert result.refreshed_modules == []
         same._install_tool_modules.assert_not_awaited()
+
+
+class TestInternalPackagesUpload:
+    """``vault.py`` is hashed into the ``internal_packages`` version, so the
+    manifest may only record that version once the helper is really there."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_vault_helper_upload_leaves_the_set_unstamped(self):
+        sandbox = _make_sandbox(_make_config(servers=[_builtin("yfinance")]))
+        sandbox.mcp_registry = MagicMock()
+        sandbox.mcp_registry.get_all_tools = MagicMock(return_value={})
+        remote = await sandbox._compute_sandbox_manifest()
+        remote["modules"]["internal_packages"]["version"] = "before-this-helper"
+
+        def refuse_vault(dest: str) -> None:
+            if dest.endswith("/vault.py"):
+                raise RuntimeError("upload refused")
+
+        async def upload_files(batch):
+            for _, dest in batch:
+                refuse_vault(dest)
+
+        async def upload_file(_content, dest):
+            refuse_vault(dest)
+
+        runtime = AsyncMock(spec=SandboxRuntime)
+        runtime.exec.return_value = ExecResult(stdout="", stderr="", exit_code=0)
+        runtime.upload_files.side_effect = upload_files
+        runtime.upload_file.side_effect = upload_file
+        sandbox.runtime = runtime
+        sandbox.provider.is_transient_error = MagicMock(return_value=False)
+
+        sandbox._wait_ready = AsyncMock()
+        sandbox.ensure_sandbox_ready = AsyncMock()
+        sandbox._prune_disabled_tool_modules = AsyncMock()
+        sandbox._read_unified_manifest = AsyncMock(return_value=remote)
+        sandbox._install_tool_modules = AsyncMock()
+        sandbox._start_internal_mcp_servers = AsyncMock()
+        sandbox._write_unified_manifest = AsyncMock()
+        sandbox._cleanup_legacy_manifests = AsyncMock()
+        with (
+            patch("ptc_agent.core.sandbox.assets.run_layout_migrations", AsyncMock()),
+            pytest.raises(RuntimeError, match="upload refused"),
+        ):
+            await sandbox.sync_sandbox_assets(reusing_sandbox=True)
+
+        # Stamping here would record a helper that never landed, and the next
+        # sync would see nothing left to redo.
+        sandbox._write_unified_manifest.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +832,7 @@ class TestDocPathTraversal:
         # The shipped helper, not a copy of it: this test used to re-derive the
         # filename, which is the same duplication that let a doc survive the
         # sweep meant to delete it.
-        name = doc_name(tool_name, source == "workspace")
+        name = doc_name(tool_name, source == "user")
         docs = SandboxLayout(work_dir).tools_docs
         return f"{docs}/{server_name}/{name}.md"
 
@@ -784,7 +841,7 @@ class TestDocPathTraversal:
         server = "user_srv"
         base = f"{SandboxLayout(work_dir).tools_docs}/{server}/"
         for hostile in ("../mcp_client", "../../_internal/.vault_secrets", "a/b", ".."):
-            path = self._doc_path(work_dir, server, hostile, "workspace")
+            path = self._doc_path(work_dir, server, hostile, "user")
             assert path.startswith(base)
             # No traversal component or separator escapes the server's docs dir.
             assert ".." not in path[len(base):]
@@ -819,6 +876,7 @@ def _script_prune(*, union_tools, union_docs, expected, legacy_client, printed):
     ]
     assert {fn.name for fn in fns} == wanted
     ns: dict = {
+        "errno": errno,
         "os": os,
         "shutil": shutil,
         "sys": sys,
@@ -965,6 +1023,45 @@ class TestStaleDocSweep:
             await install_tool_modules(
                 sandbox, project=ProjectContext("ws-broker", self.DIR)
             )
+
+    def test_a_path_another_writer_took_is_not_a_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """A writer racing the prune does not end the sync.
+
+        A path gone between the check and the unlink, or a file landing in a
+        tree mid-delete, leaves this pass nothing it could do, so the prune
+        reports what is on disk instead of failing.
+        """
+        docs = tmp_path / "docs"
+        (docs / "broker").mkdir(parents=True)
+        (docs / "broker" / "place_order.md").touch()
+        (docs / "retired").mkdir()
+        printed: list[str] = []
+        prune = _script_prune(
+            union_tools=str(tmp_path / "tools"),
+            union_docs=str(docs),
+            expected={"broker": []},
+            legacy_client=str(tmp_path / "tools" / "mcp_client.py"),
+            printed=printed,
+        )
+        real_unlink = os.unlink
+
+        def taken_first(path, *args, **kwargs):
+            real_unlink(path, *args, **kwargs)
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+
+        def written_into(path, *args, **kwargs):
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", path)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "unlink", taken_first)
+            m.setattr(shutil, "rmtree", written_into)
+            gone = prune(["retired"])
+
+        assert printed == []
+        assert gone == [str(docs / "broker" / "place_order.md")]
+        assert (docs / "retired").is_dir()
 
     @pytest.mark.asyncio
     async def test_an_unlistable_docs_dir_is_not_read_as_nothing_to_sweep(

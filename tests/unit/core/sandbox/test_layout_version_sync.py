@@ -25,9 +25,9 @@ from ptc_agent.config.core import (
     SecurityConfig,
 )
 from ptc_agent.core.project_context import ProjectContext
-from ptc_agent.core.sandbox.assets import sync_sandbox_assets
+from ptc_agent.core.sandbox.assets import publish_vault_secrets, sync_sandbox_assets
 from ptc_agent.core.sandbox.migration import CURRENT_LAYOUT_VERSION
-from ptc_agent.core.sandbox.runtime import SandboxRuntime
+from ptc_agent.core.sandbox.runtime import ExecResult, SandboxRuntime
 
 WORK_DIR = "/home/workspace"
 DIR_NAME = "acme-ab12"
@@ -196,7 +196,15 @@ class TestTheMigrationStampsItself:
         sandbox._build_complete_skills_cache.assert_called_once()
 
 
+VAULT_FILE = f"{WORK_DIR}/_internal/.vault_secrets.json"
+
+
 class TestVaultPublication:
+    """The root vault file is rewritten exactly when what it holds on disk
+    differs from the owner's vault. A digest recorded beside it would be
+    trusted after the earlier version rewrote the path, or after anything
+    removed it."""
+
     @staticmethod
     def _digest(payload):
         encoded = json.dumps(
@@ -204,70 +212,146 @@ class TestVaultPublication:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @classmethod
+    def _on_disk(cls, sandbox, payload, *, exit_code=0):
+        """Answer the digest read as a file holding *payload* would."""
+        if payload is None:
+            stdout = "absent\n"
+        else:
+            stdout = f"{cls._digest(payload)}  {VAULT_FILE}\n"
+
+        async def run(command, *args, **kwargs):
+            if "sha256sum" in command:
+                return ExecResult(stdout=stdout, stderr="", exit_code=exit_code)
+            return ExecResult(stdout="", stderr="", exit_code=0)
+
+        sandbox.runtime.exec = AsyncMock(side_effect=run)
+
+    @staticmethod
+    async def _settle(sandbox):
+        sandbox._read_unified_manifest = AsyncMock(
+            return_value=await _settled_manifest(
+                sandbox, layout_version=CURRENT_LAYOUT_VERSION
+            )
+        )
+
+    @staticmethod
+    def _commands(sandbox):
+        return [call.args[0] for call in sandbox.runtime.exec.await_args_list]
+
     @pytest.mark.asyncio
-    async def test_unchanged_vault_content_is_not_published_again(self):
+    async def test_a_file_already_holding_the_vault_is_left_alone(self):
         sandbox = _make_sandbox()
         payload = {"API_KEY": "secret"}
-        remote = await _settled_manifest(sandbox, layout_version=CURRENT_LAYOUT_VERSION)
-        remote["vaults"] = {"ws-1": self._digest(payload)}
-        sandbox._read_unified_manifest = AsyncMock(return_value=remote)
+        await self._settle(sandbox)
+        self._on_disk(sandbox, payload)
 
         await sync_sandbox_assets(
-            sandbox,
-            reusing_sandbox=True,
-            project=PROJECT,
-            vault_payloads={"ws-1": payload},
+            sandbox, reusing_sandbox=True, project=PROJECT, vault_secrets=payload
         )
 
         sandbox.runtime.upload_file.assert_not_awaited()
         sandbox._write_unified_manifest.assert_not_awaited()
-        sandbox._read_unified_manifest.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_changed_vault_content_is_published_and_stamped(self):
+    async def test_a_file_holding_other_content_is_rewritten(self):
         sandbox = _make_sandbox()
-        payload = {"API_KEY": "new-secret"}
-        remote = await _settled_manifest(sandbox, layout_version=CURRENT_LAYOUT_VERSION)
-        remote["vaults"] = {"ws-1": self._digest({"API_KEY": "old-secret"})}
-        sandbox._read_unified_manifest = AsyncMock(return_value=remote)
+        await self._settle(sandbox)
+        self._on_disk(sandbox, {"API_KEY": "old-secret"})
 
         await sync_sandbox_assets(
             sandbox,
             reusing_sandbox=True,
             project=PROJECT,
-            vault_payloads={"ws-1": payload},
+            vault_secrets={"API_KEY": "new-secret"},
+        )
+
+        assert sandbox.runtime.upload_file.await_args.args == (
+            b'{"API_KEY":"new-secret"}',
+            VAULT_FILE,
+        )
+        # Nothing about the vault lives in the manifest any more.
+        sandbox._write_unified_manifest.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_file_gone_from_disk_is_written_again(self):
+        sandbox = _make_sandbox()
+        payload = {"API_KEY": "secret"}
+        await self._settle(sandbox)
+        self._on_disk(sandbox, None)
+
+        await sync_sandbox_assets(
+            sandbox, reusing_sandbox=True, project=PROJECT, vault_secrets=payload
         )
 
         sandbox.runtime.upload_file.assert_awaited_once()
-        assert (
-            sandbox.runtime.upload_file.await_args.args[0]
-            == b'{"API_KEY":"new-secret"}'
-        )
-        written = sandbox._write_unified_manifest.await_args.args[0]
-        assert written["vaults"]["ws-1"] == self._digest(payload)
-        sandbox._read_unified_manifest.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_empty_vault_removes_the_old_file_and_stamps_empty(self):
+    async def test_an_unreadable_file_is_written_rather_than_trusted(self):
         sandbox = _make_sandbox()
-        remote = await _settled_manifest(sandbox, layout_version=CURRENT_LAYOUT_VERSION)
-        remote["vaults"] = {"ws-1": self._digest({"API_KEY": "old-secret"})}
-        sandbox._read_unified_manifest = AsyncMock(return_value=remote)
+        payload = {"API_KEY": "secret"}
+        await self._settle(sandbox)
+        self._on_disk(sandbox, payload, exit_code=1)
 
         await sync_sandbox_assets(
-            sandbox,
-            reusing_sandbox=True,
-            project=PROJECT,
-            vault_payloads={"ws-1": {}},
+            sandbox, reusing_sandbox=True, project=PROJECT, vault_secrets=payload
         )
 
-        commands = [call.args[0] for call in sandbox.runtime.exec.await_args_list]
-        assert any(
-            command == f"rm -f {WORK_DIR}/_internal/vaults/ws-1.json"
-            for command in commands
+        sandbox.runtime.upload_file.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_vault_removes_the_file(self):
+        sandbox = _make_sandbox()
+        await self._settle(sandbox)
+        self._on_disk(sandbox, {"API_KEY": "old-secret"})
+
+        await sync_sandbox_assets(
+            sandbox, reusing_sandbox=True, project=PROJECT, vault_secrets={}
         )
-        written = sandbox._write_unified_manifest.await_args.args[0]
-        assert written["vaults"]["ws-1"] == self._digest({})
+
+        assert f"rm -f {VAULT_FILE}" in self._commands(sandbox)
+        sandbox.runtime.upload_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_vault_with_no_file_does_nothing(self):
+        sandbox = _make_sandbox()
+        await self._settle(sandbox)
+        self._on_disk(sandbox, None)
+
+        await sync_sandbox_assets(
+            sandbox, reusing_sandbox=True, project=PROJECT, vault_secrets={}
+        )
+
+        assert not any(c.startswith("rm ") for c in self._commands(sandbox))
+        sandbox.runtime.upload_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_sync_with_nothing_to_say_does_not_read_the_file(self):
+        sandbox = _make_sandbox()
+        await self._settle(sandbox)
+        self._on_disk(sandbox, None)
+
+        await sync_sandbox_assets(sandbox, reusing_sandbox=True, project=PROJECT)
+
+        assert not any("sha256sum" in c for c in self._commands(sandbox))
+        sandbox.runtime.upload_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_direct_push_is_gated_on_the_file(self):
+        sandbox = _make_sandbox()
+        payload = {"API_KEY": "secret"}
+        sandbox._read_unified_manifest = AsyncMock()
+        self._on_disk(sandbox, {"API_KEY": "old-secret"})
+
+        assert await publish_vault_secrets(sandbox, payload) is True
+        sandbox.runtime.upload_file.assert_awaited_once()
+
+        self._on_disk(sandbox, payload)
+        sandbox.runtime.upload_file.reset_mock()
+        assert await publish_vault_secrets(sandbox, payload) is False
+        sandbox.runtime.upload_file.assert_not_awaited()
+        sandbox._read_unified_manifest.assert_not_awaited()
+        sandbox._write_unified_manifest.assert_not_awaited()
 
 
 class TestTheWorkspaceTierIsCreated:

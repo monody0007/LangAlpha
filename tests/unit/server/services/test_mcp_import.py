@@ -39,7 +39,6 @@ def _scope(persist, *, existing_names=(), create_secret=None):
     return ImportScope(
         reserved_names=set(),
         existing_names=set(existing_names),
-        current_count=0,
         cap=50,
         cap_message="cap",
         exists_message="exists",
@@ -141,3 +140,25 @@ async def test_one_real_token_in_two_servers_is_still_stored_once():
 
     assert created == ["SRV_A_X_API_KEY"]
     assert headers["srv_a"] == headers["srv_b"] == "${vault:SRV_A_X_API_KEY}"
+
+
+async def test_an_uncoerced_reserved_name_does_not_land():
+    # The model checks shape only, so the loop is where every import and
+    # install door refuses a name the sandbox reserves.
+    landed: list[str] = []
+
+    async def persist(conn, server, entry):
+        landed.append(server.name)
+        return True
+
+    report = await run_mcp_import(
+        [
+            _entry("class", "class", transport="stdio", command="npx"),
+            _entry("match", "match", transport="stdio", command="npx"),
+        ],
+        scope=_scope(persist),
+    )
+
+    assert [r["status"] for r in report.results] == ["invalid", "created"]
+    assert "Python keyword" in report.results[0]["error"]
+    assert landed == ["match"]

@@ -128,12 +128,12 @@ class SecurityConfig(BaseModel):
 
 
 class VaultBlueprint(BaseModel):
-    """Credential an MCP server expects users to set in the workspace vault.
+    """Credential an MCP server expects users to set in their vault.
 
     Pure metadata — never touches actual values. Surfaced via
-    GET /api/v1/workspaces/{id}/vault/blueprints as a 'recommended but not set'
-    list in the UI's Vault tab, so users don't have to read docs to learn the
-    exact secret name for each integration.
+    GET /api/v1/mcp/vault/blueprints as a 'recommended but not set' list on
+    the Plugins page's Secrets tab, so users don't have to read docs to learn
+    the exact secret name for each integration.
     """
 
     # Same regex as CreateSecretRequest in src/server/models/vault.py.
@@ -190,12 +190,12 @@ class MCPServerConfig(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)  # For SSE/HTTP transports
     tool_exposure_mode: Literal["summary", "detailed"] | None = None  # Per-server override
     vault_blueprints: list[VaultBlueprint] = Field(default_factory=list)
-    # 'builtin' = from agent_config.yaml; 'workspace' = user-configured per-workspace;
-    # 'user' = user-level server inherited by every workspace of the user.
-    # Workspace AND user servers are untrusted: vault-only secret resolution,
-    # neutral prompt framing, sanitized discovery.
-    source: Literal["builtin", "workspace", "user"] = "builtin"
-    discovery_uses_secrets: bool = False  # workspace servers: resolve vault secrets during discovery (default off = secret-less probe)
+    # 'builtin' = from agent_config.yaml; 'user' = user-level server inherited
+    # by every workspace of the user unless that workspace switched it off.
+    # User servers are untrusted: vault-only secret resolution, neutral prompt
+    # framing, sanitized discovery.
+    source: Literal["builtin", "user"] = "builtin"
+    discovery_uses_secrets: bool = False  # user servers: resolve vault secrets during discovery (default off = secret-less probe)
     # Set at resolve time when the user has a non-revoked OAuth connection for
     # this server — the server is then bound through the egress relay and its
     # sandbox config carries a grant reference instead of the vendor URL.

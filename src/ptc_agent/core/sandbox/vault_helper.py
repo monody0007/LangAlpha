@@ -1,26 +1,15 @@
 """Source code for the ``vault`` Python module uploaded to the sandbox.
 
 The module is written to ``_internal/src/vault.py`` so it's importable via
-``from vault import get, list_names, load_env``. The computer root's
-``_internal/.vault_secrets.json`` holds the user tier; each workspace's own
-merged set lives under :data:`VAULTS_DIR`, named by the workspace's claim, and
-the helper finds it through the calling folder's ``mcp_client_config.json``.
+``from vault import get, list_names, load_env``. It reads the owner's secrets
+from the computer root's ``_internal/.vault_secrets.json``, the one vault every
+workspace on the computer shares.
 """
 
-from ..paths import SandboxLayout, WorkspaceLayout
-
-#: Per-workspace vault files, under the runtime tier so file tools, backups
-#: and the file panel never see them.
-VAULTS_DIR = f"{SandboxLayout.INTERNAL_DIR}/vaults"
-
-
-def workspace_vault_path(root: str, claim: str) -> str:
-    """Where one workspace's effective secrets live on the computer."""
-    return f"{root.rstrip('/')}/{VAULTS_DIR}/{claim}.json"
-
+from ..paths import WorkspaceLayout
 
 _VAULT_MODULE_TEMPLATE = '''\
-"""Workspace vault — access user-provided API keys and credentials.
+"""Vault: access user-provided API keys and credentials.
 
 Usage::
 
@@ -33,40 +22,44 @@ Usage::
 import json
 import os
 
-_ROOT_SECRETS_FILE = os.path.join(
+_SECRETS_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     ".vault_secrets.json",
 )
 _WS_CONFIG_REL = "__WS_CONFIG_REL__"
 
 
-def _secrets_file() -> str:
-    """The calling workspace's vault, found from the working directory.
+def _names_own_vault() -> bool:
+    """Whether the calling folder's tools still name a per-workspace vault.
 
-    Several workspaces share this computer and each has its own secrets; the
-    folder a call runs in names which. Outside every folder the root file (the
-    user tier) answers.
+    An earlier version gave each workspace its own vault, and the root one is
+    the account's, where a secret of the same name can hold another value.
     """
     here = os.getcwd()
     for _ in range(32):
-        candidate = os.path.join(here, _WS_CONFIG_REL)
         try:
-            with open(candidate, encoding="utf-8") as f:
+            with open(os.path.join(here, _WS_CONFIG_REL), encoding="utf-8") as f:
                 view = json.load(f)
         except (OSError, ValueError):
             view = None
-        if isinstance(view, dict) and view.get("vault_file"):
-            return str(view["vault_file"])
+        if isinstance(view, dict):
+            return bool(view.get("vault_file"))
         parent = os.path.dirname(here)
         if parent == here:
             break
         here = parent
-    return _ROOT_SECRETS_FILE
+    return False
 
 
 def _load() -> dict[str, str]:
+    if _names_own_vault():
+        raise RuntimeError(
+            "This workspace was set up by an earlier version and still names "
+            "its own vault; secrets are available once the workspace starts "
+            "again"
+        )
     try:
-        with open(_secrets_file()) as f:
+        with open(_SECRETS_FILE) as f:
             return json.load(f)
     except FileNotFoundError:
         return {}

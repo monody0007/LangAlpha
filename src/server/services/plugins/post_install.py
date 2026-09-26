@@ -13,7 +13,6 @@ import logging
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from src.server.database.mcp_servers import bump_user_workspaces_mcp_version
 from src.server.database.plugins import (
     claim_plugin_secrets,
     get_plugin,
@@ -46,10 +45,7 @@ from src.server.services.plugins.grants import (
 from src.server.services.plugins.manifest import manifest_extension
 from src.server.services.plugins.mcp import McpEntryPlan, validate_mcp_document
 from src.server.services.plugins.server_fanout import fan_out_servers
-from src.server.services.vault_invalidation import (
-    USER_TIER,
-    after_secrets_changed,
-)
+from src.server.services.vault_invalidation import after_secrets_changed
 
 logger = logging.getLogger(__name__)
 
@@ -145,15 +141,12 @@ async def apply_sse_upgrades(
             consented.append(plan)
         if not consented:
             return report
+        # Each row commits with its own version bump, as on install.
         await fan_out_servers(
             user_id, plugin["user_plugin_id"], consented, report
         )
     disclose_vaulted_literals(report)
-    await after_secrets_changed(
-        USER_TIER, user_id, report.secrets_created, user_id=user_id
-    )
-    if report.servers_created:
-        await bump_user_workspaces_mcp_version(user_id)
+    await after_secrets_changed(user_id, report.secrets_created)
     logger.info(
         f"[plugins] sse upgrade user_id={user_id} name={plugin['name']} "
         f"servers={report.servers_created}"
@@ -224,5 +217,5 @@ async def apply_bindings(
     await claim_plugin_secrets(user_id, plugin["user_plugin_id"], introduced)
     # A filled blueprint is what makes a dangling ${vault:NAME} on an
     # already-enabled server resolve; the caches must not keep the old view.
-    await after_secrets_changed(USER_TIER, user_id, written, user_id=user_id)
+    await after_secrets_changed(user_id, written)
     return written
