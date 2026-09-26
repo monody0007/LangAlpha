@@ -20,7 +20,6 @@ import { PackagesTab } from './sandbox/PackagesTab';
 import { StorageTab } from './sandbox/StorageTab';
 import { ToolsTab } from './sandbox/ToolsTab';
 import type { RefreshResult, SandboxStats } from './sandbox/sandboxTypes';
-import { WorkspaceSecretsTab } from './vault/WorkspaceSecretsTab';
 
 interface SandboxSettingsPanelProps {
   onClose: () => void;
@@ -63,12 +62,6 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
   // when a faster post-action read lands — without this the older response wins
   // by arriving last and resurrects a stopped sandbox as running.
   const statsRequestRef = useRef(0);
-
-  // Vault deep-link: an MCP "Set up NAME" affordance switches to the Vault tab
-  // and prefills the add form with that secret name. The tab acknowledges it so
-  // the prefill fires once and doesn't replay when the tab is reopened.
-  const [vaultPrefillSecret, setVaultPrefillSecret] = useState<string | null>(null);
-  const consumeVaultPrefill = useCallback(() => setVaultPrefillSecret(null), []);
 
   const loadStats = useCallback(async () => {
     const requestId = ++statsRequestRef.current;
@@ -135,18 +128,12 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
 
   const tabs = [
     { key: 'overview', label: 'Overview' },
-    { key: 'vault', label: 'Vault' },
     { key: 'mcp', label: 'MCP' },
     { key: 'skills', label: 'Skills' },
     { key: 'storage', label: 'Storage' },
     { key: 'packages', label: 'Packages' },
     { key: 'tools', label: 'Runtime' },
   ];
-
-  function openVaultTab(prefillSecretName?: string) {
-    setVaultPrefillSecret(prefillSecretName ?? null);
-    setActiveTab('vault');
-  }
 
   // Canonical value only. Provider synonyms are the API's job to translate — see
   // _DISPLAY_STATE_SYNONYMS server-side.
@@ -197,16 +184,7 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
               dirName={workspace?.dir_name ?? null}
             />
           )}
-          {activeTab === 'vault' && (
-            <WorkspaceSecretsTab
-              workspaceId={workspaceId}
-              prefillSecretName={vaultPrefillSecret}
-              onPrefillConsumed={consumeVaultPrefill}
-            />
-          )}
-          {activeTab === 'mcp' && (
-            <McpTab workspaceId={workspaceId} onOpenVaultTab={openVaultTab} />
-          )}
+          {activeTab === 'mcp' && <McpTab workspaceId={workspaceId} />}
           {activeTab === 'skills' && <SkillsTab workspaceId={workspaceId} />}
           {activeTab === 'storage' && (
             isRunning ? (

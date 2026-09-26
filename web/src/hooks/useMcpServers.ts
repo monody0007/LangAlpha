@@ -7,13 +7,10 @@ import { needsDiscoveryProbe, PROBE_KICK_WINDOW_MS } from '../pages/ChatAgent/co
 import {
   getWorkspaceMcpServers,
   addWorkspaceMcpServer,
-  adoptMcpServerToWorkspace,
   updateWorkspaceMcpServer,
   setWorkspaceMcpServerEnabled,
-  deleteWorkspaceMcpServer,
   discoverWorkspaceMcpServer,
   importWorkspaceMcpServers,
-  promoteWorkspaceMcpServerToTemplate,
   getMcpCatalog,
   getMcpCatalogServerTools,
   getBuiltinMcpServers,
@@ -23,6 +20,7 @@ import {
   updateMcpCatalogServer,
   deleteMcpCatalogServer,
   setMcpCatalogServerEnabled,
+  setMcpCatalogServerNewWorkspaces,
   setMcpCatalogServerBinding,
   mergeToolBinding,
   mergeOrderApproval,
@@ -31,6 +29,7 @@ import {
   refreshMcpOauthSchemas,
   getBrokerages,
   setBrokerageEnabled,
+  type CatalogServer,
   type CatalogServerList,
   type EffectiveServerList,
   type McpServerBindingPatch,
@@ -57,21 +56,19 @@ import {
  * One blast radius for every mutation that changes what an MCP row looks like:
  * `queryKeys.mcp.all`.
  *
- * A catalog row that is enabled is inherited by EVERY workspace of the user, so
- * creating, editing, deleting or disconnecting one changes each workspace's
- * effective list exactly as toggling it does. Invalidating only the catalog
- * leaves an open workspace panel showing the pre-edit definition, which is the
- * drift these three different radii had already produced.
+ * A server lives on the account and every workspace lists it, so creating,
+ * editing, deleting or disconnecting one, from either surface, changes the
+ * catalog and each workspace's effective list at once. Invalidating only the
+ * surface that asked leaves the other showing the pre-edit definition, which
+ * is the drift these three different radii had already produced.
  *
  * Exported because callers outside this module need the same radius without
  * re-deciding it: a bulk MCP action on the Plugins page reaching for the
  * plugin-wide fan-out instead would drop the skills and vault caches too, which
  * an MCP change cannot have altered.
  *
- * The radius covers every scope's cached probe verdicts (`queryKeys.mcp.probes`)
- * on purpose. A user-tier secret resolves for workspace probes as well, so a
- * user-vault mutation answers `missing_secrets` in every vault at once; a
- * workspace-vault mutation invalidates only its own scope instead.
+ * The radius covers the cached probe verdicts (`queryKeys.mcp.probes`) on
+ * purpose: a vault mutation answers their `missing_secrets`.
  */
 export function invalidateMcpFanout(qc: QueryClient) {
   qc.invalidateQueries({ queryKey: queryKeys.mcp.all });
@@ -220,7 +217,7 @@ const CATALOG_PROBE_POLL_MAX_MS = PROBE_KICK_WINDOW_MS;
 // answered with a fresh kick.
 const CATALOG_KICK_THROTTLE_MS = 120_000;
 
-/** The user's MCP template catalog. */
+/** The account's MCP servers, as the Plugins page lists them. */
 export function useMcpCatalog(enabled = true) {
   // The outstanding set and when the wait on it opened. A change to the set
   // restarts the clock; the same set running long stops the poll. The signature
@@ -338,13 +335,17 @@ export function useToggleBuiltinMcpServer() {
 // Per-workspace mutations
 // ---------------------------------------------------------------------------
 
+// Add, edit and import from a workspace write the ACCOUNT server (and an add
+// switches it off in every other workspace), so they take the shared radius
+// rather than this workspace's key alone.
+
 export function useAddWorkspaceMcpServer(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     ...FAIL_FAST_OFFLINE,
     mutationFn: (body: McpServerInput) => addWorkspaceMcpServer(workspaceId, body),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
+      invalidateMcpFanout(queryClient);
     },
   });
 }
@@ -356,7 +357,7 @@ export function useUpdateWorkspaceMcpServer(workspaceId: string) {
     mutationFn: ({ name, body }: { name: string; body: McpServerInput }) =>
       updateWorkspaceMcpServer(workspaceId, name, body),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
+      invalidateMcpFanout(queryClient);
     },
   });
 }
@@ -399,25 +400,17 @@ export function useToggleWorkspaceMcpServer(workspaceId: string) {
       if (context?.previous) queryClient.setQueryData(key, context.previous);
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: key });
-    },
-  });
-}
-
-export function useDeleteWorkspaceMcpServer(workspaceId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (name: string) => deleteWorkspaceMcpServer(workspaceId, name),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
+      // The switch writes this workspace's marker, which the Plugins scope
+      // checklist reads off the catalog too.
+      invalidateMcpFanout(queryClient);
     },
   });
 }
 
 /**
  * Bulk-import a standard `mcpServers` blob (parsed JSON object). The backend
- * auto-extracts inline literal credentials into the WORKSPACE vault, so that
- * list is invalidated too — otherwise the freshly created secrets stay
+ * auto-extracts inline literal credentials into the account vault, so that
+ * list is invalidated too; otherwise the freshly created secrets stay
  * invisible (and the server modal's picker keeps offering to re-create them)
  * until the staleTime lapses. Same rule as the catalog import.
  */
@@ -427,69 +420,17 @@ export function useImportWorkspaceMcpServers(workspaceId: string) {
     ...FAIL_FAST_OFFLINE,
     mutationFn: (payload: unknown) => importWorkspaceMcpServers(workspaceId, payload),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.workspaceVault.byWorkspace(workspaceId) });
-    },
-  });
-}
-
-/**
- * Promote a workspace server up into the user template catalog. Invalidates the
- * catalog so the new/updated template appears in the Templates view; the
- * workspace list is untouched (promotion doesn't change the workspace set).
- *
- * The workspace id rides in the vars because the all-scopes Plugins list mixes
- * rows from many workspaces in one list; a fixed-workspace page passes the
- * same id every call. `removeSource` turns a copy into a move.
- */
-export function usePromoteMcpServerToTemplate() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({
-      workspaceId,
-      name,
-      overwrite,
-      removeSource,
-    }: {
-      workspaceId: string;
-      name: string;
-      overwrite?: boolean;
-      removeSource?: boolean;
-    }) =>
-      promoteWorkspaceMcpServerToTemplate(
-        workspaceId, name, overwrite ?? false, removeSource ?? false,
-      ),
-    onSuccess: (_data, vars) => {
-      // With removeSource the workspace set changes too (the fork is gone),
-      // so the whole prefix goes; a plain copy touches only the catalog.
-      queryClient.invalidateQueries({
-        queryKey: vars.removeSource ? queryKeys.mcp.all : queryKeys.mcp.catalog(),
-      });
-    },
-  });
-}
-
-/**
- * Move a user-level server INTO one workspace (the down direction). The
- * catalog row disappears and every workspace's effective list changes, so the
- * whole `mcp` prefix is invalidated.
- */
-export function useAdoptMcpServerToWorkspace() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({ workspaceId, name }: { workspaceId: string; name: string }) =>
-      adoptMcpServerToWorkspace(workspaceId, name),
-    onSuccess: () => {
       invalidateMcpFanout(queryClient);
+      queryClient.invalidateQueries({ queryKey: queryKeys.userVault.all });
     },
   });
 }
 
-/** Per-workspace enable toggle with the workspace id in the vars — for the
- * all-scopes Plugins view where one list mixes rows from many workspaces
+/** Per-workspace enable toggle with the workspace id in the vars, for the
+ * Plugins scope checklist, which addresses many workspaces from one row
  * (useToggleWorkspaceMcpServer serves the single-workspace pages). Writes
- * tombstones / builtin markers for inherited names, so the catalog and
- * builtin views change too: whole-prefix invalidation. */
+ * tombstones / builtin markers, so the catalog and builtin views change too:
+ * whole-prefix invalidation. */
 export function useSetMcpServerEnabledInWorkspace() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -509,16 +450,16 @@ export function useSetMcpServerEnabledInWorkspace() {
 }
 
 /**
- * Discovery probe. Invalidates the workspace list on success so the freshly
- * probed status + tool count surface on the row immediately; callers also
- * render the returned result inline.
+ * Discovery probe. Callers render the returned result inline; the fan-out
+ * brings the probed status and tool count to every list, because a remote
+ * row's probe lands on the account row every workspace and Plugins read.
  */
 export function useDiscoverWorkspaceMcpServer(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (name: string) => discoverWorkspaceMcpServer(workspaceId, name),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
+      invalidateMcpFanout(queryClient);
     },
   });
 }
@@ -526,6 +467,41 @@ export function useDiscoverWorkspaceMcpServer(workspaceId: string) {
 // ---------------------------------------------------------------------------
 // Catalog mutations
 // ---------------------------------------------------------------------------
+
+/**
+ * The optimistic half of a mutation that edits one catalog row in place:
+ * patch the row at once, put the previous list back if the write fails, and
+ * take the shared radius either way.
+ */
+function optimisticCatalogRow<V extends { name: string }>(
+  queryClient: QueryClient,
+  patch: (row: CatalogServer, vars: V) => CatalogServer,
+) {
+  const key = queryKeys.mcp.catalog();
+  return {
+    onMutate: async (vars: V) => {
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<CatalogServerList>(key);
+      if (previous) {
+        queryClient.setQueryData<CatalogServerList>(key, {
+          ...previous,
+          servers: previous.servers.map((s) => (s.name === vars.name ? patch(s, vars) : s)),
+        });
+      }
+      return { previous };
+    },
+    onError: (
+      _err: unknown,
+      _vars: V,
+      context: { previous?: CatalogServerList } | undefined,
+    ) => {
+      if (context?.previous) queryClient.setQueryData(key, context.previous);
+    },
+    onSettled: () => {
+      invalidateMcpFanout(queryClient);
+    },
+  };
+}
 
 /** Catalog mutations all take the shared radius (`invalidateMcpFanout`). */
 export function useCreateMcpCatalogServer() {
@@ -561,34 +537,36 @@ export function useDeleteMcpCatalogServer() {
   });
 }
 
+type NameEnabled = { name: string; enabled: boolean };
+
 /** Optimistic user-level enabled toggle (Plugins page). */
 export function useToggleMcpCatalogServer() {
   const queryClient = useQueryClient();
-  const key = queryKeys.mcp.catalog();
   return useMutation({
-    mutationFn: ({ name, enabled }: { name: string; enabled: boolean }) =>
-      setMcpCatalogServerEnabled(name, enabled),
-    onMutate: async ({ name, enabled }) => {
-      await queryClient.cancelQueries({ queryKey: key });
-      const previous = queryClient.getQueryData<CatalogServerList>(key);
-      if (previous) {
-        queryClient.setQueryData<CatalogServerList>(key, {
-          ...previous,
-          servers: previous.servers.map((s) =>
-            s.name === name ? { ...s, enabled } : s,
-          ),
-        });
-      }
-      return { previous };
-    },
-    onError: (_err, _vars, context) => {
-      if (context?.previous) queryClient.setQueryData(key, context.previous);
-    },
-    onSettled: () => {
-      invalidateMcpFanout(queryClient);
-    },
+    mutationFn: ({ name, enabled }: NameEnabled) => setMcpCatalogServerEnabled(name, enabled),
+    ...optimisticCatalogRow(queryClient, (s, { enabled }: NameEnabled) => ({ ...s, enabled })),
   });
 }
+
+/**
+ * The scope menu's "On in new workspaces" on a user server. Optimistic on the
+ * catalog row because the item keeps its menu open: until the refetch lands
+ * the check would still show the old value, and a second click would resend
+ * the one just written rather than undo it.
+ */
+export function useSetMcpServerNewWorkspaces() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, enabled }: NameEnabled) =>
+      setMcpCatalogServerNewWorkspaces(name, enabled),
+    ...optimisticCatalogRow(queryClient, (s, { enabled }: NameEnabled) => ({
+      ...s,
+      enabled_in_new_workspaces: enabled,
+    })),
+  });
+}
+
+type BindingVars = { name: string; body: McpServerBindingPatch };
 
 /**
  * Change how a catalog server's tools reach the model (Plugins detail panel).
@@ -598,46 +576,18 @@ export function useToggleMcpCatalogServer() {
  */
 export function useSetMcpServerBinding() {
   const queryClient = useQueryClient();
-  const key = queryKeys.mcp.catalog();
   return useMutation({
-    mutationFn: ({ name, body }: { name: string; body: McpServerBindingPatch }) =>
-      setMcpCatalogServerBinding(name, body),
-    onMutate: async ({ name, body }) => {
-      await queryClient.cancelQueries({ queryKey: key });
-      const previous = queryClient.getQueryData<CatalogServerList>(key);
-      if (previous) {
-        queryClient.setQueryData<CatalogServerList>(key, {
-          ...previous,
-          servers: previous.servers.map((s) =>
-            s.name === name
-              ? {
-                  ...s,
-                  ...((body.tool_binding_set !== undefined ||
-                    body.tool_binding_unset !== undefined) && {
-                    tool_binding: mergeToolBinding(s.tool_binding ?? {}, body),
-                  }),
-                  ...(body.binding_preset !== undefined && {
-                    binding_preset: body.binding_preset,
-                  }),
-                  ...(body.order_approval !== undefined && {
-                    order_approval: mergeOrderApproval(
-                      s.order_approval,
-                      body.order_approval,
-                    ),
-                  }),
-                }
-              : s,
-          ),
-        });
-      }
-      return { previous };
-    },
-    onError: (_err, _vars, context) => {
-      if (context?.previous) queryClient.setQueryData(key, context.previous);
-    },
-    onSettled: () => {
-      invalidateMcpFanout(queryClient);
-    },
+    mutationFn: ({ name, body }: BindingVars) => setMcpCatalogServerBinding(name, body),
+    ...optimisticCatalogRow(queryClient, (s, { body }: BindingVars) => ({
+      ...s,
+      ...((body.tool_binding_set !== undefined || body.tool_binding_unset !== undefined) && {
+        tool_binding: mergeToolBinding(s.tool_binding ?? {}, body),
+      }),
+      ...(body.binding_preset !== undefined && { binding_preset: body.binding_preset }),
+      ...(body.order_approval !== undefined && {
+        order_approval: mergeOrderApproval(s.order_approval, body.order_approval),
+      }),
+    })),
   });
 }
 

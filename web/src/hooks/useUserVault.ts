@@ -38,8 +38,8 @@ export function useCreateUserVaultSecret() {
       createUserVaultSecret(body),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.userVault.all });
-      // User-tier secrets feed needs_secret on the catalog AND on inherited
-      // rows in every workspace list, and settled MCP queries stop polling.
+      // Account secrets feed needs_secret on the catalog AND on every workspace
+      // list, and settled MCP queries stop polling.
       invalidateMcpFanout(queryClient);
     },
   });

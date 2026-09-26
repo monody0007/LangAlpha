@@ -8,7 +8,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import type { Workspace } from '@/types/api';
 
 import { createWorkspace } from '../utils/api';
-import { invalidateWorkspaceMembership } from './workspaceRowActions';
+import { invalidateNewWorkspace } from './workspaceRowActions';
 
 export interface NewWorkspace {
   name: string;
@@ -21,7 +21,7 @@ export function useCreateWorkspace(): (data: NewWorkspace) => Promise<Workspace>
     async ({ name, description }: NewWorkspace) => {
       const created = await createWorkspace(name, description);
       // A new folder also lands on a machine, so the computer rows move too.
-      invalidateWorkspaceMembership(queryClient);
+      invalidateNewWorkspace(queryClient);
       return created;
     },
     [queryClient],

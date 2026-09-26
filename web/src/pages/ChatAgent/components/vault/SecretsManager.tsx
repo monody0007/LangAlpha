@@ -9,17 +9,16 @@ import {
   ListSkeleton,
 } from '@/components/mcp/McpPrimitives';
 import { Disclosure } from '@/components/ui/Disclosure';
-import { formatApiErrorDetail, type VaultBlueprint } from '../../utils/api';
+import { formatApiErrorDetail, type UserVaultBlueprint } from '../../utils/api';
 import { BlueprintCards } from './BlueprintCards';
 import { EMPTY_DRAFT, SecretAddForm, SecretEditForm, type SecretDraft } from './SecretEditor';
 import { SecretRow } from './SecretRow';
 
 /**
- * The one vault-secrets manager, shared by the two scopes: the workspace Vault
- * tab and the Plugins → Secrets page. It owns the entire add/edit/reveal/
- * delete state machine; callers supply the data and the four async operations
- * (React Query mutations on both sides) plus the scope-specific extras —
- * blueprints, prefill deep-link, hint copy, footer.
+ * The account vault's secrets manager (Plugins → Secrets). It owns the entire
+ * add/edit/reveal/delete state machine; the caller supplies the data and the
+ * four async operations (React Query mutations) plus the extras: blueprints,
+ * prefill deep-link, hint copy, footer.
  */
 
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
@@ -33,7 +32,7 @@ const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
  */
 type SecretsMode =
   | { kind: 'idle' }
-  | { kind: 'add'; draft: SecretDraft; blueprint: VaultBlueprint | null; saving: boolean }
+  | { kind: 'add'; draft: SecretDraft; blueprint: UserVaultBlueprint | null; saving: boolean }
   | { kind: 'edit'; name: string; draft: SecretDraft; saving: boolean }
   | { kind: 'confirmDelete'; name: string; pending: boolean };
 
@@ -104,7 +103,7 @@ export interface SecretsManagerProps {
   hint?: React.ReactNode;
   emptyText: string;
   /** "Recommended credentials" cards (declared by enabled MCP servers). */
-  blueprints?: VaultBlueprint[];
+  blueprints?: UserVaultBlueprint[];
   /** Deep-link (e.g. an MCP "Set up NAME" affordance): opens the add form prefilled. */
   prefillSecretName?: string | null;
   /** Must be referentially stable — it fires from the prefill effect. */
@@ -113,7 +112,7 @@ export interface SecretsManagerProps {
   onUpdate: (name: string, body: { value?: string; description?: string }) => Promise<unknown>;
   onDelete: (name: string) => Promise<unknown>;
   onReveal: (name: string) => Promise<string>;
-  /** Scope-specific trailing content (e.g. the workspace usage/security card). */
+  /** Trailing content (e.g. the usage/security card). */
   footer?: React.ReactNode;
 }
 

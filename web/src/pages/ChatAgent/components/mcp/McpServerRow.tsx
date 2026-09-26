@@ -1,11 +1,13 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Pencil, Zap, Trash2, KeyRound, BookmarkPlus, Blocks } from 'lucide-react';
+import { Pencil, Zap, KeyRound, Blocks } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu';
 import { BrandMark } from './BrandMark';
 import { McpLifecycle } from './McpLifecycle';
@@ -23,17 +25,17 @@ import type { EffectiveServer } from '../../utils/api';
 /**
  * One row in the effective per-workspace MCP list.
  *
- * - Origin badge (builtin / inherited / workspace).
- * - Enabled toggle (the only interactive control for builtins).
+ * - Origin badge (builtin / account).
+ * - Enabled toggle: this workspace's on/off (the only interactive control for
+ *   builtins).
  * - Tool count + status pill.
- * - Kebab menu: Edit / Test connection / Save to your servers / Delete — all
- *   disabled for builtins. "Test connection" is also disabled when the server
- *   is off (discovery only runs against enabled servers). "Save to your servers"
- *   copies the server's definition up into the user's reusable catalog (vault
- *   refs travel, values don't). A disabled workspace server still renders with
- *   its toggle so it can be re-enabled.
+ * - Kebab menu: Manage in Plugins / Edit / Test connection, disabled for
+ *   builtins. An edit changes the account server, so it applies wherever the
+ *   server is on. "Test connection" is also disabled when the server is off
+ *   (discovery only runs against enabled servers). There is no delete here:
+ *   removing a server is an account action, and the menu says where it lives.
  * - needs_secret rows surface a "Set up NAME" affordance that deep-links to the
- *   Vault tab with the secret name prefilled.
+ *   account vault with the secret name prefilled.
  * - The status area is a single `McpLifecycle` signal (Saved → Verifying →
  *   Ready) that fuses the verify axis (discovery: `checking`/status) and the
  *   apply axis (`synced`: the running agent has loaded the saved config). A
@@ -51,9 +53,6 @@ interface McpServerRowProps {
   /** An enable/disable PATCH is in flight — locks the switch against a double
    *  fire. Optimistic, so it shows NO spinner (the switch already moved). */
   toggling?: boolean;
-  /** A delete is in flight — the row is actually leaving, so the kebab shows
-   *  the spinner. (Toggle does not.) */
-  deleting?: boolean;
   /** A discovery probe is in flight for this row. */
   checking?: boolean;
   /** The running session has applied the saved config (apply axis complete). */
@@ -69,21 +68,16 @@ interface McpServerRowProps {
   onToggle: (server: EffectiveServer, enabled: boolean) => void;
   onEdit: (server: EffectiveServer) => void;
   onDiscover: (server: EffectiveServer) => void;
-  onDelete: (server: EffectiveServer) => void;
-  /** Save this workspace server's definition up into the user template catalog.
-   *  Builtins pass nothing here, which disables the menu item. */
-  onPromoteToTemplate?: (server: EffectiveServer) => void;
-  /** Deep-link to the Vault tab, optionally prefilling a secret name. */
+  /** Deep-link to the account vault, prefilling the secret name. */
   onSetupSecret: (secretName: string) => void;
-  /** Navigate to /plugins — offered on inherited (user-origin) rows, whose
-   *  definition and OAuth lifecycle are managed there, not per-workspace. */
+  /** Navigate to /plugins: offered on account rows, whose OAuth lifecycle and
+   *  removal live there. */
   onManageInPlugins?: () => void;
 }
 
 function McpServerRowImpl({
   server,
   toggling = false,
-  deleting = false,
   checking = false,
   synced = false,
   sandboxRunning = false,
@@ -91,14 +85,12 @@ function McpServerRowImpl({
   onToggle,
   onEdit,
   onDiscover,
-  onDelete,
-  onPromoteToTemplate,
   onSetupSecret,
   onManageInPlugins,
 }: McpServerRowProps) {
   const { t } = useTranslation();
   const isBuiltin = server.origin === 'builtin';
-  const isInherited = server.origin === 'user';
+  const isAccount = server.origin === 'user';
   // Account-level disable: a workspace cannot undo it, and the backend 409s
   // an attempt, so the toggle is inert here and the badge says where to go.
   const lockedByUserTier = server.disabled_scope === 'user';
@@ -118,14 +110,9 @@ function McpServerRowImpl({
       main={
         <>
           <ServerNameLine name={server.name}>
-            <TagBadge title={isInherited ? t('mcp.row.inheritedHint') : undefined}>
-              {isBuiltin ? t('mcp.row.builtin') : isInherited ? t('mcp.row.inherited') : t('mcp.row.workspace')}
+            <TagBadge title={isAccount ? t('mcp.row.accountHint') : undefined}>
+              {isBuiltin ? t('mcp.row.builtin') : t('mcp.row.account')}
             </TagBadge>
-            {server.shadows_inherited && (
-              <TagBadge soft title={t('mcp.row.overridesInheritedHint')}>
-                {t('mcp.row.overridesInherited')}
-              </TagBadge>
-            )}
             <PluginOriginBadge plugin={server.plugin_name} />
             {lockedByUserTier && <TagBadge soft>{t('mcp.row.userDisabled')}</TagBadge>}
           </ServerNameLine>
@@ -204,16 +191,16 @@ function McpServerRowImpl({
           <EnabledToggle
             enabled={server.enabled}
             name={server.name}
-            disabled={toggling || deleting || lockedByUserTier}
+            disabled={toggling || lockedByUserTier}
             onToggle={() => onToggle(server, !server.enabled)}
           />
 
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <KebabTrigger busy={deleting} aria-label={t('mcp.row.actionsAria', { name: server.name })} />
+              <KebabTrigger aria-label={t('mcp.row.actionsAria', { name: server.name })} />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              {isInherited && onManageInPlugins && (
+              {isAccount && onManageInPlugins && (
                 <DropdownMenuItem onSelect={onManageInPlugins}>
                   <Blocks className="h-3.5 w-3.5 mr-2" />
                   {t('mcp.row.manageInPlugins')}
@@ -232,21 +219,17 @@ function McpServerRowImpl({
                 <Zap className="h-3.5 w-3.5 mr-2" />
                 {t('mcp.row.testConnection')}
               </DropdownMenuItem>
-              <DropdownMenuItem
-                disabled={isBuiltin || !onPromoteToTemplate}
-                onSelect={() => onPromoteToTemplate?.(server)}
-              >
-                <BookmarkPlus className="h-3.5 w-3.5 mr-2" />
-                {t('mcp.row.promoteToUser')}
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                disabled={!server.deletable}
-                onSelect={() => onDelete(server)}
-                variant="destructive"
-              >
-                <Trash2 className="h-3.5 w-3.5 mr-2" />
-                {t('mcp.row.delete')}
-              </DropdownMenuItem>
+              {isAccount && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel
+                    className="font-normal max-w-[16rem] whitespace-normal"
+                    style={{ color: 'var(--color-text-tertiary)' }}
+                  >
+                    {t('mcp.row.removeHint')}
+                  </DropdownMenuLabel>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </>

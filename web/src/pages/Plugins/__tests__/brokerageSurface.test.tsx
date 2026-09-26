@@ -87,7 +87,7 @@ vi.mock('@/hooks/useMcpServers', async (importOriginal) => {
     useBrokerages: () => ({ data: shipped, isLoading: false, error: null }),
     useToggleBrokerage: () => ({ mutateAsync: toggleBrokerage }),
     useMcpCatalog: () => ({
-      data: { servers: catalogServers, workspace_servers: [], max_servers: 50 },
+      data: { servers: catalogServers, max_servers: 50 },
       isLoading: false,
       error: null,
     }),
@@ -919,7 +919,7 @@ describe("the quirks after it is the user's own row", () => {
         onRequestDelete={() => {}}
         onToggle={() => {}}
         onSetWorkspaceDisabled={() => {}}
-        onMove={() => {}}
+        onSetNewWorkspacesOn={() => {}}
       />,
     );
   }

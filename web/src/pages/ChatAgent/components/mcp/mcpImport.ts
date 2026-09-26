@@ -45,10 +45,15 @@ const TRANSPORT_ALIASES: Record<string, Transport> = {
   sse: 'sse',
 };
 
-/** Coerce an arbitrary server key into a legal MCP name (mirrors backend). */
+/**
+ * Coerce an arbitrary server key into a legal MCP name, exactly as the
+ * backend's `coerce_mcp_name` does. The `u` flag makes the replacement run per
+ * code point the way Python's does: without it an emoji is two UTF-16 units
+ * and becomes `__`, so the preview named a server the import never creates.
+ */
 export function coerceMcpName(raw: string): { name: string | null; renamed: boolean } {
   if (!raw || typeof raw !== 'string') return { name: null, renamed: false };
-  let cand = raw.replace(/[^0-9A-Za-z_]/g, '_');
+  let cand = raw.replace(/[^0-9A-Za-z_]/gu, '_');
   if (/^[0-9]/.test(cand)) cand = `_${cand}`;
   cand = cand.slice(0, 64);
   if (!cand || !NAME_RE.test(cand)) return { name: null, renamed: false };

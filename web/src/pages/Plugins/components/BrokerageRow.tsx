@@ -18,9 +18,9 @@ import {
   ServerRowShell,
 } from '@/components/mcp/McpPrimitives';
 import type { CatalogServer } from '@/pages/ChatAgent/utils/api';
+import { useFlashWorkspace } from '@/hooks/useFlashWorkspace';
 import { settledGrant, type Brokerage } from '../brokerages';
-import { useFlashWorkspace } from '../hooks/useFlashWorkspace';
-import { isPluginOwned } from '../utils/provenance';
+import { isEffectivelyEnabled, isPluginOwned } from '../utils/provenance';
 import {
   ConnectButton,
   OauthMenuItems,
@@ -29,7 +29,13 @@ import {
 } from './OauthRowParts';
 import { OrderCapabilityBadges } from './OrderCapabilityBadges';
 import { RowNote } from './RowNote';
-import { ScopeControl, scopeLocked, type ScopeWorkspace } from './ScopeControl';
+import {
+  ScopeControl,
+  scopeLocked,
+  scopeReach,
+  serverStateLine,
+  type ScopeWorkspace,
+} from './ScopeControl';
 
 /**
  * One shipped brokerage, in whichever of its two states the user is in: an
@@ -51,6 +57,7 @@ export function BrokerageRow({
   row,
   vendor,
   workspaces,
+  workspacesLoading = false,
   connecting,
   refreshing,
   toggling,
@@ -61,6 +68,7 @@ export function BrokerageRow({
   onToggle,
   onRequestRemove,
   onSetWorkspaceDisabled,
+  onSetNewWorkspacesOn,
   onOpenInMcpTab,
   onOpen,
 }: {
@@ -72,6 +80,8 @@ export function BrokerageRow({
    *  so the tab paragraph and this row cannot reach different answers. */
   vendor: Brokerage | null;
   workspaces: ScopeWorkspace[];
+  /** `workspaces` has not arrived yet; the reach waits for it. */
+  workspacesLoading?: boolean;
   connecting: boolean;
   refreshing: boolean;
   toggling: boolean;
@@ -84,6 +94,8 @@ export function BrokerageRow({
   onToggle: (enabled: boolean) => void;
   onRequestRemove: () => void;
   onSetWorkspaceDisabled: (workspaceId: string, disabled: boolean) => void;
+  /** Whether a workspace created later starts with this broker on. */
+  onSetNewWorkspacesOn: (on: boolean) => void;
   onOpenInMcpTab: () => void;
   /** Open this broker's detail. Offered on an unadded row too: what a broker
    *  can do is the thing to read before deciding to add it. */
@@ -130,6 +142,23 @@ export function BrokerageRow({
   const description = redirected
     ? row?.description
     : row?.description || brokerage.description;
+  const flashScope = row?.has_direct_tools ? flashWorkspace : undefined;
+  // An offer and an off row name no workspace, so only an on row waits for
+  // the list its reach would be counted against.
+  const stateLine = !row
+    ? t('plugins.brokerages.notAdded')
+    : isEffectivelyEnabled(row) && workspacesLoading
+      ? null
+      : serverStateLine(
+          t,
+          isEffectivelyEnabled(row),
+          scopeReach(
+            workspaces,
+            row.disabled_workspace_ids ?? [],
+            flashScope,
+            row.enabled_in_new_workspaces,
+          ),
+        );
 
   return (
     <ServerRowShell
@@ -151,15 +180,7 @@ export function BrokerageRow({
 
           <div className="flex items-center gap-2 flex-wrap">
             {status && <McpOauthPill status={status} />}
-            {row ? (
-              <MetaText>
-                {row.enabled
-                  ? t('plugins.servers.enabledState')
-                  : t('plugins.servers.disabledState')}
-              </MetaText>
-            ) : (
-              <MetaText>{t('plugins.brokerages.notAdded')}</MetaText>
-            )}
+            {stateLine && <MetaText>{stateLine}</MetaText>}
             <ToolCountText status={status} count={row?.tool_count} />
             {/* What this broker can do about orders, which is the first thing
                 anyone wants off a brokerage row and the last thing the page
@@ -220,15 +241,12 @@ export function BrokerageRow({
                 scopeWorkspaceId={null}
                 disabledWorkspaceIds={row.disabled_workspace_ids ?? []}
                 checklistLocked={scopeLocked(row)}
-                flashWorkspace={row.has_direct_tools ? flashWorkspace : undefined}
-                // A brokerage is an account-wide identity, so the only scope
-                // question it has is which workspaces may reach it. Moving one
-                // into a single workspace would strand the OAuth connection,
-                // which exists at the user tier and nowhere else.
-                allowWorkspaceTargets={false}
-                moveBlockedReason={t('plugins.scope.moveOauthBlocked')}
+                flashWorkspace={flashScope}
+                newWorkspacesOn={row.enabled_in_new_workspaces}
+                loading={workspacesLoading}
                 busy={scopeBusy}
                 onSetWorkspaceDisabled={onSetWorkspaceDisabled}
+                onSetNewWorkspacesOn={onSetNewWorkspacesOn}
               />
 
               <EnabledToggle

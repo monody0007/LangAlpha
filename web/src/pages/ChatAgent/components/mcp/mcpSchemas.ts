@@ -24,53 +24,64 @@ import { z } from 'zod';
 export const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 export const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,127}$/;
 
-// Mirrors Python 3.13's `keyword.kwlist + keyword.softkwlist`.
+// A copy of the backend's rule (`sandbox_name_error` and `_PY_KEYWORDS` in
+// `src/server/models/mcp_server.py`): Python 3.13's hard keywords, written out.
+// Soft keywords (`match`, `type`, `case`, `_`) are legal module names.
 const PYTHON_KEYWORDS: ReadonlySet<string> = new Set([
   'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break',
   'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for',
   'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not',
   'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield',
-  '_', 'case', 'match', 'type',
 ]);
 const RUNTIME_MODULE = 'mcp_client';
+const NAME_SHAPE_MESSAGE =
+  'name must be 1-64 chars: letter/underscore then letters/digits/underscores';
+const NAME_RESERVED_MESSAGE = 'name is reserved in the sandbox';
+
+/** Why a server name is refused. A code rather than a sentence: the form words
+ *  it in the user's locale. */
+export type ServerNameError = 'shape' | 'runtimeModule' | 'dunder' | 'keyword';
 
 /**
- * The message for a name the sandbox reserves, or null. A server name is also
- * the Python module its tool wrappers are generated into, beside the runtime's
- * own `mcp_client`. Mirrors `sandbox_name_error` in the backend model.
+ * Why the sandbox reserves `name`, or null. A server name is also the Python
+ * module its tool wrappers are generated into, beside the runtime's own
+ * `mcp_client`. Mirrors `sandbox_name_error` in the backend model.
  */
-export function sandboxNameError(name: string): string | null {
-  if (name === RUNTIME_MODULE) {
-    return `name '${name}' is reserved: the sandbox's MCP runtime module already has it`;
-  }
-  if (name.startsWith('__')) {
-    return "name must not start with '__': a server name becomes a Python module in the sandbox, and those names are Python's own";
-  }
-  if (PYTHON_KEYWORDS.has(name)) {
-    return `name '${name}' is a Python keyword, and a server name becomes a Python module in the sandbox`;
-  }
+function sandboxNameError(name: string): Exclude<ServerNameError, 'shape'> | null {
+  if (name === RUNTIME_MODULE) return 'runtimeModule';
+  if (name.startsWith('__')) return 'dunder';
+  if (PYTHON_KEYWORDS.has(name)) return 'keyword';
   return null;
+}
+
+/**
+ * Why a server cannot be saved under `name`, or null. `keepName` is the name
+ * the row is already saved under: like the backend, which checks reserved
+ * names only where a name is introduced, an edit keeps a name the sandbox
+ * reserved after it was saved.
+ */
+export function serverNameError(
+  name: string,
+  keepName?: string | null,
+): ServerNameError | null {
+  if (!NAME_RE.test(name)) return 'shape';
+  return name === keepName ? null : sandboxNameError(name);
 }
 
 /**
  * Rename a `NAME_RE`-legal name the sandbox reserves into one it accepts
  * (mirrors the backend's `_unreserve`): `class` → `class_server`, `__init__` →
- * `init__`, and a name that is only underscores → `server`.
+ * `init__`, and a dunder with nothing after its underscores → `server`.
  */
 export function unreserveName(name: string): string {
   let cand = name;
-  if (cand.startsWith('__') || cand === '_') {
+  if (cand.startsWith('__')) {
     cand = cand.replace(/^_+/, '');
     if (!cand) return 'server';
     if (/^[0-9]/.test(cand)) cand = `_${cand}`;
   }
   if (cand === RUNTIME_MODULE || PYTHON_KEYWORDS.has(cand)) cand = `${cand}_server`;
   return cand;
-}
-
-/** Whether `name` is one a catalog server could be called. */
-export function isServerName(name: string): boolean {
-  return NAME_RE.test(name) && sandboxNameError(name) === null;
 }
 
 // Ordered for the transport picker: http leads because a remote service is the
@@ -300,14 +311,9 @@ function isDisallowedIp(host: string): boolean {
 // The server-definition schema — discriminated on transport.
 // ---------------------------------------------------------------------------
 
-const nameField = z
-  .string()
-  .regex(NAME_RE, 'name must be 1-64 chars: letter/underscore then letters/digits/underscores')
-  .superRefine((name, ctx) => {
-    // A name that already failed the shape gets that one message, not two.
-    const reason = NAME_RE.test(name) ? sandboxNameError(name) : null;
-    if (reason) ctx.addIssue({ code: 'custom', message: reason });
-  });
+// Shape only: whether the sandbox reserves the name depends on the name the
+// row is saved under, which `validateMcpServer` is told and the schema is not.
+const nameField = z.string().regex(NAME_RE, NAME_SHAPE_MESSAGE);
 
 const descriptionField = z.string().max(DESCRIPTION_MAX).default('');
 const instructionField = z.string().max(INSTRUCTION_MAX).default('');
@@ -379,19 +385,31 @@ const SCHEMA_BY_TRANSPORT = {
   http: httpSchema,
 } as const;
 
-/** Validate a raw form object, returning either ok or the list of errors. */
-export function validateMcpServer(input: unknown):
+/**
+ * Validate a raw form object, returning either ok or the list of errors.
+ * `keepName` is the name an edited row is saved under (see `serverNameError`).
+ */
+export function validateMcpServer(
+  input: unknown,
+  { keepName = null }: { keepName?: string | null } = {},
+):
   | { ok: true }
   | { ok: false; errors: Array<{ path: string; message: string }> } {
   const transport = (input as { transport?: keyof typeof SCHEMA_BY_TRANSPORT })?.transport;
   const schema = (transport && SCHEMA_BY_TRANSPORT[transport]) || stdioSchema;
   const result = schema.safeParse(input);
-  if (result.success) return { ok: true };
-  return {
-    ok: false,
-    errors: result.error.issues.map((i) => ({
-      path: i.path.map(String).join('.'),
-      message: i.message,
-    })),
-  };
+  const errors = result.success
+    ? []
+    : result.error.issues.map((i) => ({
+        path: i.path.map(String).join('.'),
+        message: i.message,
+      }));
+  // A name that already failed the shape has that one message, not two.
+  const name = (input as { name?: unknown } | null)?.name;
+  if (typeof name === 'string' && NAME_RE.test(name)) {
+    if (serverNameError(name, keepName)) {
+      errors.unshift({ path: 'name', message: NAME_RESERVED_MESSAGE });
+    }
+  }
+  return errors.length ? { ok: false, errors } : { ok: true };
 }

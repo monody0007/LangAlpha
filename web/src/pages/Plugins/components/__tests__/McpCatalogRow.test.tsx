@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import React from 'react';
 import { renderWithProviders } from '@/test/utils';
@@ -53,12 +54,18 @@ function makeServer(overrides: Partial<CatalogServer> = {}): CatalogServer {
   };
 }
 
-function renderRow(server: CatalogServer) {
+function renderRow(
+  server: CatalogServer,
+  workspaces: { id: string; name: string }[] = [],
+  onSetNewWorkspacesOn = vi.fn(),
+  workspacesLoading = false,
+) {
   return renderWithProviders(
     <McpCatalogRow
       server={server}
       vendor={null}
-      workspaces={[]}
+      workspaces={workspaces}
+      workspacesLoading={workspacesLoading}
       selection={selection}
       connecting={false}
       refreshing={false}
@@ -72,7 +79,7 @@ function renderRow(server: CatalogServer) {
       onRequestDelete={vi.fn()}
       onToggle={vi.fn()}
       onSetWorkspaceDisabled={vi.fn()}
-      onMove={vi.fn()}
+      onSetNewWorkspacesOn={onSetNewWorkspacesOn}
     />,
   );
 }
@@ -136,5 +143,88 @@ describe('McpCatalogRow: what a stored verdict does to the row', () => {
     expect(connect()).not.toBeInTheDocument();
     expect(screen.queryByTestId('oauth-status-revoked')).not.toBeInTheDocument();
     expect(screen.getByText('4 tools')).toBeInTheDocument();
+  });
+});
+
+describe('McpCatalogRow: the state line agrees with the scope badge', () => {
+  const workspaces = [
+    { id: 'ws-a', name: 'Alpha' },
+    { id: 'ws-b', name: 'Beta' },
+  ];
+
+  it('does not claim every workspace when one has switched the server off', () => {
+    // A disable left behind by a deleted workspace does not count, the same
+    // way the badge counts it.
+    renderRow(makeServer({ disabled_workspace_ids: ['ws-b', 'ws-gone'] }), workspaces);
+    expect(screen.getByText('On, switched off in 1 workspace')).toBeInTheDocument();
+    expect(screen.queryByText('On in all workspaces')).not.toBeInTheDocument();
+  });
+
+  it('says every workspace when none has', () => {
+    renderRow(makeServer({ disabled_workspace_ids: ['ws-gone'] }), workspaces);
+    expect(screen.getByText('On in all workspaces')).toBeInTheDocument();
+  });
+
+  it('says off everywhere when its plugin is off, whatever its own switch says', () => {
+    renderRow(
+      makeServer({ plugin_name: 'acme', plugin_enabled: false, disabled_workspace_ids: [] }),
+      workspaces,
+    );
+    expect(screen.getByText('Off in every workspace')).toBeInTheDocument();
+    expect(screen.queryByText('On in all workspaces')).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * A server added from a workspace starts off in the ones created later, so
+ * "On in all workspaces" on its row would promise the next workspace a server
+ * it will not have. The row names where it is on instead, in the same words
+ * on the state line and the badge.
+ */
+describe('McpCatalogRow: a server new workspaces start without', () => {
+  const workspaces = [
+    { id: 'ws-a', name: 'Alpha' },
+    { id: 'ws-b', name: 'Beta' },
+  ];
+  const offForNew = (disabled: string[]) =>
+    makeServer({ enabled_in_new_workspaces: false, disabled_workspace_ids: disabled });
+
+  it('names the one workspace it is on in', () => {
+    renderRow(offForNew(['ws-b']), workspaces);
+    expect(screen.getByText('On only in Alpha')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Scope: Only in Alpha' })).toBeInTheDocument();
+  });
+
+  it('counts the workspaces it is on in, even when that is all of them', () => {
+    renderRow(offForNew([]), workspaces);
+    expect(screen.getByText('On in 2 workspaces')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Scope: 2 workspaces' })).toBeInTheDocument();
+    expect(screen.queryByText('On in all workspaces')).not.toBeInTheDocument();
+  });
+
+  it('says so when it is on in none', () => {
+    // A disable left by a deleted workspace is not a workspace it is off in.
+    renderRow(offForNew(['ws-a', 'ws-b', 'ws-gone']), workspaces);
+    expect(screen.getByText('On, but active in no workspace')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Scope: No workspaces' })).toBeInTheDocument();
+  });
+
+  it('names no reach while the workspace list is still loading', () => {
+    // Counted against the empty list a loading query hands back, the row read
+    // "active in no workspace" until the list arrived.
+    renderRow(offForNew([]), [], vi.fn(), true);
+    expect(screen.queryByText('On, but active in no workspace')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Scope:/ })).not.toBeInTheDocument();
+  });
+
+  it('hands the new-workspaces switch to its caller', async () => {
+    const onSet = vi.fn();
+    const user = userEvent.setup();
+    renderRow(offForNew(['ws-b']), workspaces, onSet);
+    await user.click(screen.getByRole('button', { name: 'Scope: Only in Alpha' }));
+    const item = await screen.findByRole('menuitemcheckbox', { name: 'On in new workspaces' });
+    expect(item).toHaveAttribute('aria-checked', 'false');
+    await user.click(item);
+    expect(onSet).toHaveBeenCalledWith(true);
   });
 });

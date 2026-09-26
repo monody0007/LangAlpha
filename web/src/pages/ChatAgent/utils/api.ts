@@ -16,7 +16,6 @@ export * from './api/files';
 export * from './api/sandbox';
 export * from './api/metadata';
 export * from './api/feedback';
-export * from './api/vault';
 export * from './api/userVault';
 export * from './api/memory';
 export * from './api/memos';

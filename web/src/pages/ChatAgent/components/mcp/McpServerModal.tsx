@@ -31,7 +31,14 @@ import {
   type Draft,
   type DraftMeta,
 } from './mcpServerDraft';
-import { DESCRIPTION_MAX, EXPOSURE_MODES, INSTRUCTION_MAX, validateMcpServer } from './mcpSchemas';
+import {
+  DESCRIPTION_MAX,
+  EXPOSURE_MODES,
+  INSTRUCTION_MAX,
+  serverNameError,
+  validateMcpServer,
+  type ServerNameError,
+} from './mcpSchemas';
 import {
   formatApiErrorDetail,
   type McpDiscoveryResult,
@@ -76,21 +83,29 @@ export interface McpServerModalProps {
   onSubmit: (body: McpServerInput) => Promise<void>;
   onDiscover?: (body: McpServerInput) => Promise<McpDiscoveryResult>;
   /** The host-side check of a remote address, before anything is saved. The
-   *  caller supplies it because only it knows which vault the refs in the
-   *  headers should resolve against. The signal is the query's: an address the
-   *  user has typed past stops holding a host-side probe slot. */
+   *  signal is the query's: an address the user has typed past stops holding
+   *  a host-side probe slot. */
   onProbe?: (body: McpProbeInput, signal?: AbortSignal) => Promise<McpProbeResult>;
-  /** Which vault `onProbe` resolves refs against, as the cache's scope: a
-   *  workspace id, or `''` for the user vault. A verdict is only about the
-   *  vault that produced it, so the two must not share a cache entry. */
-  probeScope?: string;
-  /** Inline secret-create for the picker, into the tier this modal edits. */
+  /** A helper line under the title, for where the save lands when the surface
+   *  alone does not make it obvious. */
+  note?: string;
+  /** Title and save label for an edit that reaches past the surface it was
+   *  opened from, such as an account server edited from one workspace. */
+  editLabels?: { title: string; save: string };
+  /** Inline secret-create for the picker, into the account vault. */
   createSecret: (body: { name: string; value: string }) => Promise<unknown>;
   saving?: boolean;
   submitError?: string | null;
 }
 
 const NOOP = () => {};
+
+const NAME_ERROR_KEY: Record<ServerNameError, string> = {
+  shape: 'mcp.modal.nameShape',
+  runtimeModule: 'mcp.modal.nameReservedRuntime',
+  dunder: 'mcp.modal.nameReservedDunder',
+  keyword: 'mcp.modal.nameReservedKeyword',
+};
 
 /** Whether two addresses name the same host. An address that will not parse is
  *  never the one already saved. */
@@ -124,7 +139,8 @@ export function McpServerModal({
   onSubmit,
   onDiscover,
   onProbe,
-  probeScope = '',
+  note,
+  editLabels,
   createSecret,
   saving = false,
   submitError = null,
@@ -136,6 +152,9 @@ export function McpServerModal({
   const close = saving ? NOOP : onClose;
   const titleId = useId();
   const isEdit = !!initial;
+  // What an edited row is saved under. It keeps that name even if the sandbox
+  // has reserved it since, as the backend's edit routes do.
+  const keepName = initial?.name ?? null;
 
   const [draft, setDraft] = useState<Draft>(() => initialDraft(initial));
   // Null until the user types one: the name follows the field until then.
@@ -173,8 +192,8 @@ export function McpServerModal({
   // CURRENT payload, so a slightly-stale gate can never let stale data through.
   const deferredPayload = useDeferredValue(payload);
   const canSubmit = useMemo(
-    () => !!deferredPayload && validateMcpServer(deferredPayload).ok,
-    [deferredPayload],
+    () => !!deferredPayload && validateMcpServer(deferredPayload, { keepName }).ok,
+    [deferredPayload, keepName],
   );
 
   // --- The live check of a remote address -------------------------------
@@ -209,7 +228,7 @@ export function McpServerModal({
   const urlCommitted =
     !hasHeaders || (!!committed && committed.withHeaders && committed.url === target?.url);
   const probeQuery = useQuery({
-    queryKey: queryKeys.mcp.probe(probeScope, target?.url ?? '', headersKey),
+    queryKey: queryKeys.mcp.probe(target?.url ?? '', headersKey),
     queryFn: ({ signal }) => onProbe!({ url: target!.url, headers: target!.headers }, signal),
     enabled:
       !!onProbe && !!target && !probeHeld && urlCommitted && restedKey === probeKey,
@@ -223,9 +242,9 @@ export function McpServerModal({
   // the form rather than resting in the cache for its gcTime.
   useEffect(
     () => () => {
-      queryClient.removeQueries({ queryKey: queryKeys.mcp.probes(probeScope) });
+      queryClient.removeQueries({ queryKey: queryKeys.mcp.probes() });
     },
-    [queryClient, probeScope],
+    [queryClient],
   );
 
   function applyEntry(raw: string) {
@@ -240,7 +259,7 @@ export function McpServerModal({
   async function handleSubmit() {
     const body = draftPayload(draft, fullMeta);
     if (!body) return;
-    const result = validateMcpServer(body);
+    const result = validateMcpServer(body, { keepName });
     // Two rows the schema never gets to see: one map drops a blank key, both
     // maps are last-wins on a repeated one, so the payload is already short an
     // entry by the time it is validated.
@@ -271,7 +290,7 @@ export function McpServerModal({
   async function handleTest() {
     const body = draftPayload(draft, fullMeta);
     if (!onDiscover || !body) return;
-    const result = validateMcpServer(body);
+    const result = validateMcpServer(body, { keepName });
     if (!result.ok) {
       setErrors(result.errors);
       return;
@@ -290,6 +309,11 @@ export function McpServerModal({
 
   const errorFor = (path: string) =>
     errors.find((e) => e.path === path || e.path.startsWith(`${path}.`));
+  // Checked as the name is typed: a refused name disables Save, so waiting
+  // for a submit to explain it would leave the button disabled with no reason.
+  // An empty one waits for the submit, as the other fields do.
+  const nameReason = name || errorFor('name') ? serverNameError(name, keepName) : null;
+  const nameError = nameReason ? t(NAME_ERROR_KEY[nameReason], { name }) : null;
   const entryError =
     errorFor('url') ?? errorFor('command') ?? errorFor('args') ?? errorFor('transport');
 
@@ -352,7 +376,7 @@ export function McpServerModal({
           style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
         >
           {saving && <Loader size={14} className="text-current" />}
-          {isEdit ? t('mcp.modal.save') : t('mcp.modal.add')}
+          {isEdit ? (editLabels?.save ?? t('mcp.modal.save')) : t('mcp.modal.add')}
         </button>
       </div>
     </div>
@@ -361,11 +385,16 @@ export function McpServerModal({
   return (
     <ModalShell
       labelId={titleId}
-      title={isEdit ? t('mcp.modal.editTitle') : t('mcp.modal.addTitle')}
+      title={isEdit ? (editLabels?.title ?? t('mcp.modal.editTitle')) : t('mcp.modal.addTitle')}
       onClose={onClose}
       closeDisabled={saving}
       footer={footer}
     >
+      {note && (
+        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }} data-testid="mcp-modal-note">
+          {note}
+        </p>
+      )}
       <Field label={t('mcp.modal.entryLabel')} hint={t('mcp.modal.entryHint')}>
         <input
           type="text"
@@ -416,7 +445,7 @@ export function McpServerModal({
           maxLength={64}
           data-testid="mcp-name"
         />
-        <FieldError error={errorFor('name')} />
+        <FieldError error={nameError ? { message: nameError } : undefined} />
       </Field>
 
       {draft.kind === 'remote' && (

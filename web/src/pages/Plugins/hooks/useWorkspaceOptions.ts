@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
+import { useFlashWorkspace } from '@/hooks/useFlashWorkspace';
 import type { ScopeWorkspace } from '../components/ScopeControl';
-import { useFlashWorkspace } from './useFlashWorkspace';
 
 /**
  * The user's workspaces as the Plugins page consumes them: scope-control
@@ -14,6 +14,10 @@ export interface WorkspaceOptions {
    * here offers it as a move target and as a bulk destination, neither of
    * which it can be. */
   workspaces: ScopeWorkspace[];
+  /** The list has not arrived yet. `workspaces` is then empty for want of an
+   * answer, not because there are none, so a reach counted against it would
+   * read "No workspaces" and flip a moment later. */
+  loading: boolean;
   /** Both tiers, so a deck header still resolves a Flash-scoped name. */
   nameById: Map<string, string>;
 }
@@ -30,6 +34,7 @@ export function useWorkspaceOptions(): WorkspaceOptions {
   }));
   return {
     workspaces,
+    loading: data === undefined,
     nameById: new Map(
       [...workspaces, ...(flashWorkspace ? [flashWorkspace] : [])].map((w) => [w.id, w.name]),
     ),

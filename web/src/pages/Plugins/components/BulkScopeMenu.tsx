@@ -16,10 +16,11 @@ import type { ScopeWorkspace } from './ScopeControl';
 
 /**
  * The bulk counterpart of the row ScopeControl, rendered in the select-mode
- * action bar. Same three scope states, applied to the whole selection: all
- * workspaces, only a chosen set of workspaces (deny-list), or moved into one
- * workspace (tier change). Each entry carries the count of selected rows it
- * can actually reach; ineligible rows are simply left out of the run.
+ * action bar. Same scope states, applied to the whole selection: all
+ * workspaces, only a chosen set of workspaces (deny-list), or, where the tab
+ * has workspace-tier rows, moved into one workspace (tier change). Each entry
+ * carries the count of selected rows it can actually reach; ineligible rows
+ * are simply left out of the run.
  */
 
 export interface BulkScopeSpec {
@@ -28,8 +29,8 @@ export interface BulkScopeSpec {
   onEverywhere: () => void;
   onlyInCount: number;
   onOnlyIn: (workspaceIds: string[]) => void;
-  moveCount: number;
-  onMoveTo: (workspaceId: string) => void;
+  /** Absent where rows cannot live in a workspace of their own. */
+  move?: { count: number; onMoveTo: (workspaceId: string) => void };
 }
 
 export function BulkScopeMenu({
@@ -38,15 +39,14 @@ export function BulkScopeMenu({
   onEverywhere,
   onlyInCount,
   onOnlyIn,
-  moveCount,
-  onMoveTo,
+  move,
 }: BulkScopeSpec) {
   const { t } = useTranslation();
   // The checklist stages locally and commits on Apply: a bulk deny-list write
   // is a fan-out, not something to fire on every checkbox flip.
   const [staged, setStaged] = useState<ReadonlySet<string>>(new Set());
 
-  const anyEligible = everywhereCount > 0 || onlyInCount > 0 || moveCount > 0;
+  const anyEligible = everywhereCount > 0 || onlyInCount > 0 || (move?.count ?? 0) > 0;
 
   return (
     <DropdownMenu onOpenChange={(open) => !open && setStaged(new Set())}>
@@ -113,20 +113,22 @@ export function BulkScopeMenu({
           </DropdownMenuSubContent>
         </DropdownMenuSub>
 
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger disabled={moveCount === 0 || workspaces.length === 0}>
-            <ArrowRightLeft className="h-3.5 w-3.5 mr-2" />
-            {t('plugins.bulk.scopeMoveTo', { count: moveCount })}
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent>
-            {workspaces.map((ws) => (
-              <DropdownMenuItem key={ws.id} onSelect={() => onMoveTo(ws.id)}>
-                <FolderOpen className="h-3.5 w-3.5 mr-2" />
-                <span className="truncate">{ws.name}</span>
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
+        {move && (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger disabled={move.count === 0 || workspaces.length === 0}>
+              <ArrowRightLeft className="h-3.5 w-3.5 mr-2" />
+              {t('plugins.bulk.scopeMoveTo', { count: move.count })}
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              {workspaces.map((ws) => (
+                <DropdownMenuItem key={ws.id} onSelect={() => move.onMoveTo(ws.id)}>
+                  <FolderOpen className="h-3.5 w-3.5 mr-2" />
+                  <span className="truncate">{ws.name}</span>
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

@@ -30,8 +30,6 @@ vi.mock('../../utils/api', async (importOriginal) => {
     getComputers: (...a: unknown[]) => mockGetComputers(...a),
     startComputer: (...a: unknown[]) => mockStartComputer(...a),
     stopComputer: (...a: unknown[]) => mockStopComputer(...a),
-    getVaultSecrets: vi.fn(async () => []),
-    getVaultBlueprints: vi.fn(async () => []),
     installSandboxPackages: vi.fn(),
     refreshWorkspace: vi.fn(),
     streamComputerEvents: vi.fn(async () => {}),

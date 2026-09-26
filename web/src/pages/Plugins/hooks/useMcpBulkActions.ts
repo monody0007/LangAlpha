@@ -1,60 +1,53 @@
 import { useTranslation } from 'react-i18next';
 import {
-  adoptMcpServerToWorkspace,
   deleteMcpCatalogServer,
-  promoteWorkspaceMcpServerToTemplate,
   setBuiltinMcpServerEnabled,
   setMcpCatalogServerEnabled,
+  setMcpCatalogServerNewWorkspaces,
   setWorkspaceMcpServerEnabled,
   type BuiltinMcpServer,
   type CatalogServer,
-  type WorkspaceScopedMcpServer,
 } from '@/pages/ChatAgent/utils/api';
+import { useFlashWorkspace } from '@/hooks/useFlashWorkspace';
 import type { BulkAction } from '../components/BulkActionBar';
 import type { BulkScopeSpec } from '../components/BulkScopeMenu';
-import type { ScopeWorkspace } from '../components/ScopeControl';
+import { scopeLocked, type ScopeWorkspace } from '../components/ScopeControl';
 import { bulkSelectionKey, type BulkTarget } from '../components/useBulkSelection';
 import { isPluginOwned } from '../utils/provenance';
 import type { PluginListSurface } from './usePluginListSurface';
 import { useScopeBulk } from './useScopeBulk';
 
 /**
- * The select-mode actions for the MCP tab. One selection spans three row
- * tiers with three different endpoints, so the keys are tier-namespaced and
- * the rows travel as a tagged union rather than as three parallel arrays —
- * the scope algorithm downstream wants one list.
+ * The select-mode actions for the MCP tab. One selection spans two row tiers
+ * with different endpoints, so the keys are tier-namespaced and the rows
+ * travel as a tagged union rather than as parallel arrays; the scope
+ * algorithm downstream wants one list.
  */
 
 type McpScopeRow =
   | { tier: 'builtin'; server: BuiltinMcpServer }
-  | { tier: 'catalog'; server: CatalogServer }
-  | { tier: 'workspace'; server: WorkspaceScopedMcpServer };
+  | { tier: 'catalog'; server: CatalogServer };
 
-const rowKey = (row: McpScopeRow) =>
-  row.tier === 'workspace'
-    ? `ws:${row.server.workspace_id}:${row.server.name}`
-    : `${row.tier}:${row.server.name}`;
+const rowKey = (row: McpScopeRow) => `${row.tier}:${row.server.name}`;
 
 export function useMcpBulkActions({
   builtins,
   catalog,
-  workspaceServers,
   surface,
   workspaces,
 }: {
   builtins: readonly BuiltinMcpServer[];
   catalog: readonly CatalogServer[];
-  workspaceServers: readonly WorkspaceScopedMcpServer[];
   surface: PluginListSurface;
   workspaces: ScopeWorkspace[];
 }): { actions: BulkAction[]; scope: BulkScopeSpec; count: number; selectionKey: string } {
   const { t } = useTranslation();
   const { selected } = surface.selection;
+  const flashWorkspace = useFlashWorkspace();
 
   const rows: McpScopeRow[] = [
     ...builtins.map((server) => ({ tier: 'builtin' as const, server })),
     ...catalog.map((server) => ({ tier: 'catalog' as const, server })),
-    ...workspaceServers.map((server) => ({ tier: 'workspace' as const, server })),
   ].filter((row) => selected.has(rowKey(row)));
 
   function toggleTargets(enabled: boolean): BulkTarget[] {
@@ -62,49 +55,39 @@ export function useMcpBulkActions({
       if (!!row.server.enabled === enabled) return [];
       const key = rowKey(row);
       const { name } = row.server;
-      if (row.tier === 'builtin') {
-        return [{ key, run: () => setBuiltinMcpServerEnabled(name, enabled) }];
-      }
-      if (row.tier === 'catalog') {
-        return [{ key, run: () => setMcpCatalogServerEnabled(name, enabled) }];
-      }
-      const workspaceId = row.server.workspace_id;
       return [
-        { key, run: () => setWorkspaceMcpServerEnabled(workspaceId, name, enabled) },
+        {
+          key,
+          run: () =>
+            row.tier === 'builtin'
+              ? setBuiltinMcpServerEnabled(name, enabled)
+              : setMcpCatalogServerEnabled(name, enabled),
+        },
       ];
     });
   }
 
-  // Same eligibility as each row's ScopeControl: the deny-list checklist
-  // exists on enabled user-tier rows (builtin + catalog); moving into a
-  // workspace exists for catalog rows that are neither plugin-owned nor
-  // OAuth-connected (connections live only at the user tier); a workspace
-  // row's only destination is up, blocked while it shadows an inherited name.
-  const movableCatalog = (row: McpScopeRow) =>
-    row.tier === 'catalog' &&
-    !isPluginOwned(row.server) &&
-    !(row.server.oauth_status && row.server.oauth_status !== 'revoked');
-
+  // Same eligibility as each row's ScopeControl: a locked checklist, off or
+  // under a plugin that is off, is out. No move: every server lives on the account.
   const scope = useScopeBulk<McpScopeRow>(rows, {
     workspaces,
     run: surface.run,
     key: rowKey,
     denyMarkers: (row) =>
-      row.tier !== 'workspace' && row.server.enabled
-        ? (row.server.disabled_workspace_ids ?? [])
-        : null,
+      scopeLocked(row.server) ? null : (row.server.disabled_workspace_ids ?? []),
+    // The row's rule: only a server with a directly bound tool lists Flash.
+    flashWorkspaceId: (row) =>
+      row.tier === 'catalog' && row.server.has_direct_tools ? (flashWorkspace?.id ?? null) : null,
     setWorkspaceEnabled: (row, workspaceId, enabled) =>
       setWorkspaceMcpServerEnabled(workspaceId, row.server.name, enabled),
-    promote: (row) => {
-      if (row.tier !== 'workspace' || row.server.shadows_inherited) return null;
-      const { workspace_id: workspaceId, name } = row.server;
-      return () => promoteWorkspaceMcpServerToTemplate(workspaceId, name, false, true);
-    },
-    movable: movableCatalog,
-    moveTo: (row, workspaceId) => {
-      if (!movableCatalog(row)) return null;
-      const { name } = row.server;
-      return () => adoptMcpServerToWorkspace(workspaceId, name);
+    // Only a user row (brokerages included) has the setting. Absent reads as
+    // on, like the badge: every row inherited before the setting existed.
+    newWorkspaces: (row, on) => {
+      if (row.tier !== 'catalog') return null;
+      const current = row.server.enabled_in_new_workspaces !== false;
+      return current === on
+        ? null
+        : () => setMcpCatalogServerNewWorkspaces(row.server.name, on);
     },
   });
 

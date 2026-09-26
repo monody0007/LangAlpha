@@ -4,7 +4,7 @@ import { ExternalLink, Eye, EyeOff } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { Field } from '@/components/mcp/McpPrimitives';
 import { normalizeSecretName } from '@/lib/secretNames';
-import type { VaultBlueprint } from '../../utils/api';
+import type { UserVaultBlueprint } from '../../utils/api';
 
 /**
  * The two secret-editing surfaces: the add form (name + value + description,
@@ -185,7 +185,7 @@ export function SecretAddForm({
   onSave,
 }: {
   draft: SecretDraft;
-  blueprint: VaultBlueprint | null;
+  blueprint: UserVaultBlueprint | null;
   saving: boolean;
   onChange: DraftPatch;
   onCancel: () => void;

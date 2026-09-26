@@ -84,7 +84,7 @@ export function showsWorkspaceDetail(server: EffectiveServer): boolean {
  */
 export function needsDiscoveryProbe(server: EffectiveServer): boolean {
   return (
-    (server.origin === 'workspace' || server.origin === 'user') &&
+    server.origin === 'user' &&
     !isHostDiscovered(server) &&
     server.enabled &&
     server.status === 'pending'
@@ -133,7 +133,7 @@ export interface McpLifecycleInput {
   sandboxRunning: boolean;
   /** The sandbox is warming up toward running (a background apply kicked it). */
   sandboxWarming?: boolean;
-  /** Inherited rows: the status of a connection that still claims the row; a revoked one is dropped upstream. */
+  /** Account rows: the status of a connection that still claims the row; a revoked one is dropped upstream. */
   oauthStatus?: McpOauthStatus | null;
 }
 

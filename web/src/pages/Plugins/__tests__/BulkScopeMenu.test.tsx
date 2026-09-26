@@ -54,8 +54,7 @@ function makeSpec(overrides: Partial<BulkScopeSpec> = {}): BulkScopeSpec {
     onEverywhere: vi.fn(),
     onlyInCount: 3,
     onOnlyIn: vi.fn(),
-    moveCount: 1,
-    onMoveTo: vi.fn(),
+    move: { count: 1, onMoveTo: vi.fn() },
     ...overrides,
   };
 }
@@ -74,7 +73,7 @@ describe('BulkScopeMenu', () => {
   it('disables the whole trigger when nothing is eligible', () => {
     renderWithProviders(
       <BulkScopeMenu
-        {...makeSpec({ everywhereCount: 0, onlyInCount: 0, moveCount: 0 })}
+        {...makeSpec({ everywhereCount: 0, onlyInCount: 0, move: { count: 0, onMoveTo: vi.fn() } })}
       />,
     );
     expect(screen.getByRole('button', { name: /set scope/i })).toBeDisabled();
@@ -111,6 +110,11 @@ describe('BulkScopeMenu', () => {
     renderWithProviders(<BulkScopeMenu {...spec} />);
     // The move submenu renders the second batch of workspace items.
     fireEvent.click(screen.getAllByRole('menuitem', { name: 'Trading' })[1]);
-    expect(spec.onMoveTo).toHaveBeenCalledWith('ws2');
+    expect(spec.move?.onMoveTo).toHaveBeenCalledWith('ws2');
+  });
+
+  it('has no move entry for rows that only live on the account', () => {
+    renderWithProviders(<BulkScopeMenu {...makeSpec({ move: undefined })} />);
+    expect(screen.queryByText(/Move into workspace/)).not.toBeInTheDocument();
   });
 });

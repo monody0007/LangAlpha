@@ -22,9 +22,9 @@ import {
 } from '@/components/mcp/McpPrimitives';
 import type { CatalogServer } from '@/pages/ChatAgent/utils/api';
 import { brokerageArt, mcpServerArt } from '@/lib/brandArt';
+import { useFlashWorkspace } from '@/hooks/useFlashWorkspace';
 import { type Brokerage } from '../brokerages';
-import { useFlashWorkspace } from '../hooks/useFlashWorkspace';
-import { isPluginOwned } from '../utils/provenance';
+import { isEffectivelyEnabled, isPluginOwned } from '../utils/provenance';
 import {
   ConnectButton,
   OauthMenuItems,
@@ -33,7 +33,13 @@ import {
 } from './OauthRowParts';
 import { PluginSuppressedBadge } from './PluginBadges';
 import { RowNote } from './RowNote';
-import { ScopeControl, scopeLocked, type ScopeWorkspace } from './ScopeControl';
+import {
+  ScopeControl,
+  scopeLocked,
+  scopeReach,
+  serverStateLine,
+  type ScopeWorkspace,
+} from './ScopeControl';
 import { rowSelection, type BulkSelection } from './useBulkSelection';
 
 /**
@@ -52,6 +58,7 @@ export function McpCatalogRow({
   vendor,
   registryUnavailable,
   workspaces,
+  workspacesLoading = false,
   selection,
   connecting,
   refreshing,
@@ -65,7 +72,7 @@ export function McpCatalogRow({
   onRequestDelete,
   onToggle,
   onSetWorkspaceDisabled,
-  onMove,
+  onSetNewWorkspacesOn,
 }: {
   server: CatalogServer;
   /** Which shipped brokerage this row's URL resolves to, `null` for none, and
@@ -78,11 +85,14 @@ export function McpCatalogRow({
    *  at; what holds it is `vendor` being unresolved either way. */
   registryUnavailable?: boolean;
   workspaces: ScopeWorkspace[];
+  /** `workspaces` has not arrived yet; the reach waits for it. */
+  workspacesLoading?: boolean;
   selection: BulkSelection;
   connecting: boolean;
   refreshing: boolean;
   toggling: boolean;
-  /** A move or a per-workspace deny flip is in flight for this row. */
+  /** A scope write (a per-workspace deny flip, or the new-workspaces
+   *  setting) is in flight for this row. */
   scopeBusy: boolean;
   onOpen: () => void;
   /** Handed the vendor this row's URL resolves to, so the caller need not
@@ -96,7 +106,8 @@ export function McpCatalogRow({
   onRequestDelete: () => void;
   onToggle: (enabled: boolean) => void;
   onSetWorkspaceDisabled: (workspaceId: string, disabled: boolean) => void;
-  onMove: (toWorkspaceId: string) => void;
+  /** Whether a workspace created later starts with this server on. */
+  onSetNewWorkspacesOn: (on: boolean) => void;
 }) {
   const { t } = useTranslation();
   const flashWorkspace = useFlashWorkspace();
@@ -132,6 +143,27 @@ export function McpCatalogRow({
       ? { key: probe.noteKey, tone: probe.tone, wire: probe.wire }
       : null;
   const rowKey = `catalog-${server.name}`;
+  // Flash has no sandbox, so it can install only directly bound tools. The
+  // server answers whether this row has any; offering Flash on a row that has
+  // none is a switch that does nothing.
+  const flashScope = server.has_direct_tools ? flashWorkspace : undefined;
+  // An off server's line names no workspace, so only an on one waits for the
+  // list it would be counted against. A server its plugin holds off is off
+  // everywhere, whatever its own switch says.
+  const enabled = isEffectivelyEnabled(server);
+  const stateLine =
+    enabled && workspacesLoading
+      ? null
+      : serverStateLine(
+          t,
+          enabled,
+          scopeReach(
+            workspaces,
+            server.disabled_workspace_ids ?? [],
+            flashScope,
+            server.enabled_in_new_workspaces,
+          ),
+        );
 
   return (
     <ServerRowShell
@@ -153,11 +185,7 @@ export function McpCatalogRow({
               metadata — scope, tool count, transport. */}
           <div className="flex items-center gap-2 flex-wrap">
             {claim && <McpOauthPill status={claim} />}
-            <MetaText>
-              {server.enabled
-                ? t('plugins.servers.enabledState')
-                : t('plugins.servers.disabledState')}
-            </MetaText>
+            {stateLine && <MetaText>{stateLine}</MetaText>}
             <ToolCountText status={claim} count={server.tool_count} />
             {checking && !claim && <MetaText>{t('mcp.probe.rowChecking')}</MetaText>}
             {unconnected && !claim && oauthByProbe && <MetaText>{t('mcp.probe.rowOauth')}</MetaText>}
@@ -201,25 +229,12 @@ export function McpCatalogRow({
             scopeWorkspaceId={null}
             disabledWorkspaceIds={server.disabled_workspace_ids ?? []}
             checklistLocked={scopeLocked(server)}
-            // Flash has no sandbox, so it can install only directly bound
-            // tools. The server answers whether this row has any; offering
-            // Flash on a row that has none is a switch that does nothing.
-            flashWorkspace={server.has_direct_tools ? flashWorkspace : undefined}
+            flashWorkspace={flashScope}
+            newWorkspacesOn={server.enabled_in_new_workspaces}
+            loading={workspacesLoading}
             busy={scopeBusy}
-            moveBlockedReason={
-              // OAuth connections exist only at the user tier, so a connected
-              // server cannot move into a workspace. A plugin-owned row stays
-              // put too: moving it would orphan the plugin's ownership row.
-              isPluginOwned(server)
-                ? t('plugins.scope.movePluginBlocked', { plugin: server.plugin_name })
-                : status && status !== 'revoked'
-                  ? t('plugins.scope.moveOauthBlocked')
-                  : null
-            }
             onSetWorkspaceDisabled={onSetWorkspaceDisabled}
-            onMove={(toWorkspaceId) => {
-              if (toWorkspaceId) onMove(toWorkspaceId);
-            }}
+            onSetNewWorkspacesOn={onSetNewWorkspacesOn}
           />
 
           {/* Enabled toggle — fans out to every workspace */}

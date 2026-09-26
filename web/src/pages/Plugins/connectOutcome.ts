@@ -13,7 +13,7 @@
  * English, on a page that is otherwise translated.
  */
 
-import { isServerName } from '@/pages/ChatAgent/components/mcp/mcpSchemas';
+import { NAME_RE } from '@/pages/ChatAgent/components/mcp/mcpSchemas';
 
 /**
  * Every reason the callback emits. Each has a sentence; anything else is the
@@ -41,9 +41,13 @@ export type ConnectOutcome =
   | { kind: 'connected'; server: string | null }
   | { kind: 'failed'; server: string | null; reasonKey: string };
 
-/** What a server the user could have connected is called, or null. */
+/**
+ * What a server the user could have connected is called, or null. The shape
+ * alone: a row saved before the sandbox reserved its name still connects, and
+ * dropping its name here would leave its pending marker behind.
+ */
 function serverName(value: string | null): string | null {
-  return value && isServerName(value) ? value : null;
+  return value && NAME_RE.test(value) ? value : null;
 }
 
 /** The callback's verdict, or null if this landing is not one. */

@@ -8,7 +8,6 @@ import {
   useWorkspaceMcpServers,
   useToggleWorkspaceMcpServer,
   useAddWorkspaceMcpServer,
-  useDeleteWorkspaceMcpServer,
   useCreateMcpCatalogServer,
   useImportMcpCatalogServers,
   useMcpCatalog,
@@ -28,7 +27,6 @@ vi.mock('../../pages/ChatAgent/utils/api', () => ({
   addWorkspaceMcpServer: vi.fn(),
   updateWorkspaceMcpServer: vi.fn(),
   setWorkspaceMcpServerEnabled: vi.fn(),
-  deleteWorkspaceMcpServer: vi.fn(),
   discoverWorkspaceMcpServer: vi.fn(),
   getMcpCatalog: vi.fn(),
   createMcpCatalogServer: vi.fn(),
@@ -41,7 +39,6 @@ import {
   getWorkspaceMcpServers,
   setWorkspaceMcpServerEnabled,
   addWorkspaceMcpServer,
-  deleteWorkspaceMcpServer,
   createMcpCatalogServer,
   importMcpCatalogServers,
   getMcpCatalog,
@@ -52,11 +49,10 @@ const WS = 'ws-1';
 function makeServer(name: string, enabled: boolean): EffectiveServerList['servers'][number] {
   return {
     name,
-    origin: 'workspace',
+    origin: 'user',
     transport: 'stdio',
     enabled,
     editable: true,
-    deletable: true,
     status: 'connected',
     error: '',
     tool_count: 2,
@@ -111,7 +107,7 @@ function makeCatalog(
         }
       : null,
   };
-  return { servers: [server], max_servers: 20, workspace_servers: [] };
+  return { servers: [server], max_servers: 20 };
 }
 
 function makeClient() {
@@ -256,30 +252,19 @@ describe('useDelayedFalse — apply-axis anti-flicker', () => {
 });
 
 describe('mcp mutations — invalidation', () => {
-  it('add invalidates the workspace list', async () => {
+  it('a workspace add invalidates the whole mcp prefix', async () => {
+    // The add creates an account server (off in every other workspace), so the
+    // Plugins catalog and every other workspace's list changed too.
     const client = makeClient();
     const spy = vi.spyOn(client, 'invalidateQueries');
-    (addWorkspaceMcpServer as Mock).mockResolvedValue({ name: 's2', source: 'workspace', enabled: true });
+    (addWorkspaceMcpServer as Mock).mockResolvedValue({ name: 's2', source: 'user', enabled: true });
 
     const { result } = renderHook(() => useAddWorkspaceMcpServer(WS), { wrapper: wrapperFor(client) });
     await act(async () => {
       await result.current.mutateAsync({ name: 's2', transport: 'stdio', command: 'node' });
     });
 
-    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.workspace(WS) });
-  });
-
-  it('delete invalidates the workspace list', async () => {
-    const client = makeClient();
-    const spy = vi.spyOn(client, 'invalidateQueries');
-    (deleteWorkspaceMcpServer as Mock).mockResolvedValue({ ok: true });
-
-    const { result } = renderHook(() => useDeleteWorkspaceMcpServer(WS), { wrapper: wrapperFor(client) });
-    await act(async () => {
-      await result.current.mutateAsync('s1');
-    });
-
-    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.workspace(WS) });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.all });
   });
 
   it('catalog create invalidates the whole mcp prefix, not just the catalog', async () => {

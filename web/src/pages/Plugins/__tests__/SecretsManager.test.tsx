@@ -1,22 +1,17 @@
 import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest';
-import { act, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import React from 'react';
+import { useLocation } from 'react-router-dom';
 import { renderWithProviders } from '@/test/utils';
 
 /**
- * `SecretsManager` is one state machine behind two ports: the workspace Vault
- * tab drives it with imperative API calls + an explicit reload, Plugins →
- * Secrets drives it with React Query mutations. Every branch below is exercised
- * through a real adapter rather than through hand-passed props, because the
- * interesting failures live in the wiring — a mutation shape the component
- * doesn't call the way the adapter expects, or a rejection the adapter swallows
- * before the shared error region can render it.
- *
- * Coverage is split to avoid restating what `SandboxSettingsPanel.test.tsx`
- * already pins on the workspace side (blueprints, the regex hint, the load
- * generation guard, form reset on workspace switch, create + refetch): here the
- * workspace adapter covers the read/reveal/delete half and the error paths.
+ * `SecretsManager` driven through its one adapter, Plugins → Secrets (React
+ * Query mutations). Every branch below is exercised through that adapter
+ * rather than through hand-passed props, because the interesting failures live
+ * in the wiring: a mutation shape the component doesn't call the way the
+ * adapter expects, or a rejection the adapter swallows before the shared error
+ * region can render it.
  */
 
 // ---------------------------------------------------------------------------
@@ -45,7 +40,13 @@ let userVaultData: UserVaultData | undefined;
 let userVaultError: Error | null = null;
 let userVaultLoading = false;
 
-let userBlueprints: { name: string; label: string; description?: string }[] = [];
+let userBlueprints: Array<{
+  name: string;
+  label: string;
+  description?: string;
+  docs_url?: string | null;
+  regex?: string | null;
+}> = [];
 
 vi.mock('@/hooks/useUserVault', () => ({
   useUserVaultSecrets: () => ({ data: userVaultData, isLoading: userVaultLoading, error: userVaultError }),
@@ -56,35 +57,16 @@ vi.mock('@/hooks/useUserVault', () => ({
 }));
 
 // ---------------------------------------------------------------------------
-// API boundary — the workspace adapter (imperative calls + reload) plus the
-// one direct call the user adapter makes (`revealUserVaultSecret`).
+// API boundary: the one direct call the adapter makes (`revealUserVaultSecret`).
 // ---------------------------------------------------------------------------
 
-const wsVault = {
-  get: vi.fn(),
-  create: vi.fn(),
-  update: vi.fn(),
-  del: vi.fn(),
-  reveal: vi.fn(),
-  blueprints: vi.fn(),
-};
 const mockRevealUserVaultSecret = vi.fn();
-const mockGetSandboxStats = vi.fn();
 
 vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>();
   return {
     ...actual,
     // `formatApiErrorDetail` stays real — the error copy is what's under test.
-    getVaultSecrets: (...a: unknown[]) => wsVault.get(...a),
-    createVaultSecret: (...a: unknown[]) => wsVault.create(...a),
-    updateVaultSecret: (...a: unknown[]) => wsVault.update(...a),
-    deleteVaultSecret: (...a: unknown[]) => wsVault.del(...a),
-    revealVaultSecret: (...a: unknown[]) => wsVault.reveal(...a),
-    getVaultBlueprints: (...a: unknown[]) => wsVault.blueprints(...a),
-    getSandboxStats: (...a: unknown[]) => mockGetSandboxStats(...a),
-    installSandboxPackages: vi.fn(),
-    refreshWorkspace: vi.fn(),
     revealUserVaultSecret: (...a: unknown[]) => mockRevealUserVaultSecret(...a),
   };
 });
@@ -100,7 +82,6 @@ vi.mock('@/api/client', () => ({
 }));
 
 import { PluginSecrets } from '../components/PluginSecrets';
-import { SandboxSettingsContent } from '@/pages/ChatAgent/components/SandboxSettingsPanel';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -118,35 +99,12 @@ function userSecret(name: string, overrides: Partial<UserVaultData['secrets'][nu
   };
 }
 
-function wsSecret(name: string, description = '') {
-  return {
-    workspace_vault_secret_id: `wvs-${name}`,
-    name,
-    description,
-    masked_value: 'tok-…9f21',
-    created_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z',
-  };
-}
-
-/** Mount the workspace port: the settings panel's Vault tab. */
-function renderWorkspaceVault(workspaceId = 'ws-1') {
-  const view = renderWithProviders(<SandboxSettingsContent workspaceId={workspaceId} />);
-  fireEvent.click(screen.getByRole('button', { name: /vault/i }));
-  return view;
-}
-
 beforeEach(() => {
   vi.clearAllMocks();
   userVaultData = { secrets: [], remaining_slots: 20 };
   userVaultError = null;
   userVaultLoading = false;
   userBlueprints = [];
-  wsVault.get.mockResolvedValue([]);
-  wsVault.blueprints.mockResolvedValue({ blueprints: [], remaining_slots: 20 });
-  mockGetSandboxStats.mockResolvedValue({
-    state: 'running', sandbox_id: 'sandbox-abc', resources: {}, packages: [], skills: [], mcp_servers: [],
-  });
 });
 
 // ===========================================================================
@@ -436,116 +394,90 @@ describe('SecretsManager via the user vault adapter — reveal', () => {
   });
 });
 
-// ===========================================================================
-// Workspace adapter — the settings-panel Vault tab (imperative + reload)
-// ===========================================================================
-
-describe('SecretsManager via the workspace adapter — list and reveal', () => {
-  it('renders the workspace list and its scope-specific copy', async () => {
-    wsVault.get.mockResolvedValue([wsSecret('WS_TOKEN', 'workspace-only credential')]);
-    renderWorkspaceVault();
-
-    await waitFor(() => expect(screen.getByText('WS_TOKEN')).toBeInTheDocument());
-    expect(screen.getByText('workspace-only credential')).toBeInTheDocument();
-    expect(screen.getByText('tok-…9f21')).toBeInTheDocument();
-    // The workspace port passes a footer the user port does not.
-    expect(screen.getByText('Usage')).toBeInTheDocument();
-  });
-
-  it('reveals through the workspace endpoint, scoped to the workspace id', async () => {
-    wsVault.get.mockResolvedValue([wsSecret('WS_TOKEN')]);
-    wsVault.reveal.mockResolvedValue('workspace-plaintext');
-    renderWorkspaceVault();
-
-    await waitFor(() => expect(screen.getByText('WS_TOKEN')).toBeInTheDocument());
-    fireEvent.click(screen.getByTitle('Reveal value'));
-
-    await waitFor(() => expect(wsVault.reveal).toHaveBeenCalledWith('ws-1', 'WS_TOKEN'));
-    await waitFor(() => expect(screen.getByText('workspace-plaintext')).toBeInTheDocument());
-  });
-
-  it('surfaces a rejected reveal', async () => {
-    wsVault.get.mockResolvedValue([wsSecret('WS_TOKEN')]);
-    wsVault.reveal.mockRejectedValue({ response: { data: { detail: 'sandbox key unavailable' } } });
-    renderWorkspaceVault();
-
-    await waitFor(() => expect(screen.getByText('WS_TOKEN')).toBeInTheDocument());
-    fireEvent.click(screen.getByTitle('Reveal value'));
-
-    await waitFor(() => expect(screen.getByText('sandbox key unavailable')).toBeInTheDocument());
-  });
-});
-
-describe('SecretsManager via the workspace adapter — delete and errors', () => {
-  it('deletes after the confirm and reloads the list', async () => {
-    wsVault.get.mockResolvedValue([wsSecret('WS_DOOMED')]);
-    wsVault.del.mockResolvedValue({ ok: true });
-    renderWorkspaceVault();
-
-    await waitFor(() => expect(screen.getByText('WS_DOOMED')).toBeInTheDocument());
-    const callsBefore = wsVault.get.mock.calls.length;
-
-    fireEvent.click(screen.getByTitle('Delete'));
-    fireEvent.click(screen.getByRole('button', { name: /^confirm$/i }));
-
-    await waitFor(() => expect(wsVault.del).toHaveBeenCalledWith('ws-1', 'WS_DOOMED'));
-    // The workspace port has no cache to invalidate — it re-reads explicitly.
-    await waitFor(() => expect(wsVault.get.mock.calls.length).toBeGreaterThan(callsBefore));
-  });
-
-  it('surfaces a rejected delete', async () => {
-    wsVault.get.mockResolvedValue([wsSecret('WS_DOOMED')]);
-    wsVault.del.mockRejectedValue({ response: { data: { detail: 'secret is locked' } } });
-    renderWorkspaceVault();
-
-    await waitFor(() => expect(screen.getByText('WS_DOOMED')).toBeInTheDocument());
-    fireEvent.click(screen.getByTitle('Delete'));
-    fireEvent.click(screen.getByRole('button', { name: /^confirm$/i }));
-
-    await waitFor(() => expect(screen.getByText('secret is locked')).toBeInTheDocument());
-  });
-
-  it('surfaces a rejected create', async () => {
-    wsVault.create.mockRejectedValue({ response: { data: { detail: 'workspace vault is full' } } });
-    renderWorkspaceVault();
-
-    await waitFor(() => expect(screen.getByRole('button', { name: /add secret/i })).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('button', { name: /add secret/i }));
-    fireEvent.change(screen.getByPlaceholderText('SECRET_NAME'), { target: { value: 'WS_NEW' } });
-    fireEvent.change(screen.getByPlaceholderText('Secret value'), { target: { value: 'v' } });
-    fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
-
-    await waitFor(() => expect(screen.getByText('workspace vault is full')).toBeInTheDocument());
-  });
-
-  it('surfaces a list-load failure through the same error region', async () => {
-    wsVault.get.mockRejectedValue({ response: { data: { detail: 'vault service down' } } });
-    renderWorkspaceVault();
-
-    await waitFor(() => expect(screen.getByText('vault service down')).toBeInTheDocument());
-  });
-});
-
-describe('SecretsManager: the two ports drive the same state machine', () => {
-  it('opens an edit form scoped to the clicked row in either scope', async () => {
-    // Same interaction, both adapters: the edit form replaces exactly one row.
+describe('SecretsManager via the user vault adapter: edit and deep link', () => {
+  it('opens an edit form scoped to the clicked row', () => {
     userVaultData = {
       secrets: [userSecret('FIRST_TOKEN'), userSecret('SECOND_TOKEN')],
       remaining_slots: 18,
     };
-    const { unmount } = renderWithProviders(<PluginSecrets />);
-    fireEvent.click(within(screen.getByText('SECOND_TOKEN').closest('div.flex')!.parentElement!.parentElement!)
-      .getByTitle('Edit'));
-    expect(screen.getByPlaceholderText('New value (leave empty to keep current)')).toBeInTheDocument();
-    expect(screen.getByText('FIRST_TOKEN')).toBeInTheDocument();
-    unmount();
-
-    wsVault.get.mockResolvedValue([wsSecret('WS_FIRST'), wsSecret('WS_SECOND')]);
-    renderWorkspaceVault();
-    await waitFor(() => expect(screen.getByText('WS_SECOND')).toBeInTheDocument());
+    renderWithProviders(<PluginSecrets />);
     fireEvent.click(screen.getAllByTitle('Edit')[1]);
     expect(screen.getByPlaceholderText('New value (leave empty to keep current)')).toBeInTheDocument();
-    expect(screen.getByText('WS_FIRST')).toBeInTheDocument();
+    expect(screen.getByText('FIRST_TOKEN')).toBeInTheDocument();
+  });
+
+  it('opens the add form prefilled from a "Set up NAME" link, once', async () => {
+    // The workspace MCP tab links here for a missing secret; the param is
+    // stripped once acted on, so a remount does not reopen the form.
+    function Search() {
+      return <span data-testid="search">{useLocation().search}</span>;
+    }
+    renderWithProviders(
+      <>
+        <PluginSecrets />
+        <Search />
+      </>,
+      { route: '/plugins?tab=secrets&secret=MY_API_KEY' },
+    );
+
+    expect(screen.getByPlaceholderText('SECRET_NAME')).toHaveValue('MY_API_KEY');
+    await waitFor(() => expect(screen.getByTestId('search')).toHaveTextContent('?tab=secrets'));
+    expect(screen.getByTestId('search')).not.toHaveTextContent('secret=');
+  });
+
+  it('explains how sandbox code reads a secret', () => {
+    renderWithProviders(<PluginSecrets />);
+    expect(screen.getByText('Usage')).toBeInTheDocument();
+  });
+});
+
+describe('SecretsManager via the user vault adapter: recommended credentials', () => {
+  const X_BLUEPRINT = {
+    name: 'X_BEARER_TOKEN',
+    label: 'X (Twitter) Bearer Token',
+    description: 'Read-only app-only auth for x_api.',
+    docs_url: 'https://console.x.com/',
+    regex: '^[A-Za-z0-9%_-]{20,}$',
+  };
+
+  it('opens the add form prefilled, with the docs link', () => {
+    userBlueprints = [X_BLUEPRINT];
+    renderWithProviders(<PluginSecrets />);
+
+    fireEvent.click(screen.getByText('Set up'));
+    expect(screen.getByPlaceholderText('SECRET_NAME')).toHaveValue('X_BEARER_TOKEN');
+    expect(screen.getByText('Docs').closest('a')).toHaveAttribute('href', 'https://console.x.com/');
+  });
+
+  it('disables Set up at the cap', () => {
+    userBlueprints = [X_BLUEPRINT];
+    userVaultData = { secrets: [userSecret('ONLY_TOKEN')], remaining_slots: 0 };
+    renderWithProviders(<PluginSecrets />);
+    expect(screen.getByText('Set up').closest('button')).toBeDisabled();
+  });
+
+  it('hints when the value does not match the blueprint regex, and not when it does', async () => {
+    userBlueprints = [X_BLUEPRINT];
+    renderWithProviders(<PluginSecrets />);
+    fireEvent.click(screen.getByText('Set up'));
+
+    const value = screen.getByPlaceholderText('Secret value');
+    fireEvent.change(value, { target: { value: 'Bearer abc' } });
+    await waitFor(() => expect(screen.getByText(/doesn't look like a valid/i)).toBeInTheDocument());
+
+    fireEvent.change(value, { target: { value: 'A'.repeat(25) } });
+    await waitFor(() =>
+      expect(screen.queryByText(/doesn't look like a valid/i)).not.toBeInTheDocument(),
+    );
+  });
+
+  it('survives a malformed blueprint regex', () => {
+    userBlueprints = [{ ...X_BLUEPRINT, regex: '[unterminated' }];
+    renderWithProviders(<PluginSecrets />);
+    fireEvent.click(screen.getByText('Set up'));
+
+    fireEvent.change(screen.getByPlaceholderText('Secret value'), { target: { value: 'anything' } });
+    expect(screen.queryByText(/doesn't look like a valid/i)).not.toBeInTheDocument();
   });
 });
 

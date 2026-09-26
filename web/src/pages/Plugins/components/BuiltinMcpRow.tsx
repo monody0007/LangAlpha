@@ -30,6 +30,7 @@ import { rowSelection, type BulkSelection } from './useBulkSelection';
 export function BuiltinMcpRow({
   server,
   workspaces,
+  workspacesLoading = false,
   busy,
   selection,
   onOpen,
@@ -38,6 +39,8 @@ export function BuiltinMcpRow({
 }: {
   server: BuiltinMcpServer;
   workspaces: ScopeWorkspace[];
+  /** `workspaces` has not arrived yet; the scope pill waits for it. */
+  workspacesLoading?: boolean;
   /** A write is in flight for this row, whichever surface started it. */
   busy: boolean;
   selection?: BulkSelection;
@@ -74,6 +77,7 @@ export function BuiltinMcpRow({
             scopeWorkspaceId={null}
             disabledWorkspaceIds={server.disabled_workspace_ids ?? []}
             checklistLocked={scopeLocked(server)}
+            loading={workspacesLoading}
             busy={busy}
             onSetWorkspaceDisabled={onSetWorkspaceDisabled}
           />

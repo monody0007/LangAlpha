@@ -35,8 +35,7 @@ const mutateAsync = {
   refresh: vi.fn(),
   createSecret: vi.fn(),
   wsEnable: vi.fn(),
-  adopt: vi.fn(),
-  moveUp: vi.fn(),
+  newWorkspaces: vi.fn(),
 };
 
 let catalogData: CatalogServerList | undefined;
@@ -72,8 +71,7 @@ vi.mock('@/hooks/useMcpServers', () => ({
   }),
   useToggleBuiltinMcpServer: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useSetMcpServerEnabledInWorkspace: () => ({ mutateAsync: mutateAsync.wsEnable, isPending: false }),
-  useAdoptMcpServerToWorkspace: () => ({ mutateAsync: mutateAsync.adopt, isPending: false }),
-  usePromoteMcpServerToTemplate: () => ({ mutateAsync: mutateAsync.moveUp, isPending: false }),
+  useSetMcpServerNewWorkspaces: () => ({ mutateAsync: mutateAsync.newWorkspaces, isPending: false }),
   // The registry the list joins every row against before it will let a connect
   // start. Most rows here are ordinary servers, so what matters is that the
   // query has *answered* -- an unanswered one deliberately holds the button,
@@ -86,8 +84,9 @@ vi.mock('@/hooks/useMcpServers', () => ({
   }),
 }));
 
-// No workspaces → the scope control renders as a plain badge (or the OAuth
-// explainer) and the per-workspace checklist stays out of these tests.
+// No workspaces → the per-workspace checklist stays out of these tests: a
+// builtin's scope control renders as a plain badge, and a catalog row's menu
+// holds only its new-workspaces setting.
 vi.mock('@/hooks/useWorkspaces', () => ({
   useWorkspaces: () => ({ data: { workspaces: [] }, isLoading: false, error: null }),
 }));
@@ -112,8 +111,7 @@ const mockBulkApi = {
   setBuiltinMcpServerEnabled: vi.fn(),
   setMcpCatalogServerEnabled: vi.fn(),
   setWorkspaceMcpServerEnabled: vi.fn(),
-  promoteWorkspaceMcpServerToTemplate: vi.fn(),
-  adoptMcpServerToWorkspace: vi.fn(),
+  setMcpCatalogServerNewWorkspaces: vi.fn(),
   deleteMcpCatalogServer: vi.fn(),
 };
 vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
@@ -127,10 +125,8 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
       mockBulkApi.setMcpCatalogServerEnabled(...args),
     setWorkspaceMcpServerEnabled: (...args: unknown[]) =>
       mockBulkApi.setWorkspaceMcpServerEnabled(...args),
-    promoteWorkspaceMcpServerToTemplate: (...args: unknown[]) =>
-      mockBulkApi.promoteWorkspaceMcpServerToTemplate(...args),
-    adoptMcpServerToWorkspace: (...args: unknown[]) =>
-      mockBulkApi.adoptMcpServerToWorkspace(...args),
+    setMcpCatalogServerNewWorkspaces: (...args: unknown[]) =>
+      mockBulkApi.setMcpCatalogServerNewWorkspaces(...args),
     deleteMcpCatalogServer: (...args: unknown[]) =>
       mockBulkApi.deleteMcpCatalogServer(...args),
   };
@@ -154,6 +150,26 @@ vi.mock('@/components/ui/dropdown-menu', () => ({
   }) => (
     <button
       role="menuitem"
+      aria-disabled={disabled ? 'true' : undefined}
+      onClick={() => { if (!disabled) onSelect?.({ preventDefault: () => {} }); }}
+    >
+      {children}
+    </button>
+  ),
+  DropdownMenuCheckboxItem: ({
+    children,
+    checked,
+    onSelect,
+    disabled,
+  }: {
+    children: React.ReactNode;
+    checked?: boolean;
+    onSelect?: (e?: { preventDefault: () => void }) => void;
+    disabled?: boolean;
+  }) => (
+    <button
+      role="menuitemcheckbox"
+      aria-checked={checked}
       aria-disabled={disabled ? 'true' : undefined}
       onClick={() => { if (!disabled) onSelect?.({ preventDefault: () => {} }); }}
     >
@@ -241,9 +257,9 @@ describe('McpServers — list rendering', () => {
     expect(screen.getByTestId('server-row-alpha_server')).toBeInTheDocument();
     expect(screen.getByTestId('server-row-beta_server')).toBeInTheDocument();
     expect(screen.getByText('does a thing')).toBeInTheDocument();
-    // Inheritance scope is spelled out per row — it's the whole point of the page.
+    // Scope is spelled out per row, which is the whole point of the page.
     expect(screen.getByText('On in all workspaces')).toBeInTheDocument();
-    expect(screen.getByText('Off, not inherited')).toBeInTheDocument();
+    expect(screen.getByText('Off in every workspace')).toBeInTheDocument();
   });
 
   it('shows the OAuth pill and tool count on a connected remote server', () => {
@@ -346,13 +362,13 @@ describe('McpServers — delete', () => {
 
     fireEvent.click(screen.getByText('Delete'));
     expect(mutateAsync.del).not.toHaveBeenCalled();
-    expect(screen.getByText(/Workspaces stop inheriting it immediately/i)).toBeInTheDocument();
+    expect(screen.getByText(/Every workspace stops using it immediately/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /^delete$/i }));
 
     await waitFor(() => expect(mutateAsync.del).toHaveBeenCalledWith('doomed_server'));
     await waitFor(() =>
-      expect(screen.queryByText(/Workspaces stop inheriting it immediately/i)).not.toBeInTheDocument(),
+      expect(screen.queryByText(/Every workspace stops using it immediately/i)).not.toBeInTheDocument(),
     );
   });
 
@@ -374,7 +390,7 @@ describe('McpServers — delete', () => {
       ),
     );
     // Not dismissed — the row is still there to retry or cancel.
-    expect(screen.getByText(/Workspaces stop inheriting it immediately/i)).toBeInTheDocument();
+    expect(screen.getByText(/Every workspace stops using it immediately/i)).toBeInTheDocument();
   });
 
   it('cancels without deleting', () => {
@@ -384,7 +400,7 @@ describe('McpServers — delete', () => {
     fireEvent.click(screen.getByText('Delete'));
     fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
 
-    expect(screen.queryByText(/Workspaces stop inheriting it immediately/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Every workspace stops using it immediately/i)).not.toBeInTheDocument();
     expect(mutateAsync.del).not.toHaveBeenCalled();
   });
 });

@@ -9,7 +9,7 @@ import {
 import type { SkillInfo } from '@/pages/ChatAgent/utils/api';
 import type { BulkAction } from '../components/BulkActionBar';
 import type { BulkScopeSpec } from '../components/BulkScopeMenu';
-import type { ScopeWorkspace } from '../components/ScopeControl';
+import { scopeLocked, type ScopeWorkspace } from '../components/ScopeControl';
 import { bulkSelectionKey, type BulkTarget } from '../components/useBulkSelection';
 import type { PluginListSurface } from './usePluginListSurface';
 import { useScopeBulk } from './useScopeBulk';
@@ -39,7 +39,7 @@ export function useSkillBulkActions(
   }
 
   // Same eligibility as each row's own ScopeControl: the deny-list checklist
-  // exists on enabled user-tier rows; tier moves exist for the user's own
+  // exists on user-tier rows it does not lock; tier moves exist for the user's own
   // uploads and workspace rows (plugin skills stay put, a shadowing workspace
   // row can't surface to a tier where its name is taken).
   const scope = useScopeBulk<SkillInfo>(selected, {
@@ -47,24 +47,26 @@ export function useSkillBulkActions(
     run: surface.run,
     key: skillRowKey,
     denyMarkers: (s) =>
-      s.origin !== 'workspace' && s.enabled ? (s.disabled_workspace_ids ?? []) : null,
+      s.origin !== 'workspace' && !scopeLocked(s) ? (s.disabled_workspace_ids ?? []) : null,
     setWorkspaceEnabled: (s, workspaceId, enabled) =>
       setWorkspaceSkillEnabled(workspaceId, s.name, enabled),
     promote: (s) =>
       s.origin === 'workspace' && s.workspace_id && !s.shadows_inherited
         ? () => moveSkill(s.name, s.workspace_id as string, null)
         : null,
-    movable: (s) =>
-      (s.origin === 'user' && !isPluginOwned(s)) ||
-      (s.origin === 'workspace' && !!s.workspace_id),
-    moveTo: (s, workspaceId) => {
-      if (s.origin === 'user' && !isPluginOwned(s)) {
-        return () => moveSkill(s.name, null, workspaceId);
-      }
-      if (s.origin === 'workspace' && s.workspace_id && s.workspace_id !== workspaceId) {
-        return () => moveSkill(s.name, s.workspace_id as string, workspaceId);
-      }
-      return null;
+    move: {
+      movable: (s) =>
+        (s.origin === 'user' && !isPluginOwned(s)) ||
+        (s.origin === 'workspace' && !!s.workspace_id),
+      to: (s, workspaceId) => {
+        if (s.origin === 'user' && !isPluginOwned(s)) {
+          return () => moveSkill(s.name, null, workspaceId);
+        }
+        if (s.origin === 'workspace' && s.workspace_id && s.workspace_id !== workspaceId) {
+          return () => moveSkill(s.name, s.workspace_id as string, workspaceId);
+        }
+        return null;
+      },
     },
   });
 

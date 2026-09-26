@@ -20,16 +20,21 @@ describe('coerceMcpName', () => {
   // the import will actually create.
   it.each([
     ['class', 'class_server'],
-    ['match', 'match_server'],
     ['mcp_client', 'mcp_client_server'],
     ['mcp-client', 'mcp_client_server'],
     ['__init__', 'init__'],
     ['__class', 'class_server'],
     ['__3d', '_3d'],
-    ['_', 'server'],
     ['---', 'server'],
   ])('renames %s, which the sandbox reserves, to %s', (raw, name) => {
     expect(coerceMcpName(raw)).toEqual({ name, renamed: true });
+  });
+  it.each(['match', 'type', '_'])('keeps %s, a soft keyword the sandbox accepts', (raw) => {
+    expect(coerceMcpName(raw)).toEqual({ name: raw, renamed: false });
+  });
+  it('underscores an astral character once, as the backend does', () => {
+    // Same case as test_coerce_mcp_name_counts_an_astral_character_once.
+    expect(coerceMcpName('rocket\u{1F680}mcp')).toEqual({ name: 'rocket_mcp', renamed: true });
   });
 });
 

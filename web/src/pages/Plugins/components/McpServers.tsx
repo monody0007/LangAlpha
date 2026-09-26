@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence } from 'framer-motion';
-import { AlertTriangle, Blocks, Folder, Plus, Server } from 'lucide-react';
+import { AlertTriangle, Blocks, Plus, Server } from 'lucide-react';
 import { toast } from '@/components/ui/use-toast';
 import {
   useBrokerages,
@@ -15,8 +15,7 @@ import {
   useToggleMcpCatalogServer,
   useImportMcpCatalogServers,
   useSetMcpServerEnabledInWorkspace,
-  useAdoptMcpServerToWorkspace,
-  usePromoteMcpServerToTemplate,
+  useSetMcpServerNewWorkspaces,
 } from '@/hooks/useMcpServers';
 import { invalidateMcpFanout } from '@/hooks/usePlugins';
 import { useUserVaultSecrets, useCreateUserVaultSecret } from '@/hooks/useUserVault';
@@ -57,20 +56,21 @@ import { McpCatalogRow } from './McpCatalogRow';
 import { REGISTRY_NOTE_ID } from './OauthRowParts';
 import { RowNote } from './RowNote';
 import { brokerageForUrl } from '../brokerages';
-import { McpWorkspaceRow } from './McpWorkspaceRow';
 import { PluginSuppressedBadge } from './PluginBadges';
 import { ServerDetail, type McpServerDetailData } from './ServerDetail';
 
 /**
  * The Plugins → MCP tab, grouped by the package a row came from: one deck per
- * shipped bundle, `Your servers` (hand-made rows), one deck per installed
- * plugin, then one deck per workspace. A builtin no bundle declares keeps the
- * `Platform servers` deck. An enabled user-tier row is inherited by EVERY
- * workspace of the user; a disabled row is an inert template. Remote (http)
- * servers carry the OAuth connect lifecycle — the vendor bearer never leaves
- * the host, so "Connect" here is all a sandbox needs for the server to work.
+ * shipped bundle, `Your servers` (hand-made rows, including ones added from a
+ * workspace), then one deck per installed plugin. A builtin no bundle declares
+ * keeps the `Platform servers` deck. Every server lives on the account: an
+ * enabled row is on in every workspace that has not switched it off, a
+ * workspace created later starts with a user row on or off by that row's own
+ * setting, and a disabled row is off everywhere. Remote (http) servers carry
+ * the OAuth connect lifecycle; the vendor bearer never leaves the host, so
+ * "Connect" here is all a sandbox needs for the server to work.
  *
- * This file owns the tab's composition and the workspace-tier writes; the row
+ * This file owns the tab's composition and the per-workspace writes; the row
  * bodies, the OAuth lifecycle and the bulk actions each live beside their own
  * reasoning.
  */
@@ -93,9 +93,8 @@ export function McpServers() {
   const importMutation = useImportMcpCatalogServers();
   const createSecretMutation = useCreateUserVaultSecret();
   const wsEnableMutation = useSetMcpServerEnabledInWorkspace();
-  const adoptMutation = useAdoptMcpServerToWorkspace();
-  const moveUpMutation = usePromoteMcpServerToTemplate();
-  const { workspaces: wsOptions, nameById: wsNameById } = useWorkspaceOptions();
+  const newWorkspacesMutation = useSetMcpServerNewWorkspaces();
+  const { workspaces: wsOptions, loading: wsLoading } = useWorkspaceOptions();
 
   const {
     modalOpen,
@@ -119,7 +118,7 @@ export function McpServers() {
     update: updateMutation.mutateAsync,
     toggle: toggleMutation.mutateAsync,
     remove: deleteMutation.mutateAsync,
-    // Deleting a connector un-inherits it from every workspace, so the strip
+    // Deleting a connector removes it from every workspace, so the strip
     // confirms first — and stays up if the delete fails, to retry or cancel.
     confirmBeforeDelete: true,
     onSaveWarnings: (warnings) =>
@@ -152,15 +151,8 @@ export function McpServers() {
   // refetch that fails still leaves the answer the query already has, and this
   // registry is what the build ships, so that answer is as good as it was.
   const registryUnavailable = !brokerages && !!brokeragesError;
-  const [movingName, setMovingName] = useState<string | null>(null);
   const [builtinTogglingName, setBuiltinTogglingName] = useState<string | null>(null);
-  // Two busy identities for the same endpoint, because two different rows can
-  // be the one the user touched: a user-tier deny checklist marks the user-tier
-  // row (by name), a workspace row's own toggle marks that row (by workspace +
-  // name). One key for both lights up an unrelated sibling whenever a
-  // workspace row shadows an inherited name.
   const [denyBusyName, setDenyBusyName] = useState<string | null>(null);
-  const [wsTogglingKey, setWsTogglingKey] = useState<string | null>(null);
   // Bulk delete already excludes plugin-owned rows and the rest of the actions
   // are enable/disable/scope, so no bulk run here can change plugin identity.
   const surface = usePluginListSurface({ invalidate: invalidateMcpFanout });
@@ -171,7 +163,6 @@ export function McpServers() {
   const secretNames = (vault?.secrets ?? []).map((s) => s.name);
   const servers = catalog?.servers ?? [];
   const builtinServers = builtinData?.servers ?? [];
-  const allWorkspaceServers = catalog?.workspace_servers ?? [];
   const maxServers = catalog?.max_servers ?? 0;
 
   const visibleBuiltins = builtinServers.filter(
@@ -187,15 +178,9 @@ export function McpServers() {
         isOauthBroken(s.oauth_status) || isPluginSuppressed(s),
       ),
   );
-  const visibleWorkspaceServers = allWorkspaceServers.filter(
-    (s) =>
-      matchesFilter(surface.filter, s.name, s.description) &&
-      surface.matchesState(s.enabled),
-  );
-  // Every row the tab can show, across every section — the one population the
+  // Every row the tab can show, across every section: the one population the
   // "No matches" notice is allowed to be keyed on.
-  const visibleTotal =
-    visibleBuiltins.length + visibleServers.length + visibleWorkspaceServers.length;
+  const visibleTotal = visibleBuiltins.length + visibleServers.length;
 
   const ownServers = visibleServers.filter((s) => !s.plugin_name);
   // Builtins group by the bundle that declares them, the same way catalog
@@ -215,22 +200,13 @@ export function McpServers() {
       (s) => s.plugin_name as string,
     ).entries(),
   ].sort(([a], [b]) => a.localeCompare(b));
-  const workspaceSections = [
-    ...groupBy(visibleWorkspaceServers, (s) => s.workspace_id).entries(),
-  ].sort(([a], [b]) => (wsNameById.get(a) ?? '').localeCompare(wsNameById.get(b) ?? ''));
 
-  // --- Detail overlay (?detail=server:NAME [&dws=wsid]) ---
-  // Builtin names are reserved against catalog names, so a bare name lookup
-  // is unambiguous; a `dws` selects the workspace-local row instead.
+  // --- Detail overlay (?detail=server:NAME) ---
+  // Builtin names are reserved against catalog names, and a catalog name is
+  // unique per account, so a bare name lookup is unambiguous.
   const detail = useDetailParam<McpServerDetailData>(
     'server',
     (ref) => {
-      if (ref.workspaceId) {
-        const row = allWorkspaceServers.find(
-          (s) => s.workspace_id === ref.workspaceId && s.name === ref.name,
-        );
-        return row ? { origin: 'workspace' as const, server: row } : null;
-      }
       const builtin = builtinServers.find((s) => s.name === ref.name);
       if (builtin) return { origin: 'builtin' as const, server: builtin };
       const cat = servers.find((s) => s.name === ref.name);
@@ -245,7 +221,6 @@ export function McpServers() {
   const bulk = useMcpBulkActions({
     builtins: visibleBuiltins,
     catalog: visibleServers,
-    workspaceServers: visibleWorkspaceServers,
     surface,
     workspaces: wsOptions,
   });
@@ -295,48 +270,20 @@ export function McpServers() {
     }
   }
 
-  /** A workspace row's own enabled toggle, from the row or its detail overlay. */
-  async function handleSetWorkspaceRowEnabled(
-    workspaceId: string,
-    name: string,
-    enabled: boolean,
-  ) {
-    // Keyed by row so one row's in-flight toggle doesn't lock its siblings.
-    setWsTogglingKey(`${workspaceId}:${name}`);
+  /** "On in new workspaces" on a catalog row. Held on the same busy name as
+   *  the checklist: both are writes from the one scope menu. */
+  async function handleSetNewWorkspacesOn(name: string, on: boolean) {
+    setDenyBusyName(name);
     try {
-      await setWorkspaceEnabled(workspaceId, name, enabled);
-    } finally {
-      setWsTogglingKey(null);
-    }
-  }
-
-  async function handleAdopt(name: string, workspaceId: string) {
-    setMovingName(name);
-    try {
-      await adoptMutation.mutateAsync({ workspaceId, name });
+      await newWorkspacesMutation.mutateAsync({ name, enabled: on });
     } catch (err) {
       toast({
         variant: 'destructive',
-        title: t('plugins.scope.moveFailed'),
+        title: t('plugins.servers.toggleFailed'),
         description: formatApiErrorDetail(err),
       });
     } finally {
-      setMovingName(null);
-    }
-  }
-
-  async function handleMoveUp(workspaceId: string, name: string) {
-    setMovingName(name);
-    try {
-      await moveUpMutation.mutateAsync({ workspaceId, name, removeSource: true });
-    } catch (err) {
-      toast({
-        variant: 'destructive',
-        title: t('plugins.scope.moveFailed'),
-        description: formatApiErrorDetail(err),
-      });
-    } finally {
-      setMovingName(null);
+      setDenyBusyName(null);
     }
   }
 
@@ -357,11 +304,12 @@ export function McpServers() {
         vendor={brokerages ? brokerageForUrl(server.url, brokerages) : undefined}
         registryUnavailable={registryUnavailable}
         workspaces={wsOptions}
+        workspacesLoading={wsLoading}
         selection={selection}
         connecting={oauth.connectingName === server.name}
         refreshing={oauth.refreshingName === server.name}
         toggling={togglingName === server.name}
-        scopeBusy={movingName === server.name || denyBusyName === server.name}
+        scopeBusy={denyBusyName === server.name}
         onOpen={() => detail.open(server.name)}
         onConnect={(vendor) => {
           // One strip at a time: a delete question already on screen belongs to
@@ -385,7 +333,7 @@ export function McpServers() {
         onSetWorkspaceDisabled={(wsId, disabled) =>
           handleSetWorkspaceDisabled(server.name, wsId, disabled)
         }
-        onMove={(toWorkspaceId) => handleAdopt(server.name, toWorkspaceId)}
+        onSetNewWorkspacesOn={(on) => handleSetNewWorkspacesOn(server.name, on)}
       />
     );
   }
@@ -416,6 +364,7 @@ export function McpServers() {
               key={server.name}
               server={server}
               workspaces={wsOptions}
+              workspacesLoading={wsLoading}
               busy={
                 builtinTogglingName === server.name ||
                 denyBusyName === server.name
@@ -471,11 +420,7 @@ export function McpServers() {
         showAttention
         selecting={selection.selecting}
         onStartSelect={selection.start}
-        selectDisabled={
-          servers.length === 0 &&
-          builtinServers.length === 0 &&
-          allWorkspaceServers.length === 0
-        }
+        selectDisabled={servers.length === 0 && builtinServers.length === 0}
       />
 
       {surface.noMatches(visibleTotal) && (
@@ -564,8 +509,7 @@ export function McpServers() {
               compact={
                 bundleSections.length > 0 ||
                 unownedBuiltins.length > 0 ||
-                pluginSections.length > 0 ||
-                workspaceSections.length > 0
+                pluginSections.length > 0
               }
               // The count above is every catalog row, because that is what the
               // per-account cap counts; the list below is only the ones the
@@ -609,41 +553,6 @@ export function McpServers() {
         >
           <AnimatePresence initial={false}>
             {rows.map(renderCatalogRow)}
-          </AnimatePresence>
-        </GroupDeck>
-      ))}
-
-      {workspaceSections.map(([wsId, wsServers]) => (
-        <GroupDeck
-          key={wsId}
-          id={`mcp:ws:${wsId}`}
-          title={t('plugins.scope.inWorkspace', {
-            name: wsNameById.get(wsId) ?? t('plugins.scope.unknownWorkspace'),
-          })}
-          icon={Folder}
-          count={wsServers.length}
-          enabledCount={wsServers.filter((s) => s.enabled).length}
-          forceExpanded={surface.forceExpanded}
-          selection={selection}
-          selectionKeys={wsServers.map((s) => `ws:${wsId}:${s.name}`)}
-        >
-          <AnimatePresence initial={false}>
-            {wsServers.map((server) => (
-              <McpWorkspaceRow
-                key={`${wsId}:${server.name}`}
-                server={server}
-                workspaceId={wsId}
-                workspaces={wsOptions}
-                selection={selection}
-                moving={movingName === server.name}
-                toggling={wsTogglingKey === `${wsId}:${server.name}`}
-                onOpen={() => detail.open(server.name, wsId)}
-                onMoveUp={() => handleMoveUp(wsId, server.name)}
-                onSetEnabled={(enabled) =>
-                  handleSetWorkspaceRowEnabled(wsId, server.name, enabled)
-                }
-              />
-            ))}
           </AnimatePresence>
         </GroupDeck>
       ))}
@@ -722,30 +631,16 @@ export function McpServers() {
           key={`${detailData.origin}:${detailData.server.name}`}
           data={detailData}
           onClose={detail.close}
-          workspaceName={
-            detailData.origin === 'workspace'
-              ? wsNameById.get(detailData.server.workspace_id)
-              : undefined
-          }
           toggling={
             detailData.origin === 'builtin'
               ? builtinTogglingName === detailData.server.name
-              : detailData.origin === 'user'
-                ? togglingName === detailData.server.name
-                : wsTogglingKey ===
-                  `${detailData.server.workspace_id}:${detailData.server.name}`
+              : togglingName === detailData.server.name
           }
           onToggle={(enabled) => {
             if (detailData.origin === 'builtin') {
               handleToggleBuiltin(detailData.server.name, enabled);
-            } else if (detailData.origin === 'user') {
-              toggle(detailData.server, enabled);
             } else {
-              handleSetWorkspaceRowEnabled(
-                detailData.server.workspace_id,
-                detailData.server.name,
-                enabled,
-              );
+              toggle(detailData.server, enabled);
             }
           }}
         />

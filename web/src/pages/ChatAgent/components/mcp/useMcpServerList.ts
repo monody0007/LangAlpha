@@ -6,7 +6,7 @@ import { formatApiErrorDetail, type McpServerInput } from '../../utils/api';
  * and the workspace settings MCP tab. Add/edit modal, import modal, in-flight
  * toggle and delete were written once per surface and had already drifted
  * apart; each surface now keeps only what is genuinely its own (OAuth
- * connect/disconnect/refresh on one side, discovery + promote on the other).
+ * connect/disconnect/refresh and delete on one side, discovery on the other).
  *
  * Outcome reporting stays with the caller — each surface owns its copy, and an
  * omitted reporter means that outcome is deliberately silent (the workspace
@@ -27,7 +27,9 @@ export interface McpServerListOptions {
   create: (body: McpServerInput) => Promise<unknown>;
   update: (vars: { name: string; body: McpServerInput }) => Promise<unknown>;
   toggle: (vars: { name: string; enabled: boolean }) => Promise<unknown>;
-  remove: (name: string) => Promise<unknown>;
+  /** Absent where a row cannot be deleted (the workspace tab: removal is an
+   *  account action, taken on the Plugins page). */
+  remove?: (name: string) => Promise<unknown>;
   onSaveWarnings?: (warnings: string[]) => void;
   onToggleWarnings?: (warnings: string[]) => void;
   onToggleError?: (err: unknown) => void;
@@ -111,9 +113,11 @@ export function useMcpServerList<TServer extends NamedServer>(options: McpServer
   }, []);
 
   const runDelete = useCallback(async (name: string) => {
+    const remove = latest.current.remove;
+    if (!remove) return;
     setDeletingName(name);
     try {
-      await latest.current.remove(name);
+      await remove(name);
       setDeletingName(null);
     } catch (err) {
       latest.current.onDeleteError?.(err);

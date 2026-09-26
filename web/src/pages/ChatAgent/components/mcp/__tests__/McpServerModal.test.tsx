@@ -372,18 +372,15 @@ describe('McpServerModal: the check caches the question, not the credential', ()
     expect(cachedKeys(client)).not.toContain(SECRET);
   });
 
-  it("drops this scope's verdicts when the form closes", async () => {
+  it('drops its verdicts when the form closes', async () => {
     const onProbe = vi.fn().mockResolvedValue(probeResult());
     // A real client keeps an entry after its last observer leaves, which is the
     // window this asserts is shut; the shared test client sets gcTime to 0.
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false, gcTime: Infinity } },
     });
-    const probes = () => client.getQueryCache().findAll({ queryKey: queryKeys.mcp.probes('ws-1') });
-    const { unmount } = render(
-      <McpServerModal {...baseProps} onProbe={onProbe} probeScope="ws-1" />,
-      client,
-    );
+    const probes = () => client.getQueryCache().findAll({ queryKey: queryKeys.mcp.probes() });
+    const { unmount } = render(<McpServerModal {...baseProps} onProbe={onProbe} />, client);
     typeEntry('https://mcp.linear.app/mcp');
     await waitFor(() => expect(onProbe).toHaveBeenCalledTimes(1));
     expect(probes().length).toBeGreaterThan(0);
@@ -751,6 +748,31 @@ describe('McpServerModal: validation gating', () => {
     render(<McpServerModal {...baseProps} initial={makeDraft({ name: 'locked_name' })} />);
     const nameInput = screen.getByDisplayValue('locked_name') as HTMLInputElement;
     expect(nameInput).toBeDisabled();
+  });
+
+  it('saves an edit under a name the sandbox reserved after the row was saved', async () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <McpServerModal
+        {...baseProps}
+        initial={makeDraft({ name: 'class', command: 'npx', args: ['-y', 'pkg'] })}
+        onSubmit={onSubmit}
+      />,
+    );
+    const save = screen.getByRole('button', { name: /^save$/i });
+    expect(save).not.toBeDisabled();
+    expect(screen.queryByText(/Python keyword/)).not.toBeInTheDocument();
+    fireEvent.click(save);
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ name: 'class' }));
+  });
+
+  it('says why a new name is refused instead of only disabling Add', () => {
+    render(<McpServerModal {...baseProps} />);
+    typeEntry('npx -y @scope/thing');
+    fireEvent.change(screen.getByTestId('mcp-name'), { target: { value: 'class' } });
+    expect(screen.getByRole('button', { name: /^add$/i })).toBeDisabled();
+    expect(screen.getByText(/"class" is a Python keyword/)).toBeInTheDocument();
   });
 });
 

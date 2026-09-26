@@ -411,17 +411,17 @@ export function HeaderButton({
 }
 
 /**
- * The header both server lists wear: counter on the left, Import + Add on the
- * right, and the at-cap explanation that has to appear on BOTH buttons (it was
- * spelled out four times, and the two lists had already stopped agreeing on
- * which of them said what). `children` takes a surface's own extra action.
+ * A server list's header: counter on the left, Import + Add on the right.
+ * `children` takes a surface's own extra action. `cap` is the account's count
+ * and limit, passed apart from `count` because a list showing one workspace's
+ * selection cannot count against it; at the limit both adds are held, with
+ * the reason on each, before a form opens only to be refused.
  */
 export function ListToolbar({
   icon,
   title,
   count,
-  max,
-  atCap,
+  cap,
   onImport,
   onAdd,
   children,
@@ -429,27 +429,32 @@ export function ListToolbar({
   icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
   title: string;
   count: number;
-  max: number;
-  atCap: boolean;
+  cap?: { used: number; max: number };
   onImport: () => void;
   onAdd: () => void;
   children?: React.ReactNode;
 }) {
   const { t } = useTranslation();
-  const atCapHint = atCap ? t('mcp.list.atCap', { max }) : undefined;
+  const atCapHint = cap && cap.used >= cap.max ? t('mcp.list.atCap', { max: cap.max }) : undefined;
   return (
-    <ListHeader icon={icon} title={title} count={count} max={max}>
+    <ListHeader icon={icon} title={title} count={count}>
       {children}
       <HeaderButton
         variant="secondary"
         icon={Download}
         onClick={onImport}
-        disabled={atCap}
+        disabled={!!atCapHint}
         title={atCapHint ?? t('mcp.list.importHint')}
       >
         {t('mcp.list.importJson')}
       </HeaderButton>
-      <HeaderButton variant="primary" icon={Plus} onClick={onAdd} disabled={atCap} title={atCapHint}>
+      <HeaderButton
+        variant="primary"
+        icon={Plus}
+        onClick={onAdd}
+        disabled={!!atCapHint}
+        title={atCapHint}
+      >
         {t('mcp.list.addServer')}
       </HeaderButton>
     </ListHeader>

@@ -17,7 +17,8 @@ import { ChartSurfaceContext, type ChartSurface } from '../../ChatAgent/contexts
 import { WorkspaceProvider } from '../../ChatAgent/contexts/WorkspaceContext';
 import { useChatMessages } from '../../ChatAgent/hooks/useChatMessages';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
-import { appendPathSuffix, getFlashWorkspace, getPreviewUrl, summarizeThread, offloadThread } from '../../ChatAgent/utils/api';
+import { flashWorkspaceQuery } from '@/hooks/useFlashWorkspace';
+import { appendPathSuffix, getPreviewUrl, summarizeThread, offloadThread } from '../../ChatAgent/utils/api';
 import { attachmentsToContexts } from '../../ChatAgent/utils/fileUpload';
 import {
   resolveSubagentTelemetry as resolveSubagentTelemetryPure,
@@ -114,13 +115,10 @@ export default function MarketChatPanel(props: MarketChatPanelProps): React.Reac
     selectedWorkspaceId,
   } = props;
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
 
   // Flash workspace: lazily fetched once, cached forever.
-  const { data: flashWs } = useQuery({
-    queryKey: queryKeys.workspaces.flash(),
-    queryFn: getFlashWorkspace,
-    staleTime: Infinity,
-  });
+  const { data: flashWs } = useQuery(flashWorkspaceQuery(queryClient));
 
   // Active workspace per mode. Flash mode uses the shared flash workspace.
   const activeWorkspaceId = mode === 'fast'

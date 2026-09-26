@@ -12,11 +12,12 @@ import RenameWorkspaceDialog from './RenameWorkspaceDialog';
 import MorphingPageDots from '../../../components/ui/morphing-page-dots';
 import { useWorkspaces } from '../../../hooks/useWorkspaces';
 import { queryKeys } from '../../../lib/queryKeys';
-import { getFlashWorkspace, renameWorkspace } from '../utils/api';
+import { renameWorkspace } from '../utils/api';
 import { useWorkspaceActions } from './workspaceActions';
 import { isEffectivelyPinned } from '../hooks/useNavigationData';
 import { pinWorkspaceRow } from '../hooks/workspaceRowActions';
 import { useCreateWorkspace } from '../hooks/useCreateWorkspace';
+import { flashWorkspaceQuery } from '@/hooks/useFlashWorkspace';
 import { clearChatSession } from '../hooks/utils/chatSessionRestore';
 import { useWorkspaceMutation } from '../hooks/useWorkspaceMutation';
 import { useComputers } from '../hooks/useComputers';
@@ -84,8 +85,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
 
   // Flash workspace query (idempotent POST -- creates if not exists)
   const { data: flashWs, isLoading: isFlashLoading } = useQuery({
-    queryKey: queryKeys.workspaces.flash(),
-    queryFn: getFlashWorkspace,
+    ...flashWorkspaceQuery(queryClient),
     staleTime: 5 * 60_000,
   });
 

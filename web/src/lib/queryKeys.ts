@@ -125,11 +125,11 @@ export const queryKeys = {
   },
   mcp: {
     all:       ['mcp'],
-    // User-level catalog of MCP templates (not workspace-scoped).
+    // The account's servers (not workspace-scoped).
     catalog:   () => [...queryKeys.mcp.all, 'catalog'],
     // Process-global builtins with the user's account-wide toggles.
     builtins:  () => [...queryKeys.mcp.all, 'builtins'],
-    // Effective per-workspace server list (builtins + workspace servers).
+    // Effective per-workspace server list (builtins + account servers).
     workspace: (wsId: string) => [...queryKeys.mcp.all, 'workspace', wsId],
     // Discovered tool snapshot for one catalog server (the detail view).
     serverTools: (name: string) => [...queryKeys.mcp.all, 'serverTools', name],
@@ -141,20 +141,17 @@ export const queryKeys = {
       'builtinServerTools',
       name,
     ],
-    // Every pre-save check run against one vault. First in the key so a vault
-    // mutation can drop that vault's verdicts by prefix; `''` is the user
-    // vault, a workspace id is that workspace's.
-    probes: (scope: string) => [...queryKeys.mcp.all, 'probe', scope],
+    // Every pre-save check. Under `mcp` so a vault mutation, which answers
+    // `missing_secrets` for all of them, drops them with the fan-out.
+    probes: () => [...queryKeys.mcp.all, 'probe'],
     // The add form's pre-save check of one address with one set of headers.
     // Both go in the key because the verdict is about the pair: the same URL
     // answers differently once a credential rides along. `headers` is a digest
     // of the map rather than the map itself: a key is cached state, and saying
     // which credential was in hand needs no more than that, while a row the
-    // user is still filling in still never collides with the finished one. The
-    // scope is part of the question too: the same pair resolves its
-    // `${vault:…}` refs against whichever vault asked.
-    probe: (scope: string, url: string, headers: string) => [
-      ...queryKeys.mcp.probes(scope),
+    // user is still filling in still never collides with the finished one.
+    probe: (url: string, headers: string) => [
+      ...queryKeys.mcp.probes(),
       url,
       headers,
     ],
@@ -221,15 +218,6 @@ export const queryKeys = {
     executions: (automationId: string) => [...queryKeys.automations.all, 'executions', automationId],
     runs:       () => [...queryKeys.automations.all, 'runs'],
     waiting:    (threadId: string) => [...queryKeys.automations.all, 'waiting', threadId],
-  },
-  // Workspace-tier vault. Scoped under the workspace id so a mutation
-  // invalidates that workspace's secrets AND blueprints (the recommended-
-  // credentials list is derived from them) without touching a sibling's cache.
-  workspaceVault: {
-    all:         ['workspaceVault'],
-    byWorkspace: (wsId: string) => [...queryKeys.workspaceVault.all, wsId],
-    secrets:     (wsId: string) => [...queryKeys.workspaceVault.byWorkspace(wsId), 'secrets'],
-    blueprints:  (wsId: string) => [...queryKeys.workspaceVault.byWorkspace(wsId), 'blueprints'],
   },
   marketData: {
     all:  ['marketData'],

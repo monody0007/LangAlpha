@@ -3,7 +3,7 @@ import { screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import React from 'react';
 import { renderWithProviders } from '@/test/utils';
-import type { EffectiveServer, EffectiveServerList } from '../../../utils/api';
+import type { CatalogServerList, EffectiveServer, EffectiveServerList } from '../../../utils/api';
 
 // ---------------------------------------------------------------------------
 // Mock the MCP hooks so we drive list data + mutation outcomes directly.
@@ -13,83 +13,76 @@ const mutateAsync = {
   add: vi.fn(),
   update: vi.fn(),
   toggle: vi.fn(),
-  del: vi.fn(),
   discover: vi.fn(),
   import: vi.fn(),
-  promote: vi.fn(),
 };
 
 let listData: EffectiveServerList | undefined;
-let catalogData:
-  | { servers: Array<{ name: string; transport?: string; description?: string }>; max_servers?: number }
-  | undefined;
+let catalogData: CatalogServerList | undefined;
 
 vi.mock('@/hooks/useMcpServers', () => ({
+  useMcpCatalog: () => ({ data: catalogData }),
   useWorkspaceMcpServers: () => ({ data: listData, isLoading: false, error: null }),
   useAddWorkspaceMcpServer: () => ({ mutateAsync: mutateAsync.add, isPending: false }),
   useUpdateWorkspaceMcpServer: () => ({ mutateAsync: mutateAsync.update, isPending: false }),
   useToggleWorkspaceMcpServer: () => ({ mutateAsync: mutateAsync.toggle, isPending: false }),
-  useDeleteWorkspaceMcpServer: () => ({ mutateAsync: mutateAsync.del, isPending: false }),
   useDiscoverWorkspaceMcpServer: () => ({ mutateAsync: mutateAsync.discover, isPending: false }),
   useImportWorkspaceMcpServers: () => ({ mutateAsync: mutateAsync.import, isPending: false }),
-  usePromoteMcpServerToTemplate: () => ({ mutateAsync: mutateAsync.promote, isPending: false }),
-  useMcpCatalog: () => ({ data: catalogData, isLoading: false, error: null }),
-  // Catalog CRUD hooks are exercised via the Templates sub-view.
-  useCreateMcpCatalogServer: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useUpdateMcpCatalogServer: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useDeleteMcpCatalogServer: () => ({ mutateAsync: vi.fn(), isPending: false }),
   // Pass-through (no fake timers in this suite): the anti-flicker is unit-tested
   // separately in useMcpServers.test; here `synced` should reflect the raw value.
   useDelayedFalse: (v: boolean) => v,
 }));
 
-// Error feedback is a toast — mock the module so we can assert it was raised
-// (matches the existing toast-mock pattern across the codebase).
 vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 
-// The secret picker reads the workspace vault through React Query; keep it
+// The secret picker reads the account vault through React Query; keep it
 // empty and benign. (`formatApiErrorDetail` stays real — the inline submit-error
-// copy is what the first test asserts on.)
-vi.mock('@/hooks/useWorkspaceVault', () => ({
-  useWorkspaceVaultSecrets: () => ({ data: [], isLoading: false, error: null }),
-  useCreateWorkspaceVaultSecret: () => ({ mutateAsync: vi.fn(), isPending: false }),
+// copy is what the submit tests assert on.)
+vi.mock('@/hooks/useUserVault', () => ({
+  useUserVaultSecrets: () => ({ data: { secrets: [], remaining_slots: 10 }, isLoading: false, error: null }),
+  useCreateUserVaultSecret: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 
-// Stub the row so the promote action is a plain button — the real Radix kebab
-// needs portal/pointer machinery jsdom doesn't drive (the row's own test mocks
-// the dropdown for the same reason). McpServerRow's item wiring is covered there.
+const navigate = vi.fn();
+vi.mock('react-router-dom', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('react-router-dom')>()),
+  useNavigate: () => navigate,
+}));
+
+// Stub the row so its actions are plain buttons: the real Radix kebab needs
+// portal/pointer machinery jsdom doesn't drive (the row's own test mocks the
+// dropdown for the same reason). McpServerRow's item wiring is covered there.
 vi.mock('../McpServerRow', () => ({
   McpServerRow: ({
     server,
-    onPromoteToTemplate,
+    onSetupSecret,
+    onEdit,
   }: {
-    server: { name: string };
-    // Mirror the real row's stable-handler contract: hand the row's own server
-    // back at call time so the parent can pass a single stable useCallback.
-    onPromoteToTemplate?: (server: { name: string }) => void;
+    server: { name: string; missing_secrets: string[] };
+    onSetupSecret: (name: string) => void;
+    onEdit: (server: unknown) => void;
   }) => (
     <div data-testid={`row-${server.name}`}>
       <span>{server.name}</span>
-      {onPromoteToTemplate && (
-        <button type="button" onClick={() => onPromoteToTemplate(server)}>
-          {`save-template-${server.name}`}
+      <button type="button" onClick={() => onEdit(server)}>{`edit-${server.name}`}</button>
+      {server.missing_secrets.map((secret) => (
+        <button key={secret} type="button" onClick={() => onSetupSecret(secret)}>
+          {`setup-${secret}`}
         </button>
-      )}
+      ))}
     </div>
   ),
 }));
 
 import { McpTab } from '../McpTab';
-import { toast } from '@/components/ui/use-toast';
 
 function makeServer(name: string, overrides: Partial<EffectiveServer> = {}): EffectiveServer {
   return {
     name,
-    origin: 'workspace',
+    origin: 'user',
     transport: 'stdio',
     enabled: true,
     editable: true,
-    deletable: true,
     status: 'connected',
     error: '',
     tool_count: 0,
@@ -112,10 +105,18 @@ function makeList(servers: EffectiveServer[], maxServers = 20): EffectiveServerL
   return { servers, sandbox_running: true, max_servers: maxServers, config_version: 1 };
 }
 
+/** Only the count reaches the tab, so the rows can stay bare. */
+function makeCatalog(count: number, maxServers: number): CatalogServerList {
+  return {
+    servers: Array.from({ length: count }, (_, i) => ({ name: `s${i}` }) as CatalogServerList['servers'][number]),
+    max_servers: maxServers,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   listData = makeList([]);
-  catalogData = { servers: [] };
+  catalogData = makeCatalog(0, 20);
 });
 
 describe('McpTab — submit error formatting', () => {
@@ -146,82 +147,67 @@ describe('McpTab — submit error formatting', () => {
   });
 });
 
-describe('McpTab — promote workspace server to template', () => {
-  it('promotes a new-name server straight away (no overwrite, no confirm)', async () => {
-    listData = makeList([makeServer('fresh_server')]);
-    catalogData = { servers: [] }; // name not in catalog
-    mutateAsync.promote.mockResolvedValue({});
+describe('McpTab: account servers', () => {
+  it('holds Add and Import at the account cap, with the reason on each', () => {
+    // The catalog counts servers switched off account-wide, which this
+    // workspace's list leaves out, so a list of one can still be at the cap.
+    listData = makeList([makeServer('a')], 3);
+    catalogData = makeCatalog(3, 3);
     renderWithProviders(<McpTab workspaceId="ws-1" />);
 
-    fireEvent.click(screen.getByText('save-template-fresh_server'));
-
-    await waitFor(() =>
-      expect(mutateAsync.promote).toHaveBeenCalledWith({ workspaceId: 'ws-1', name: 'fresh_server', overwrite: false }),
-    );
-    // No overwrite confirm for a fresh name.
-    expect(screen.queryByText(/already exists/i)).not.toBeInTheDocument();
+    const reason = 'Your account is at its limit of 3 servers. Remove one in Plugins first.';
+    for (const name of [/add server/i, /import json/i]) {
+      const button = screen.getByRole('button', { name });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute('title', reason);
+    }
   });
 
-  it('confirms before overwriting an existing template, then promotes with overwrite', async () => {
-    listData = makeList([makeServer('dup_server')]);
-    catalogData = { servers: [{ name: 'dup_server' }] }; // name already a template
-    mutateAsync.promote.mockResolvedValue({});
-    renderWithProviders(<McpTab workspaceId="ws-1" />);
-
-    fireEvent.click(screen.getByText('save-template-dup_server'));
-
-    // Clash → confirm banner, NOT an immediate promote.
-    await waitFor(() => expect(screen.getByText(/already exists/i)).toBeInTheDocument());
-    expect(mutateAsync.promote).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole('button', { name: /overwrite/i }));
-
-    await waitFor(() =>
-      expect(mutateAsync.promote).toHaveBeenCalledWith({ workspaceId: 'ws-1', name: 'dup_server', overwrite: true }),
-    );
-  });
-
-  it('surfaces a rejected promote as a toast rather than an unhandled rejection', async () => {
-    // The branch that moved Templates out to the user tier deleted this file's
-    // only toast-error assertion along with it; promote is McpTab's remaining
-    // fire-and-report mutation, and a swallowed failure here reads as success.
-    listData = makeList([makeServer('fresh_server')]);
-    catalogData = { servers: [] };
-    mutateAsync.promote.mockRejectedValue({
-      response: { data: { detail: 'connector catalog at cap' } },
+  it('does not count this list against the cap, and shows a 409 in the form', async () => {
+    // Two rows here against a cap of two is not a full account: the gate reads
+    // the catalog, and a refusal it misses lands where the user is typing.
+    listData = makeList([makeServer('a'), makeServer('b')], 2);
+    catalogData = makeCatalog(2, 3);
+    mutateAsync.add.mockRejectedValue({
+      response: { status: 409, data: { detail: 'You already have a server named good_name.' } },
     });
     renderWithProviders(<McpTab workspaceId="ws-1" />);
 
-    fireEvent.click(screen.getByText('save-template-fresh_server'));
+    fireEvent.click(screen.getByRole('button', { name: /add server/i }));
+    expect(screen.getByText(/turns it on only in this workspace/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('mcp-entry'), { target: { value: 'npx -y @scope/thing' } });
+    fireEvent.change(screen.getByPlaceholderText('my_server'), { target: { value: 'good_name' } });
+    fireEvent.click(screen.getByRole('button', { name: /^add$/i }));
 
     await waitFor(() =>
-      expect(toast).toHaveBeenCalledWith(
-        expect.objectContaining({
-          variant: 'destructive',
-          title: 'Could not save the server',
-          description: 'connector catalog at cap',
-        }),
-      ),
+      expect(screen.getByText('You already have a server named good_name.')).toBeInTheDocument(),
     );
   });
 
-  it('cancels the overwrite confirm without promoting', async () => {
-    listData = makeList([makeServer('dup_server')]);
-    catalogData = { servers: [{ name: 'dup_server' }] };
+  it('sends "Set up NAME" to the account vault with the name prefilled', () => {
+    listData = makeList([
+      makeServer('needs', { status: 'needs_secret', missing_secrets: ['MY_API_KEY'] }),
+    ]);
     renderWithProviders(<McpTab workspaceId="ws-1" />);
 
-    fireEvent.click(screen.getByText('save-template-dup_server'));
-    await waitFor(() => expect(screen.getByText(/already exists/i)).toBeInTheDocument());
+    fireEvent.click(screen.getByText('setup-MY_API_KEY'));
+    expect(navigate).toHaveBeenCalledWith('/plugins?tab=secrets&secret=MY_API_KEY');
+  });
 
-    fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+  it('names the account reach in the edit title and save label', () => {
+    // The row sits in one workspace's list, but the edit rewrites the account
+    // server every workspace reads, and the plain "Save" did not say so.
+    listData = makeList([makeServer('shared')]);
+    renderWithProviders(<McpTab workspaceId="ws-1" />);
 
-    await waitFor(() => expect(screen.queryByText(/already exists/i)).not.toBeInTheDocument());
-    expect(mutateAsync.promote).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText('edit-shared'));
+    expect(screen.getByText('Edit account server')).toBeInTheDocument();
+    expect(screen.getByTestId('mcp-submit')).toHaveTextContent('Save for all workspaces');
   });
 });
 
 describe('McpTab — auto-resolve pending servers', () => {
-  it('probes a pending workspace server once when the sandbox is running', async () => {
+  it('probes a pending server once when the sandbox is running', async () => {
     listData = makeList([makeServer('pend', { status: 'pending' })]);
     mutateAsync.discover.mockResolvedValue({ status: 'connected', tools: [], error: '' });
     renderWithProviders(<McpTab workspaceId="ws-1" />);
@@ -245,14 +231,6 @@ describe('McpTab — auto-resolve pending servers', () => {
 
     await waitFor(() => expect(screen.getByTestId('row-off')).toBeInTheDocument());
     expect(mutateAsync.discover).not.toHaveBeenCalled();
-  });
-
-  it('probes a pending INHERITED server too (it runs in this sandbox like any other)', async () => {
-    listData = makeList([makeServer('inherited', { origin: 'user', status: 'pending' })]);
-    mutateAsync.discover.mockResolvedValue({ status: 'connected', tools: [], error: '' });
-    renderWithProviders(<McpTab workspaceId="ws-1" />);
-
-    await waitFor(() => expect(mutateAsync.discover).toHaveBeenCalledWith('inherited'));
   });
 
   it('does NOT probe an OAuth row — discovery is host-side and the backend 409s', async () => {
@@ -282,23 +260,5 @@ describe('McpTab — auto-resolve pending servers', () => {
 
     await waitFor(() => expect(screen.getByTestId('row-ok')).toBeInTheDocument());
     expect(mutateAsync.discover).not.toHaveBeenCalled();
-  });
-});
-
-describe('McpTab — Add button cap gating', () => {
-  it('disables "Add server" when the workspace is at max_servers', async () => {
-    listData = makeList([makeServer('a'), makeServer('b')], 2);
-    renderWithProviders(<McpTab workspaceId="ws-1" />);
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: /add server/i })).toBeDisabled(),
-    );
-  });
-
-  it('enables "Add server" below the cap', async () => {
-    listData = makeList([makeServer('a')], 2);
-    renderWithProviders(<McpTab workspaceId="ws-1" />);
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: /add server/i })).not.toBeDisabled(),
-    );
   });
 });

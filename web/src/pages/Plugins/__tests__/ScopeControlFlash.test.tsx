@@ -22,6 +22,23 @@ vi.mock('@/components/ui/dropdown-menu', () => ({
       {children}
     </button>
   ),
+  DropdownMenuCheckboxItem: ({
+    children,
+    checked,
+    onSelect,
+  }: {
+    children: React.ReactNode;
+    checked?: boolean;
+    onSelect?: (e?: { preventDefault: () => void }) => void;
+  }) => (
+    <button
+      role="menuitemcheckbox"
+      aria-checked={checked}
+      onClick={() => onSelect?.({ preventDefault: () => {} })}
+    >
+      {children}
+    </button>
+  ),
   DropdownMenuLabel: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DropdownMenuSeparator: () => <hr />,
   DropdownMenuSub: ({ children }: { children: React.ReactNode }) => (
@@ -44,7 +61,7 @@ import { ScopeControl } from '../components/ScopeControl';
 import { McpCatalogRow } from '../components/McpCatalogRow';
 import { BrokerageRow } from '../components/BrokerageRow';
 import { BulkScopeMenu } from '../components/BulkScopeMenu';
-import { useFlashWorkspace } from '../hooks/useFlashWorkspace';
+import { useFlashWorkspace } from '@/hooks/useFlashWorkspace';
 import { useWorkspaceOptions } from '../hooks/useWorkspaceOptions';
 
 const workspaces = [{ id: 'ws-1', name: 'Research' }];
@@ -63,16 +80,18 @@ describe('ScopeControl with the Flash workspace', () => {
         onMove={vi.fn()}
       />,
     );
-    const items = screen.getAllByRole('menuitem').map((el) => el.textContent);
-    expect(items[0]).toBe('Research');
-    expect(items[1]).toBe('Flash');
+    const checks = screen.getAllByRole('menuitemcheckbox');
+    expect(checks.map((el) => el.textContent)).toEqual(['Research', 'Flash']);
+    expect(checks.map((el) => el.getAttribute('aria-checked'))).toEqual(['true', 'false']);
     expect(screen.getByText(/Flash reaches only the tools bound as Direct/)).toBeInTheDocument();
     // Flash is never a move destination.
-    expect(items.filter((label) => label === 'Flash')).toHaveLength(1);
+    const moves = screen.getAllByRole('menuitem').map((el) => el.textContent);
+    expect(moves).toContain('Research');
+    expect(moves).not.toContain('Flash');
     // The disabled Flash entry still counts toward the label.
     expect(screen.getByText('All workspaces except 1')).toBeInTheDocument();
 
-    fireEvent.click(screen.getAllByRole('menuitem')[1]);
+    fireEvent.click(checks[1]);
     expect(onSet).toHaveBeenCalledWith('flash-1', false);
   });
 
@@ -102,8 +121,7 @@ describe('ScopeControl with the Flash workspace', () => {
             onEverywhere={vi.fn()}
             onlyInCount={2}
             onOnlyIn={vi.fn()}
-            moveCount={2}
-            onMoveTo={vi.fn()}
+            move={{ count: 2, onMoveTo: vi.fn() }}
           />
         </>
       );
@@ -168,7 +186,7 @@ describe('McpCatalogRow deciding whether Flash is reachable', () => {
         onRequestDelete={vi.fn()}
         onToggle={vi.fn()}
         onSetWorkspaceDisabled={vi.fn()}
-        onMove={vi.fn()}
+        onSetNewWorkspacesOn={vi.fn()}
       />
       </>,
     );
@@ -179,7 +197,7 @@ describe('McpCatalogRow deciding whether Flash is reachable', () => {
       expect(screen.getByTestId('flash-resolved')).toHaveTextContent('flash-1'),
     );
     fireEvent.click(screen.getByRole('button', { name: /workspace|scope|active in/i }));
-    const items = await screen.findAllByRole('menuitem');
+    const items = await screen.findAllByRole('menuitemcheckbox');
     return items.map((el) => el.textContent ?? '');
   }
 
@@ -233,6 +251,7 @@ describe('BrokerageRow deciding whether Flash is reachable', () => {
           onToggle={vi.fn()}
           onRequestRemove={vi.fn()}
           onSetWorkspaceDisabled={vi.fn()}
+          onSetNewWorkspacesOn={vi.fn()}
           onOpenInMcpTab={vi.fn()}
           onOpen={vi.fn()}
         />
@@ -245,7 +264,7 @@ describe('BrokerageRow deciding whether Flash is reachable', () => {
       expect(screen.getByTestId('flash-resolved')).toHaveTextContent('flash-1'),
     );
     fireEvent.click(screen.getByRole('button', { name: /workspace|scope|active in/i }));
-    const items = await screen.findAllByRole('menuitem');
+    const items = await screen.findAllByRole('menuitemcheckbox');
     return items.map((el) => el.textContent ?? '');
   }
 

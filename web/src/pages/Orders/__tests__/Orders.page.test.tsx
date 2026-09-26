@@ -50,7 +50,6 @@ vi.mock('@/pages/ChatAgent/utils/api/mcp', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/pages/ChatAgent/utils/api/mcp')>()),
   getMcpCatalog: vi.fn(async () => ({
     servers: catalogServers,
-    workspace_servers: [],
     max_servers: 50,
   })),
 }));

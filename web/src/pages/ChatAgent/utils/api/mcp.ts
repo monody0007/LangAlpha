@@ -1,15 +1,15 @@
 /**
- * MCP server config: per-workspace servers + user catalog.
+ * MCP server config: the account's servers, and each workspace's view of them.
  */
 import { api } from '@/api/client';
 import { foldToolName } from '@/pages/ChatAgent/utils/directTools';
 import type { OrderAction, OrderMode } from '@/types/orders';
 
 //
-// Per-workspace effective list mixes built-in servers with workspace-added
-// ones; the catalog holds reusable user templates managed on the Plugins page.
-// Env/header literal values are never echoed by
-// the backend — only `${vault:NAME}` reference names surface (as `*_refs`).
+// Servers are installed on the account and selected per workspace: the
+// workspace list is the built-ins plus the account's servers, each with this
+// workspace's on/off state. Resolved secret values are never echoed by the
+// backend, only `${vault:NAME}` refs and literals as stored.
 
 /** The wire transports a user-configured server can speak. */
 export type McpTransport = 'stdio' | 'sse' | 'http';
@@ -175,26 +175,26 @@ export type McpOauthStatus =
 /** One row in the effective per-workspace MCP list. */
 export interface EffectiveServer {
   name: string;
-  /** 'user' = inherited from the user's servers (manage at /plugins). */
-  origin: 'builtin' | 'workspace' | 'user';
-  /** Workspace-local fork that overrides a same-named inherited server. */
-  shadows_inherited?: boolean;
+  /** 'user' = one of the account's servers (removed at /plugins). */
+  origin: 'builtin' | 'user';
   transport: McpTransport;
   enabled: boolean;
+  /** True on every account row: an edit here changes the account server, so
+   *  it applies in every workspace where that server is on. */
   editable: boolean;
-  deletable: boolean;
   status: McpStatus;
   error: string;
   tool_count: number;
   tools: McpToolSummary[];
+  /** Account vault names the server references that hold no value yet. */
   missing_secrets: string[];
   env_refs: string[];
   header_refs: string[];
   /**
-   * The stored env/header reference maps for workspace-origin servers — keys are
-   * the real var/header names, values are the configured `${vault:NAME}` ref
-   * strings or plain literals (never resolved secrets). Empty/absent for builtin
-   * rows and on older backends that only return `env_refs`/`header_refs`.
+   * The stored env/header maps of an account row: keys are the real var/header
+   * names, values the configured `${vault:NAME}` ref strings or plain literals
+   * (never resolved secrets), so the edit form round-trips them. Absent on
+   * builtin rows.
    */
   env?: Record<string, string>;
   headers?: Record<string, string>;
@@ -207,7 +207,7 @@ export interface EffectiveServer {
   url: string | null;
   config_version: number;
   /**
-   * Inherited (origin='user') rows only: the owner's OAuth connection status,
+   * Account (origin='user') rows only: the owner's OAuth connection status,
    * including 'revoked'. Absent/null = the server has no OAuth connection.
    * OAuth rows are discovered host-side, never probed from the workspace.
    */
@@ -250,6 +250,9 @@ export type McpServerDraft = Pick<
 export interface EffectiveServerList {
   servers: EffectiveServer[];
   sandbox_running: boolean;
+  /** The per-account server cap. Not a count to render against this list,
+   *  which leaves out servers switched off account-wide; an add past the cap
+   *  answers 409. */
   max_servers: number;
   config_version: number;
   /**
@@ -288,7 +291,8 @@ export interface CatalogServer {
   instruction: string;
   tool_exposure_mode: string;
   discovery_uses_secrets?: boolean;
-  /** True = inherited by every workspace of the user (Plugins page toggle). */
+  /** The account switch on the Plugins page: false = off in every workspace,
+   * true = on wherever no workspace has switched it off. */
   enabled?: boolean;
   /** OAuth connection status, when one exists for this server. */
   oauth_status?: McpOauthStatus | null;
@@ -344,23 +348,18 @@ export interface CatalogServer {
   /** Workspaces holding a tombstone for this name (deny-list); populated in
    * the all-scopes view only. */
   disabled_workspace_ids?: string[];
+  /** Whether a workspace created later starts with this server on. False for
+   * a server added from a workspace: it was wanted there, not everywhere, so
+   * the next workspace should not start with it on. Changing it touches no
+   * existing workspace. Builtins and skills have no such setting and always
+   * start on. */
+  enabled_in_new_workspaces?: boolean;
   /** Set when the row was installed by an Agent Plugins package. Editing a
    * plugin-owned row detaches it (the badge clears; updates skip it). */
   plugin_name?: string | null;
   /** The owning plugin's enabled state; false = the row is suppressed from
    * every workspace regardless of its own `enabled`. */
   plugin_enabled?: boolean | null;
-}
-
-/** A workspace-local server surfaced in the all-scopes catalog view — a
- * summary, not an editable config (editing stays on the workspace endpoints). */
-export interface WorkspaceScopedMcpServer {
-  name: string;
-  workspace_id: string;
-  transport: McpTransport;
-  enabled: boolean;
-  description: string;
-  shadows_inherited: boolean;
 }
 
 /** Result of a discovery probe (POST /discover). */
@@ -378,8 +377,6 @@ export interface McpDiscoveryResult {
 export interface CatalogServerList {
   servers: CatalogServer[];
   max_servers: number;
-  /** all_scopes=true only: workspace-local servers across the user's workspaces. */
-  workspace_servers?: WorkspaceScopedMcpServer[];
 }
 
 // --- Per-workspace MCP ---
@@ -391,24 +388,42 @@ export async function getWorkspaceMcpServers(workspaceId: string): Promise<Effec
   return data;
 }
 
+/** Response of an add or edit from a workspace. */
+export interface WorkspaceMcpServerSaved {
+  name: string;
+  source: 'user';
+  enabled: boolean;
+  warnings?: string[];
+}
+
+/**
+ * Create the server on the account and turn it on in this workspace only; it
+ * starts off everywhere else, Flash included. A taken name or the account cap
+ * answers 409 with a human `detail`.
+ */
 export async function addWorkspaceMcpServer(
   workspaceId: string,
   body: McpServerInput,
-) {
-  const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/mcp/servers`, body);
-  return data as { name: string; source: string; enabled: boolean; warnings?: string[] };
+): Promise<WorkspaceMcpServerSaved> {
+  const { data } = await api.post<WorkspaceMcpServerSaved>(
+    `/api/v1/workspaces/${workspaceId}/mcp/servers`,
+    body,
+  );
+  return data;
 }
 
+/** Edits the account server, so the change reaches every workspace where it
+ *  is on. `warnings` may say the edit detached it from its plugin. */
 export async function updateWorkspaceMcpServer(
   workspaceId: string,
   name: string,
   body: McpServerInput,
-) {
-  const { data } = await api.put(
+): Promise<WorkspaceMcpServerSaved> {
+  const { data } = await api.put<WorkspaceMcpServerSaved>(
     `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}`,
     body,
   );
-  return data as { name: string; source: string; enabled: boolean; warnings?: string[] };
+  return data;
 }
 
 export async function setWorkspaceMcpServerEnabled(
@@ -421,13 +436,6 @@ export async function setWorkspaceMcpServerEnabled(
     { enabled },
   );
   return data as { name: string; enabled: boolean };
-}
-
-export async function deleteWorkspaceMcpServer(workspaceId: string, name: string) {
-  const { data } = await api.delete(
-    `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}`,
-  );
-  return data as { ok: boolean };
 }
 
 export async function discoverWorkspaceMcpServer(
@@ -474,11 +482,11 @@ export interface ProbeTool {
   description: string;
 }
 
+/** Refs in `headers` resolve against the account vault. The route refuses any
+ *  other field. */
 export interface McpProbeInput {
   url: string;
   headers?: Record<string, string>;
-  /** Resolve `${vault:NAME}` refs against this workspace's vault as well. */
-  workspace_id?: string;
 }
 
 /** What a probe of a remote address learned. Nothing is persisted by the
@@ -521,7 +529,8 @@ export interface McpImportResult {
 
 /**
  * Bulk-import a standard `mcpServers` JSON blob. The backend coerces names,
- * maps transports, and auto-extracts inline literal secrets into the vault.
+ * maps transports, and auto-extracts inline literal secrets into the account
+ * vault. Each created server lands on the account, on in this workspace only.
  * `payload` is the parsed JSON object (e.g. `{ mcpServers: { … } }`).
  */
 export async function importWorkspaceMcpServers(
@@ -535,44 +544,11 @@ export async function importWorkspaceMcpServers(
   return data;
 }
 
-/**
- * Promote a workspace server UP into the user's reusable template catalog.
- * Only `${vault:NAME}` reference names travel —
- * secret values are workspace-scoped, so the template surfaces `needs_secret`
- * when later added to another workspace. `overwrite` replaces an existing
- * same-named template; without it a clash is a 409.
- */
-export async function promoteWorkspaceMcpServerToTemplate(
-  workspaceId: string,
-  name: string,
-  overwrite = false,
-  removeSource = false,
-): Promise<CatalogServer> {
-  const { data } = await api.post<CatalogServer>(
-    `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}/promote`,
-    { overwrite, remove_source: removeSource },
-  );
-  return data;
-}
-
-/**
- * Move a user-level (Connectors) server INTO one workspace — the inverse of
- * promote-with-removeSource. The catalog row becomes a workspace-local fork
- * and is then deleted; OAuth-connected servers refuse with a 409 (connections
- * exist only at the user tier).
- */
-export async function adoptMcpServerToWorkspace(workspaceId: string, name: string) {
-  const { data } = await api.post(
-    `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}/adopt`,
-  );
-  return data as { name: string; source: string; enabled: boolean };
-}
-
-// --- User catalog (templates) ---
+// --- Account servers (the Plugins page) ---
 
 /** Always fetches the all-scopes shape: one cache key serves both the Plugins
- * scope view and plain catalog reads (the extra fields are two cheap queries
- * server-side, and a per-scope key would break the optimistic toggle). */
+ * scope view and plain catalog reads (the extra `disabled_workspace_ids` is
+ * cheap server-side, and a per-scope key would break the optimistic toggle). */
 export async function getMcpCatalog(): Promise<CatalogServerList> {
   const { data } = await api.get<CatalogServerList>('/api/v1/mcp/servers', {
     params: { all_scopes: true },
@@ -580,7 +556,6 @@ export async function getMcpCatalog(): Promise<CatalogServerList> {
   return {
     servers: data.servers ?? [],
     max_servers: data.max_servers ?? 20,
-    workspace_servers: data.workspace_servers ?? [],
   };
 }
 
@@ -650,10 +625,18 @@ export async function deleteMcpCatalogServer(name: string) {
   return data as { ok: boolean };
 }
 
-/** Enable/disable a catalog server for ALL the user's workspaces (inheritance). */
+/** The account switch: off turns the server off in every workspace, and on
+ *  turns it back on wherever no workspace has switched it off. */
 export async function setMcpCatalogServerEnabled(name: string, enabled: boolean) {
   const { data } = await api.patch(`/api/v1/mcp/servers/${name}/enabled`, { enabled });
   return data as { name: string; enabled: boolean; warnings?: string[] };
+}
+
+/** Whether workspaces created later start with this server on. 404 once the
+ *  server is gone. Brokerage rows live in the same table and take it too. */
+export async function setMcpCatalogServerNewWorkspaces(name: string, enabled: boolean) {
+  const { data } = await api.patch(`/api/v1/mcp/servers/${name}/new-workspaces`, { enabled });
+  return data as { name: string; enabled_in_new_workspaces: boolean };
 }
 
 /** Change how a catalog server's tools reach the model. 422 when a tool that

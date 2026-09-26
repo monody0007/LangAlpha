@@ -28,11 +28,10 @@ import { httpCatalogServer } from '@/test/factories';
 function makeServer(overrides: Partial<EffectiveServer> = {}): EffectiveServer {
   return {
     name: 'placeholder_server',
-    origin: 'workspace',
+    origin: 'user',
     transport: 'stdio',
     enabled: true,
     editable: true,
-    deletable: true,
     status: 'pending',
     error: '',
     tool_count: 0,
@@ -112,8 +111,7 @@ describe('showsWorkspaceDetail', () => {
 });
 
 describe('needsDiscoveryProbe', () => {
-  it('admits an enabled, pending workspace or inherited server', () => {
-    expect(needsDiscoveryProbe(makeServer({ origin: 'workspace' }))).toBe(true);
+  it('admits an enabled, pending account server', () => {
     expect(needsDiscoveryProbe(makeServer({ origin: 'user' }))).toBe(true);
   });
 
@@ -144,7 +142,7 @@ describe('needsDiscoveryProbe', () => {
 const BASE: McpLifecycleInput = {
   status: 'pending',
   enabled: true,
-  origin: 'workspace',
+  origin: 'user',
   checking: false,
   synced: false,
   sandboxRunning: true,
@@ -257,7 +255,7 @@ describe('deriveLifecycle — the two branches removed as unreachable', () => {
   // useMcpServers writes enabled+status together for the same reason.
   const STATUSES: McpStatus[] = ['connected', 'error', 'needs_secret', 'disabled', 'pending', 'unknown'];
   const OAUTH: Array<McpOauthStatus | null> = [null, 'connected', 'needs_reauth', 'refresh_ambiguous', 'revoked'];
-  const ORIGINS: Array<EffectiveServer['origin']> = ['builtin', 'workspace', 'user'];
+  const ORIGINS: Array<EffectiveServer['origin']> = ['builtin', 'user'];
   const BOOLS = [true, false];
 
   function everyView(): Array<{ input: McpLifecycleInput; view: ReturnType<typeof deriveLifecycle> }> {

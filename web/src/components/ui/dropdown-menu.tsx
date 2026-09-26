@@ -57,6 +57,10 @@ const ITEM_HIGHLIGHT = "data-[highlighted]:bg-accent/15"
 // so the geometry belongs here rather than restated at both call sites.
 const SETTING_ROW = "justify-between text-[0.8125rem]"
 
+// Every shape of item shares this box, so a checkbox row lines up with the
+// plain rows around it.
+const ITEM_BOX = "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm transition-colors data-[disabled]:pointer-events-none data-[disabled]:opacity-50"
+
 const itemVariants: Record<string, string> = {
   default: ITEM_HIGHLIGHT,
   destructive: "text-destructive data-[highlighted]:bg-destructive/10 data-[highlighted]:text-destructive",
@@ -71,16 +75,26 @@ const DropdownMenuItem = React.forwardRef<
 >(({ className, variant = "default", ...props }, ref) => (
   <DropdownMenuPrimitive.Item
     ref={ref}
-    className={cn(
-      "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm transition-colors",
-      "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
-      itemVariants[variant],
-      className
-    )}
+    className={cn(ITEM_BOX, itemVariants[variant], className)}
     {...props}
   />
 ))
 DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName
+
+// Radix gives it role="menuitemcheckbox" and aria-checked from `checked`. The
+// caller draws the mark, as it draws an item's icon, so the mark sits in the
+// same column as the icons on the rows beside it.
+const DropdownMenuCheckboxItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.CheckboxItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.CheckboxItem>
+>(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.CheckboxItem
+    ref={ref}
+    className={cn(ITEM_BOX, ITEM_HIGHLIGHT, className)}
+    {...props}
+  />
+))
+DropdownMenuCheckboxItem.displayName = DropdownMenuPrimitive.CheckboxItem.displayName
 
 const DropdownMenuLabel = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.Label>,
@@ -158,6 +172,7 @@ export {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuCheckboxItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuGroup,

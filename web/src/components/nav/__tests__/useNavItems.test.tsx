@@ -41,7 +41,7 @@ function cached(queryKey: readonly unknown[]) {
   const key = JSON.stringify(queryKey);
   if (key === JSON.stringify(queryKeys.brokerages.list())) return shipped;
   if (key === JSON.stringify(queryKeys.mcp.catalog())) {
-    return servers && { servers, workspace_servers: [], max_servers: 50 };
+    return servers && { servers, max_servers: 50 };
   }
   if (key === JSON.stringify(queryKeys.orders.any())) {
     return ledgerRows === undefined ? undefined : { items: Array(ledgerRows).fill({}), next_cursor: null };

@@ -61,18 +61,9 @@ describe('readConnectOutcome', () => {
   });
 
   it('drops a server name that could not be one', () => {
-    // Catalog names are `NAME_RE` minus what the sandbox reserves. Anything
-    // else was not written by the callback, and it is about to be printed
-    // above this app's own title.
-    for (const bad of [
-      'Contact support at evil.example',
-      '9lives',
-      'has space',
-      '',
-      'class',
-      'mcp_client',
-      '__init__',
-    ]) {
+    // Catalog names are `NAME_RE`. Anything else was not written by the
+    // callback, and it is about to be printed above this app's own title.
+    for (const bad of ['Contact support at evil.example', '9lives', 'has space', '']) {
       expect(readConnectOutcome(params(`mcp_connected=${encodeURIComponent(bad)}`))).toEqual({
         kind: 'connected',
         server: null,
@@ -87,5 +78,16 @@ describe('readConnectOutcome', () => {
     expect(
       readConnectOutcome(params('mcp_error=denied&server=ibkr')),
     ).toMatchObject({ kind: 'failed', server: 'ibkr' });
+  });
+
+  it('keeps a name saved before the sandbox reserved it', () => {
+    // Such a row still connects, and a return that loses its name leaves the
+    // pending marker behind.
+    for (const legacy of ['class', 'mcp_client', '__init__']) {
+      expect(readConnectOutcome(params(`mcp_connected=${legacy}`))).toEqual({
+        kind: 'connected',
+        server: legacy,
+      });
+    }
   });
 });

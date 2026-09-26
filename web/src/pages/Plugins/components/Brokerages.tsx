@@ -8,6 +8,7 @@ import {
   useMcpCatalog,
   useDeleteMcpCatalogServer,
   useSetMcpServerEnabledInWorkspace,
+  useSetMcpServerNewWorkspaces,
   useToggleBrokerage,
 } from '@/hooks/useMcpServers';
 import {
@@ -51,13 +52,14 @@ export function Brokerages() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { data: brokerages, isLoading: loadingOffers, error } = useBrokerages();
   const { data: catalog, isLoading: loadingCatalog, error: catalogError } = useMcpCatalog();
-  const { workspaces } = useWorkspaceOptions();
+  const { workspaces, loading: workspacesLoading } = useWorkspaceOptions();
   // Back to this tab, not the MCP one: the vendor round trip should return the
   // user to the page they left.
   const oauth = useMcpOauthActions({ returnTo: '/plugins?tab=brokerages' });
   const toggleMutation = useToggleBrokerage();
   const deleteMutation = useDeleteMcpCatalogServer();
   const wsEnableMutation = useSetMcpServerEnabledInWorkspace();
+  const newWorkspacesMutation = useSetMcpServerNewWorkspaces();
 
   // Held here rather than in the row so a click on one broker never greys out
   // the other's controls.
@@ -191,6 +193,21 @@ export function Brokerages() {
     }
   }
 
+  async function handleSetNewWorkspacesOn(name: string, on: boolean) {
+    setScopeBusyName(name);
+    try {
+      await newWorkspacesMutation.mutateAsync({ name, enabled: on });
+    } catch (err) {
+      toast({
+        variant: 'destructive',
+        title: t('plugins.servers.toggleFailed'),
+        description: formatApiErrorDetail(err),
+      });
+    } finally {
+      setScopeBusyName(null);
+    }
+  }
+
   async function confirmRemove(name: string) {
     try {
       await deleteMutation.mutateAsync(name);
@@ -284,6 +301,7 @@ export function Brokerages() {
                   row={row}
                   vendor={vendor}
                   workspaces={workspaces}
+                  workspacesLoading={workspacesLoading}
                   connecting={oauth.connectingName === b.name}
                   refreshing={oauth.refreshingName === b.name}
                   toggling={togglingName === b.name}
@@ -299,6 +317,7 @@ export function Brokerages() {
                   onSetWorkspaceDisabled={(wsId, disabled) =>
                     handleSetWorkspaceDisabled(b.name, wsId, disabled)
                   }
+                  onSetNewWorkspacesOn={(on) => handleSetNewWorkspacesOn(b.name, on)}
                   onOpenInMcpTab={() => openInMcpTab(b.name)}
                   onOpen={() => detail.open(b.name)}
                 />

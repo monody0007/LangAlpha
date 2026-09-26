@@ -1,21 +1,21 @@
 import { useTranslation } from 'react-i18next';
 import { Plus, Sparkles } from 'lucide-react';
 import { PluginOriginBadge } from '@/pages/Plugins/components/PluginBadges';
-import type { VaultBlueprint } from '../../utils/api';
+import type { UserVaultBlueprint } from '../../utils/api';
 
 /**
- * "Recommended credentials": the credentials the workspace's enabled MCP
- * servers declare but the vault doesn't hold yet. Dashed cards, not rows —
- * they are an invitation to create, not a listing of what exists.
+ * "Recommended credentials": the credentials enabled MCP servers and plugins
+ * declare but the vault doesn't hold yet. Dashed cards, not rows: they are an
+ * invitation to create, not a listing of what exists.
  */
 
 interface BlueprintCardsProps {
-  /** User-tier blueprints additionally carry the declaring plugin's name. */
-  blueprints: (VaultBlueprint & { plugin_name?: string | null })[];
+  /** Plugin-declared entries carry the declaring plugin's name. */
+  blueprints: UserVaultBlueprint[];
   /** At the secret cap: cards stay visible but explain why they're inert. */
   atCap: boolean;
   maxSecrets: number;
-  onSelect: (blueprint: VaultBlueprint) => void;
+  onSelect: (blueprint: UserVaultBlueprint) => void;
 }
 
 export function BlueprintCards({ blueprints, atCap, maxSecrets, onSelect }: BlueprintCardsProps) {

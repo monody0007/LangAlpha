@@ -9,7 +9,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import { deleteWorkspace, duplicateWorkspace } from '../utils/api';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { workspaceNameErrorMessage } from '../utils/workspaceName';
-import { invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';
+import { invalidateNewWorkspace, invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';
 import { forgetStableNavOrder } from '../hooks/useNavigationData';
 import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { removeStoredThreadId } from '../hooks/utils/threadStorage';
@@ -124,7 +124,7 @@ export function useWorkspaceActions({
     setDuplicateBusy(true);
     try {
       await duplicateWorkspace(duplicateTarget.workspace_id);
-      invalidateWorkspaceMembership(queryClient);
+      invalidateNewWorkspace(queryClient);
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
       setDuplicateTarget(null);
       toast({ title: t('workspace.duplicated', 'Workspace duplicated') });

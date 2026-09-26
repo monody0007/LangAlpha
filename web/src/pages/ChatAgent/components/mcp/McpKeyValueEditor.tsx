@@ -193,8 +193,7 @@ export function ArgsEditor({
 
 interface EditorCommon {
   secretNames: string[];
-  /** Inline-create into the caller's vault tier, so a ref always resolves
-   *  where the server it belongs to runs. */
+  /** Inline-create into the account vault, where every ref resolves. */
   createSecret: (body: { name: string; value: string }) => Promise<unknown>;
   keyPlaceholder: string;
   /** Prefix for the name offered when a typed value is saved to the vault. */

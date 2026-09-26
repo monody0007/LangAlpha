@@ -61,7 +61,7 @@ export function SkillsList() {
   // are enable/disable/scope, so no bulk run here can change plugin identity.
   const surface = usePluginListSurface({ invalidate: invalidateSkillFanout });
   const { selection } = surface;
-  const { workspaces: wsOptions, nameById: wsNameById } = useWorkspaceOptions();
+  const { workspaces: wsOptions, loading: wsLoading, nameById: wsNameById } = useWorkspaceOptions();
   const actions = useSkillActions();
 
   useAddIntent({ skill: () => setUploadOpen(true) });
@@ -229,6 +229,7 @@ export function SkillsList() {
           scopeControl: (skill) => (
             <ScopeControl
               workspaces={wsOptions}
+              loading={wsLoading}
               scopeWorkspaceId={null}
               disabledWorkspaceIds={skill.disabled_workspace_ids ?? []}
               checklistLocked={scopeLocked(skill)}
@@ -294,6 +295,7 @@ export function SkillsList() {
           scopeControl: (skill) => (
             <ScopeControl
               workspaces={wsOptions}
+              loading={wsLoading}
               scopeWorkspaceId={null}
               disabledWorkspaceIds={skill.disabled_workspace_ids ?? []}
               checklistLocked={scopeLocked(skill)}
@@ -336,6 +338,7 @@ export function SkillsList() {
                 skill,
                 <ScopeControl
                   workspaces={wsOptions}
+                  loading={wsLoading}
                   scopeWorkspaceId={null}
                   disabledWorkspaceIds={skill.disabled_workspace_ids ?? []}
                   checklistLocked={scopeLocked(skill)}
@@ -369,6 +372,7 @@ export function SkillsList() {
           scopeControl: (skill) => (
             <ScopeControl
               workspaces={wsOptions}
+              loading={wsLoading}
               scopeWorkspaceId={wsId}
               busy={actions.movingName === skillRowKey(skill)}
               moveToAllBlockedReason={

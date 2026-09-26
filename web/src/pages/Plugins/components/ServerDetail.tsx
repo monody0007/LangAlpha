@@ -23,7 +23,6 @@ import {
   type CatalogServer,
   type McpServerBindingPatch,
   type McpToolSummary,
-  type WorkspaceScopedMcpServer,
 } from '@/pages/ChatAgent/utils/api';
 import {
   DetailField,
@@ -41,19 +40,17 @@ import { ToolList } from './ToolList';
 /**
  * An MCP server's detail overlay, for every origin the Plugins page lists. The
  * union keeps each origin honest about what it knows: builtins carry no user
- * config, workspace rows are summaries (their editing stays on the workspace
- * tab), catalog rows carry the full config plus the host-side tool snapshot.
+ * config, catalog rows carry the full config plus the host-side tool snapshot.
  *
  * A brokerage is the one origin that exists before its row does, which is why
  * its `server` is nullable and its identity comes from the registry instead.
  * It is otherwise an ordinary catalog row and shares every section below.
  */
 
-/** The three origins the Connectors tab resolves; a brokerage is not one. */
+/** The origins the Connectors tab resolves; a brokerage is not one. */
 export type McpServerDetailData =
   | { origin: 'builtin'; server: BuiltinMcpServer }
-  | { origin: 'user'; server: CatalogServer }
-  | { origin: 'workspace'; server: WorkspaceScopedMcpServer };
+  | { origin: 'user'; server: CatalogServer };
 
 export type ServerDetailData =
   | McpServerDetailData
@@ -83,7 +80,6 @@ export function ServerDetail({
   onClose,
   onToggle,
   toggling = false,
-  workspaceName,
   onConnect,
   connecting = false,
 }: {
@@ -92,8 +88,6 @@ export function ServerDetail({
   /** Absent = the surface has no toggle for this row (render read-only). */
   onToggle?: (enabled: boolean) => void;
   toggling?: boolean;
-  /** Workspace rows: the display name of the owning workspace. */
-  workspaceName?: string;
   /** Brokerages only: start or repair the connection. It is also the only way
    *  to change what the connection was granted, which is why it stays offered
    *  on one that is already connected. */
@@ -261,13 +255,6 @@ export function ServerDetail({
             <>
               <span>{transport}</span>
               {origin === 'builtin' && <span>{t('plugins.mcp.platformBadge')}</span>}
-              {origin === 'workspace' && (
-                <span>
-                  {t('plugins.scope.inWorkspace', {
-                    name: workspaceName ?? t('plugins.scope.unknownWorkspace'),
-                  })}
-                </span>
-              )}
               {origin === 'brokerage' && !catalog && (
                 <span>{t('plugins.brokerages.notAdded')}</span>
               )}

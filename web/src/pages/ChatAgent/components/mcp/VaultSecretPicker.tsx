@@ -17,7 +17,6 @@ import { formatApiErrorDetail } from '../../utils/api';
  * default, because that is what a user has in their clipboard; a key button
  * beside it lists the vault, and a typed literal earns an offer to save it to
  * the vault under a suggested name, which swaps the `${vault:NAME}` ref in.
- * Which vault the save lands in is the caller's to decide.
  *
  * The picker never reveals a stored secret: a chosen ref renders as a chip
  * with only the name.
@@ -37,13 +36,9 @@ interface VaultSecretPickerProps {
   /** Current value (a `${vault:NAME}` ref or a literal). */
   value: string;
   onChange: (value: string) => void;
-  /** Existing secret names in the vault this picker writes to. */
+  /** Existing secret names in the account vault. */
   secretNames: string[];
-  /**
-   * Inline-create into the caller's vault tier, the workspace vault in the
-   * settings panel and the user vault on /plugins, so a ref always resolves
-   * where the server it belongs to runs.
-   */
+  /** Inline-create into the account vault, where every ref resolves. */
   createSecret: (body: { name: string; value: string }) => Promise<unknown>;
   /** The name offered when saving a typed literal, e.g. `FUYAO_FUND_X_API_KEY`. */
   suggestedName?: string;
