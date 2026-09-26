@@ -20,6 +20,7 @@ round-trip them; ``env_refs``/``header_refs`` carry just the vault names.
 from __future__ import annotations
 
 import ipaddress
+import keyword
 import re
 import socket
 from dataclasses import asdict, dataclass, field as dataclass_field
@@ -42,6 +43,54 @@ from src.server.services.tool_binding import order_approval_map
 
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
+
+# A server name is also the module its tool wrappers are generated into,
+# imported from the sandbox's tools package beside the runtime's own
+# ``mcp_client``. NAME_RE admits three kinds of name that cannot hold that
+# role: the runtime's module, a dunder (``__init__`` is the package itself),
+# and a keyword (``from tools.class import ...`` does not parse). Soft keywords
+# are refused with the rest, the same line the tool-name sanitizer draws.
+_RUNTIME_MODULE = "mcp_client"
+_PY_KEYWORDS = frozenset(keyword.kwlist + keyword.softkwlist)
+
+
+def sandbox_name_error(name: str) -> Optional[str]:
+    """The validation message for a name the sandbox reserves, else ``None``."""
+    if name == _RUNTIME_MODULE:
+        return (
+            f"name {name!r} is reserved: the sandbox's MCP runtime module "
+            "already has it"
+        )
+    if name.startswith("__"):
+        return (
+            "name must not start with '__': a server name becomes a Python "
+            "module in the sandbox, and those names are Python's own"
+        )
+    if name in _PY_KEYWORDS:
+        return (
+            f"name {name!r} is a Python keyword, and a server name becomes a "
+            "Python module in the sandbox"
+        )
+    return None
+
+
+def _unreserve(name: str) -> str:
+    """Rename a NAME_RE-legal name the sandbox reserves into one it accepts.
+
+    A lone ``_`` goes the dunder way because suffixing it would open with
+    ``__`` again; a name with nothing left after its underscores has no
+    content to keep, so it takes a generic one.
+    """
+    if name.startswith("__") or name == "_":
+        name = name.lstrip("_")
+        if not name:
+            return "server"
+        if name[0].isdigit():
+            name = f"_{name}"
+    if name == _RUNTIME_MODULE or name in _PY_KEYWORDS:
+        name = f"{name}_server"
+    return name
+
 
 # Allowed stdio commands — deliberately WITHOUT `bash` (and any shell). Running
 # a user-chosen command is arbitrary code execution; this is the allowlist that
@@ -293,6 +342,9 @@ class McpServerInput(BaseModel):
                 "name must be 1-64 chars: letter/underscore then "
                 "letters/digits/underscores"
             )
+        reserved = sandbox_name_error(self.name)
+        if reserved:
+            raise ValueError(reserved)
 
         # Transport ↔ field coherence.
         if self.transport == "stdio":
@@ -552,8 +604,10 @@ def coerce_mcp_name(raw: Any) -> tuple[Optional[str], bool]:
     """Coerce an arbitrary server key into a legal MCP name (``NAME_RE``).
 
     Illegal characters become ``_`` and a leading digit is prefixed, so
-    ``hexin-ifind-ds-stock-mcp`` → ``hexin_ifind_ds_stock_mcp``. Returns
-    ``(name, renamed)``, or ``(None, False)`` when nothing salvageable remains.
+    ``hexin-ifind-ds-stock-mcp`` → ``hexin_ifind_ds_stock_mcp``. A name the
+    sandbox reserves is renamed rather than refused: ``class`` →
+    ``class_server``, ``__init__`` → ``init__``. Returns ``(name, renamed)``,
+    or ``(None, False)`` when nothing salvageable remains.
     """
     if not isinstance(raw, str) or not raw:
         return None, False
@@ -563,6 +617,7 @@ def coerce_mcp_name(raw: Any) -> tuple[Optional[str], bool]:
     cand = cand[:64]
     if not cand or not NAME_RE.match(cand):
         return None, False
+    cand = _unreserve(cand)
     return cand, cand != raw
 
 

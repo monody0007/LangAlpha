@@ -35,6 +35,42 @@ describe('mcpSchemas — name shape', () => {
   ])('rejects invalid name (%s)', (_label, name) => {
     expect(validateMcpServer(stdio({ name })).ok).toBe(false);
   });
+
+  // The name becomes a Python module in the sandbox, so the shape rule alone
+  // admits names that cannot hold that role. Same matrix as the backend.
+  it.each([
+    ['mcp_client', 'MCP runtime module'],
+    ['__init__', "must not start with '__'"],
+    ['__private', "must not start with '__'"],
+    ['class', 'Python keyword'],
+    ['None', 'Python keyword'],
+    ['match', 'Python keyword'],
+    ['type', 'Python keyword'],
+    ['_', 'Python keyword'],
+  ])('rejects %s, which the sandbox reserves, and says why', (name, reason) => {
+    const result = validateMcpServer(stdio({ name }));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toMatchObject({ path: 'name' });
+    expect(result.errors[0].message).toContain(reason);
+  });
+
+  it.each(['class_server', 'mcp_client_v2', '_private', 'Type'])(
+    'accepts %s, which only resembles a reserved name',
+    (name) => {
+      expect(validateMcpServer(stdio({ name })).ok).toBe(true);
+    },
+  );
+
+  it('reports a malformed name once, with the shape message', () => {
+    const result = validateMcpServer(stdio({ name: '__has-dash' }));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.map((e) => e.message)).toEqual([
+      'name must be 1-64 chars: letter/underscore then letters/digits/underscores',
+    ]);
+  });
 });
 
 describe('mcpSchemas — command shape', () => {

@@ -14,8 +14,10 @@ the same predicate.
 """
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
+from psycopg.errors import LockNotAvailable
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
@@ -75,6 +77,52 @@ async def get_plugin(
                 (user_id, name),
             )
             return _row_to_dict(await cur.fetchone())
+
+
+_FAN_OUT_LOCK_WAIT = "30s"
+
+
+@asynccontextmanager
+async def plugin_fan_out_lock(user_id: str):
+    """One plugin fan-out at a time per user, across workers.
+
+    Install refuses a server or skill name another plugin owns by reading the
+    account's rows, and its own rows land later, in the fan-out. Install,
+    update and an sse upgrade all give a plugin names that way, so each holds
+    this from its read to its last write; otherwise a second one reads in
+    between and gets a partial install instead of the refusal. Its own key,
+    because the fan-out's writes take the per-user write lock on other pooled
+    connections, and a session lock, so no transaction stays open across the
+    archive uploads it spans.
+    """
+    from src.server.database.session_lock import release_session_lock
+
+    key = f"plugin-fan-out:{user_id}"
+    async with get_db_connection() as conn:
+        try:
+            # SET LOCAL bounds only the wait; the session lock outlives the
+            # commit.
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SET LOCAL lock_timeout = '{_FAN_OUT_LOCK_WAIT}'"
+                    )
+                    await cur.execute(
+                        "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                        (key,),
+                    )
+        except LockNotAvailable as e:
+            raise ValueError(
+                "Another plugin install or update is still running; try "
+                "again once it finishes"
+            ) from e
+        except BaseException:
+            await release_session_lock(conn, key)
+            raise
+        try:
+            yield
+        finally:
+            await release_session_lock(conn, key)
 
 
 async def create_plugin(
@@ -278,8 +326,10 @@ async def lock_plugin_row(
     classic pair that deadlocks under concurrency. Locking the plugin row up
     front puts ``user_plugins`` first on both paths.
 
-    Install and update do not take it. They hold no second lock to order this
-    one against, and each component write carries its own ``owned_by_plugin``
+    Install and update do not take it. The one other lock they hold is
+    ``plugin_fan_out_lock``, which uninstall never takes, so there is nothing
+    to order this one against, and each component write carries its own
+    ``owned_by_plugin``
     predicate, so a row that changed hands underneath them is refused at the
     write rather than held still around it.
 

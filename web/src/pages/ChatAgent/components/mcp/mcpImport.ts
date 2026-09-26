@@ -1,4 +1,4 @@
-import { NAME_RE, TRANSPORTS, EXPOSURE_MODES } from './mcpSchemas';
+import { NAME_RE, TRANSPORTS, EXPOSURE_MODES, unreserveName } from './mcpSchemas';
 
 /**
  * Client-side parser for the de-facto-standard `mcpServers` JSON blob (Claude
@@ -52,6 +52,7 @@ export function coerceMcpName(raw: string): { name: string | null; renamed: bool
   if (/^[0-9]/.test(cand)) cand = `_${cand}`;
   cand = cand.slice(0, 64);
   if (!cand || !NAME_RE.test(cand)) return { name: null, renamed: false };
+  cand = unreserveName(cand);
   return { name: cand, renamed: cand !== raw };
 }
 

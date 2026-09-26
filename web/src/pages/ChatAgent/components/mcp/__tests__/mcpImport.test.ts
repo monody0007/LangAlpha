@@ -16,6 +16,21 @@ describe('coerceMcpName', () => {
   it('passes through an already-legal name', () => {
     expect(coerceMcpName('already_ok')).toEqual({ name: 'already_ok', renamed: false });
   });
+  // Same table as the backend's coerce_mcp_name, so the preview names what
+  // the import will actually create.
+  it.each([
+    ['class', 'class_server'],
+    ['match', 'match_server'],
+    ['mcp_client', 'mcp_client_server'],
+    ['mcp-client', 'mcp_client_server'],
+    ['__init__', 'init__'],
+    ['__class', 'class_server'],
+    ['__3d', '_3d'],
+    ['_', 'server'],
+    ['---', 'server'],
+  ])('renames %s, which the sandbox reserves, to %s', (raw, name) => {
+    expect(coerceMcpName(raw)).toEqual({ name, renamed: true });
+  });
 });
 
 describe('normalizeTransport', () => {

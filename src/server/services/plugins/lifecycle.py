@@ -26,10 +26,11 @@ from src.server.database.plugins import (
     list_plugin_server_names,
     list_plugin_skill_names,
     lock_plugin_row,
+    plugin_fan_out_lock,
     stamp_plugin_content_hash,
 )
 from src.server.database.pool import get_db_connection
-from src.server.database.user_skills import delete_user_skill
+from src.server.database.user_skills import delete_user_skill, list_user_skills
 from src.server.models.plugin import (
     Diagnostic,
     InstallReport,
@@ -48,7 +49,10 @@ from src.server.services.plugins.package import (
     pending_secret_declarations,
 )
 from src.server.services.plugins.server_fanout import fan_out_servers
-from src.server.services.plugins.skill_fanout import fan_out_skills
+from src.server.services.plugins.skill_fanout import (
+    fan_out_skills,
+    installs_under_dir,
+)
 from src.server.services.user_skills.materialize import drop_archive_if_unused
 from src.server.services.vault_invalidation import (
     USER_TIER,
@@ -75,6 +79,26 @@ async def _refuse_owned_names(user_id: str, package: ValidatedPackage) -> None:
                 f"MCP server {plan.name!r} is owned by plugin "
                 f"{owner_name!r}; uninstall it first"
             )
+
+    skills = [p for p in package.skill_plans if p.skip_code is None]
+    if not skills:
+        return
+    # The fan-out installs a skill only under its directory name, so the
+    # directory finds the collision, and only a colliding archive is unpacked.
+    # One the fan-out would drop never takes the name, and uninstalling the
+    # owner would not change that.
+    by_skill = {r["name"]: r for r in await list_user_skills(user_id)}
+    for plan in skills:
+        owner = by_skill.get(plan.dir)
+        if owner is None or not owner.get("plugin_id"):
+            continue
+        if not await installs_under_dir(plan):
+            continue
+        owner_name = owner.get("plugin_name") or "another plugin"
+        raise ValueError(
+            f"Skill {plan.dir!r} is owned by plugin {owner_name!r}; "
+            "uninstall it first"
+        )
 
 
 async def install_plugin_package(
@@ -104,44 +128,57 @@ async def install_plugin_package(
             f"{package.name!r} is the name of a package that already ships "
             "with the app; rename the plugin and install it again"
         )
-    if await get_plugin(user_id, package.name) is not None:
-        raise ValueError(
-            f"Plugin {package.name!r} is already installed; use update"
-        )
-    await _refuse_owned_names(user_id, package)
-
-    plugin_row = await create_plugin(
-        user_id,
-        package.name,
-        version=package.version,
-        source_type=source_type,
-        source_ref=source_ref,
-        manifest=package.manifest,
-        mcp_document=package.mcp_document,
-    )
-
-    report = InstallReport(
-        diagnostics=list(package.diagnostics),
-        dropped_files=list(package.dropped_files),
-    )
-    plugin_id = plugin_row["user_plugin_id"]
-    # plugin_id=None: a first install owns no rows, so the vault alone decides
-    # which declared names this package is allowed to reference.
-    grants = await resolve_bind_grants(user_id, package.extension, plugin_id=None)
-    materialize_binds(
-        package.extension, package.entry_plans, grants.granted,
-        document_dropped=package.mcp_document_invalid,
-    )
-    disclose_undeclared_refs(package.entry_plans, grants)
-    if grants.preexisting:
-        report.diagnostics.append(
-            Diagnostic(
-                level="warning", scope="plugin", code="secret_preexisting",
-                message=grants.disclosure_reason(),
+    async with plugin_fan_out_lock(user_id):
+        if await get_plugin(user_id, package.name) is not None:
+            raise ValueError(
+                f"Plugin {package.name!r} is already installed; use update"
             )
+        await _refuse_owned_names(user_id, package)
+
+        plugin_row = await create_plugin(
+            user_id,
+            package.name,
+            version=package.version,
+            source_type=source_type,
+            source_ref=source_ref,
+            manifest=package.manifest,
+            mcp_document=package.mcp_document,
         )
-    await fan_out_servers(user_id, plugin_id, package.entry_plans, report)
-    await fan_out_skills(user_id, plugin_id, package.skill_plans, report)
+
+        report = InstallReport(
+            diagnostics=list(package.diagnostics),
+            dropped_files=list(package.dropped_files),
+        )
+        plugin_id = plugin_row["user_plugin_id"]
+        # plugin_id=None: a first install owns no rows, so the vault alone
+        # decides which declared names this package is allowed to reference.
+        grants = await resolve_bind_grants(
+            user_id, package.extension, plugin_id=None
+        )
+        materialize_binds(
+            package.extension, package.entry_plans, grants.granted,
+            document_dropped=package.mcp_document_invalid,
+        )
+        disclose_undeclared_refs(package.entry_plans, grants)
+        if grants.preexisting:
+            report.diagnostics.append(
+                Diagnostic(
+                    level="warning", scope="plugin", code="secret_preexisting",
+                    message=grants.disclosure_reason(),
+                )
+            )
+        await fan_out_servers(user_id, plugin_id, package.entry_plans, report)
+        await fan_out_skills(user_id, plugin_id, package.skill_plans, report)
+
+        # Under the lock for the reason update writes its row there: an update
+        # landing in between would otherwise have its tree stamped as this one.
+        if report.landed_whole:
+            plugin_row = (
+                await stamp_plugin_content_hash(
+                    user_id, package.name, package.content_hash
+                )
+                or plugin_row
+            )
 
     # Embedded literals the import loop vaulted: their refs may complete a
     # dangling ${vault:NAME} on an already-enabled server.
@@ -155,14 +192,6 @@ async def install_plugin_package(
     if report.servers_created:
         # Components land enabled, so every workspace's effective set changed.
         await bump_user_workspaces_mcp_version(user_id)
-
-    if report.landed_whole:
-        plugin_row = (
-            await stamp_plugin_content_hash(
-                user_id, package.name, package.content_hash
-            )
-            or plugin_row
-        )
 
     logger.info(
         f"[plugins] install user_id={user_id} name={package.name} "

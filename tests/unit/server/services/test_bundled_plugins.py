@@ -10,6 +10,7 @@ property is stated in a docstring and enforced by one loop; a later refactor to
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -208,8 +209,12 @@ class TestTheNameIsReservedAgainstInstalls:
 
         _write(bundles_dir, "yfinance", manifest=_manifest("yfinance"))
         package = SimpleNamespace(name="not-shipped")
-        with patch.object(
-            lifecycle, "get_plugin", AsyncMock(return_value={"name": "not-shipped"})
+        with (
+            patch.object(lifecycle, "plugin_fan_out_lock", lambda _: nullcontext()),
+            patch.object(
+                lifecycle, "get_plugin",
+                AsyncMock(return_value={"name": "not-shipped"}),
+            ),
         ):
             with pytest.raises(ValueError, match="already installed"):
                 await lifecycle.install_plugin_package(

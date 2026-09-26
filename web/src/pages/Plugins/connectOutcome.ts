@@ -13,8 +13,7 @@
  * English, on a page that is otherwise translated.
  */
 
-/** Catalog `NAME_RE`: what a server the user could have connected is called. */
-const CATALOG_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+import { isServerName } from '@/pages/ChatAgent/components/mcp/mcpSchemas';
 
 /**
  * Every reason the callback emits. Each has a sentence; anything else is the
@@ -42,9 +41,9 @@ export type ConnectOutcome =
   | { kind: 'connected'; server: string | null }
   | { kind: 'failed'; server: string | null; reasonKey: string };
 
-/** A catalog name, or null for anything that could not be one. */
+/** What a server the user could have connected is called, or null. */
 function serverName(value: string | null): string | null {
-  return value && CATALOG_NAME.test(value) ? value : null;
+  return value && isServerName(value) ? value : null;
 }
 
 /** The callback's verdict, or null if this landing is not one. */

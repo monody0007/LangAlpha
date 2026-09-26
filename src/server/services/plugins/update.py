@@ -25,8 +25,10 @@ from src.server.database.mcp_servers import (
     get_catalog_server,
 )
 from src.server.database.plugins import (
+    get_plugin,
     list_plugin_server_names,
     list_plugin_skill_names,
+    plugin_fan_out_lock,
     update_plugin_row,
 )
 from src.server.database.user_skills import (
@@ -628,8 +630,39 @@ async def update_plugin_package(
                 message=grants.disclosure_reason(),
             )
         )
-    changed = await _update_servers(user_id, plugin_id, package, report)
-    await _update_skills(user_id, plugin_id, package, report)
+    # The row names the package its components came from, so it is written
+    # under the same lock: released first, a second update could land its
+    # components in between and this row would then claim the wrong package.
+    async with plugin_fan_out_lock(user_id):
+        # The plugin was read before the fetch; an uninstall, or one followed
+        # by a reinstall under the same name, may have landed since.
+        stored = await get_plugin(user_id, plugin["name"])
+        if stored is None or stored["user_plugin_id"] != plugin_id:
+            raise ValueError(
+                f"Plugin {plugin['name']!r} was uninstalled while this update waited"
+            )
+        changed = await _update_servers(user_id, plugin_id, package, report)
+        await _update_skills(user_id, plugin_id, package, report)
+
+        # An unreadable mcp.json left the servers untouched above, so the stored
+        # document is still the one that describes them. Replacing it with NULL
+        # would throw away the only copy over a fault we did not act on, and
+        # the caller's copy may predate an update that finished since.
+        document = package.mcp_document
+        if package.mcp_document_invalid:
+            document = stored.get("mcp_document")
+        settled = report.landed_whole and not package.mcp_document_invalid
+        row = await update_plugin_row(
+            user_id,
+            plugin["name"],
+            version=package.version,
+            source_ref=source_ref,
+            manifest=package.manifest,
+            mcp_document=document,
+            # Same rule as install: the hash claims this tree is installed, so a
+            # component left in error keeps the old one and stays reconcilable.
+            content_hash=package.content_hash if settled else None,
+        )
 
     disclose_vaulted_literals(report)
     await after_secrets_changed(
@@ -637,26 +670,6 @@ async def update_plugin_package(
     )
     if changed:
         await bump_user_workspaces_mcp_version(user_id)
-
-    # An unreadable mcp.json left the servers untouched above, so the stored
-    # document is still the one that describes them — replacing it with NULL
-    # would throw away the only copy over a fault we did not act on.
-    settled = report.landed_whole and not package.mcp_document_invalid
-    row = await update_plugin_row(
-        user_id,
-        plugin["name"],
-        version=package.version,
-        source_ref=source_ref,
-        manifest=package.manifest,
-        mcp_document=(
-            plugin.get("mcp_document")
-            if package.mcp_document_invalid
-            else package.mcp_document
-        ),
-        # Same rule as install: the hash claims this tree is installed, so a
-        # component left in error keeps the old one and stays reconcilable.
-        content_hash=package.content_hash if settled else None,
-    )
     logger.info(
         f"[plugins] update user_id={user_id} name={plugin['name']} "
         f"components={len(report.components)} complete={report.landed_whole}"

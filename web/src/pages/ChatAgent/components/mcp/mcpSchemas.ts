@@ -24,6 +24,55 @@ import { z } from 'zod';
 export const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 export const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,127}$/;
 
+// Mirrors Python 3.13's `keyword.kwlist + keyword.softkwlist`.
+const PYTHON_KEYWORDS: ReadonlySet<string> = new Set([
+  'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break',
+  'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for',
+  'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not',
+  'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield',
+  '_', 'case', 'match', 'type',
+]);
+const RUNTIME_MODULE = 'mcp_client';
+
+/**
+ * The message for a name the sandbox reserves, or null. A server name is also
+ * the Python module its tool wrappers are generated into, beside the runtime's
+ * own `mcp_client`. Mirrors `sandbox_name_error` in the backend model.
+ */
+export function sandboxNameError(name: string): string | null {
+  if (name === RUNTIME_MODULE) {
+    return `name '${name}' is reserved: the sandbox's MCP runtime module already has it`;
+  }
+  if (name.startsWith('__')) {
+    return "name must not start with '__': a server name becomes a Python module in the sandbox, and those names are Python's own";
+  }
+  if (PYTHON_KEYWORDS.has(name)) {
+    return `name '${name}' is a Python keyword, and a server name becomes a Python module in the sandbox`;
+  }
+  return null;
+}
+
+/**
+ * Rename a `NAME_RE`-legal name the sandbox reserves into one it accepts
+ * (mirrors the backend's `_unreserve`): `class` → `class_server`, `__init__` →
+ * `init__`, and a name that is only underscores → `server`.
+ */
+export function unreserveName(name: string): string {
+  let cand = name;
+  if (cand.startsWith('__') || cand === '_') {
+    cand = cand.replace(/^_+/, '');
+    if (!cand) return 'server';
+    if (/^[0-9]/.test(cand)) cand = `_${cand}`;
+  }
+  if (cand === RUNTIME_MODULE || PYTHON_KEYWORDS.has(cand)) cand = `${cand}_server`;
+  return cand;
+}
+
+/** Whether `name` is one a catalog server could be called. */
+export function isServerName(name: string): boolean {
+  return NAME_RE.test(name) && sandboxNameError(name) === null;
+}
+
 // Ordered for the transport picker: http leads because a remote service is the
 // common case, and sse sits beside it as the legacy form of the same thing.
 export const TRANSPORTS = ['http', 'sse', 'stdio'] as const;
@@ -253,7 +302,12 @@ function isDisallowedIp(host: string): boolean {
 
 const nameField = z
   .string()
-  .regex(NAME_RE, 'name must be 1-64 chars: letter/underscore then letters/digits/underscores');
+  .regex(NAME_RE, 'name must be 1-64 chars: letter/underscore then letters/digits/underscores')
+  .superRefine((name, ctx) => {
+    // A name that already failed the shape gets that one message, not two.
+    const reason = NAME_RE.test(name) ? sandboxNameError(name) : null;
+    if (reason) ctx.addIssue({ code: 'custom', message: reason });
+  });
 
 const descriptionField = z.string().max(DESCRIPTION_MAX).default('');
 const instructionField = z.string().max(INSTRUCTION_MAX).default('');

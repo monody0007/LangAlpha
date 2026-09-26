@@ -58,6 +58,31 @@ def test_name_rejects_invalid(name):
         McpServerInput(**_stdio(name=name))
 
 
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        ("mcp_client", "MCP runtime module"),
+        ("__init__", "must not start with '__'"),
+        ("__private", "must not start with '__'"),
+        ("class", "Python keyword"),
+        ("None", "Python keyword"),
+        ("match", "Python keyword"),
+        ("type", "Python keyword"),
+        ("_", "Python keyword"),
+    ],
+)
+def test_name_rejects_what_the_sandbox_reserves(name, reason):
+    # The name becomes a module in the sandbox's tools package, so the message
+    # has to say that rather than restate the shape rule the name passes.
+    with pytest.raises(ValidationError, match=reason):
+        McpServerInput(**_stdio(name=name))
+
+
+@pytest.mark.parametrize("name", ["class_server", "mcp_client_v2", "_private", "Type"])
+def test_name_near_a_reserved_one_is_accepted(name):
+    assert McpServerInput(**_stdio(name=name)).name == name
+
+
 # ---------------------------------------------------------------------------
 # Transport coherence
 # ---------------------------------------------------------------------------
@@ -478,6 +503,39 @@ def test_coerce_mcp_name_prefixes_leading_digit():
 def test_coerce_mcp_name_passthrough_when_already_legal():
     name, renamed = coerce_mcp_name("already_ok")
     assert name == "already_ok" and renamed is False
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("class", "class_server"),
+        ("match", "match_server"),
+        ("mcp_client", "mcp_client_server"),
+        ("mcp-client", "mcp_client_server"),
+        ("__init__", "init__"),
+        ("__class", "class_server"),
+        ("__3d", "_3d"),
+        ("_", "server"),
+        ("---", "server"),
+    ],
+)
+def test_coerce_mcp_name_renames_what_the_sandbox_reserves(raw, expected):
+    # Import and plugin install rename rather than drop the entry, and what
+    # they produce has to pass the same validator a hand-typed name does.
+    name, renamed = coerce_mcp_name(raw)
+    assert (name, renamed) == (expected, True)
+    assert McpServerInput(**_stdio(name=name)).name == expected
+
+
+def test_parse_reports_a_reserved_key_as_renamed():
+    [entry] = parse_mcp_servers_payload(
+        {"mcpServers": {"class": {"command": "npx", "args": ["-y", "pkg"]}}}
+    )
+    assert entry.error is None
+    assert (entry.original_name, entry.name, entry.renamed) == (
+        "class", "class_server", True,
+    )
+    assert entry.config["name"] == "class_server"
 
 
 @pytest.mark.parametrize(

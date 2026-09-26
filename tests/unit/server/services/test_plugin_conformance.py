@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from src.server.models.mcp_server import McpServerInput
 from src.server.services.plugins import archive
 from src.server.services.plugins.errors import PluginAmbiguous, PluginFatal
 from src.server.services.plugins.fetch import (
@@ -379,6 +380,41 @@ class TestMcpComponentLadder:
         assert entry(package, "no-url").skip_code == "schema"
         assert entry(package, "dup-headers").skip_code == "duplicate_header"
         assert entry(package, "good").installable
+
+    def test_a_key_the_sandbox_reserves_installs_renamed(self):
+        # The key becomes a module name in the sandbox. A package author has
+        # no reason to know that, so the entry lands under a legal name and
+        # reports the rename instead of being skipped.
+        raw = in_memory_zip({
+            "plugin.json": json.dumps({
+                "$schema": CANONICAL_PLUGIN_SCHEMA,
+                "name": "reserved-keys",
+                "version": "1.0.0",
+            }).encode(),
+            "mcp.json": json.dumps({
+                "$schema": (
+                    "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
+                ),
+                "mcpServers": {
+                    "class": {"type": "stdio", "command": "npx"},
+                    "mcp_client": {
+                        "type": "streamable-http",
+                        "url": "https://api.example.com/mcp",
+                    },
+                    "__init__": {"type": "stdio", "command": "npx"},
+                },
+            }).encode(),
+        })
+        package = validate_package(raw)
+        for key, name in (
+            ("class", "class_server"),
+            ("mcp_client", "mcp_client_server"),
+            ("__init__", "init__"),
+        ):
+            plan = entry(package, key)
+            assert plan.installable, plan.skip_reason
+            assert (plan.name, plan.renamed) == (name, True)
+            assert McpServerInput(**plan.config).name == name
 
     def test_a_shell_command_installs_like_any_other(self):
         # The command reaches an argv list in the user's own sandbox, where the

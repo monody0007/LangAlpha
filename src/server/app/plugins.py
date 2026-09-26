@@ -409,7 +409,9 @@ async def update_plugin_upload(
 
 
 @router.post("/{name}/sse-upgrades", response_model=InstallResponse)
-@handle_api_exceptions("upgrade plugin sse entries", logger)
+@handle_api_exceptions(
+    "upgrade plugin sse entries", logger, conflict_on_value_error=True
+)
 async def sse_upgrades(
     plugin: CurrentPlugin, body: SseUpgradeInput, user_id: CurrentUserId
 ) -> InstallResponse:

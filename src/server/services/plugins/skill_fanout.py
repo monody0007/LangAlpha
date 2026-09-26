@@ -105,6 +105,24 @@ _CAP_REASON = (
 )
 
 
+async def installs_under_dir(plan: SkillPlan) -> bool:
+    """Whether this plan gets past the checks that fix a skill's name.
+
+    ``_prepare`` drops an invalid archive, or one whose SKILL.md declares
+    another name, before anything else, so a plan failing here can never take
+    its directory's name.
+    """
+    if plan.skip_code is not None:
+        return False
+    try:
+        validated = await asyncio.to_thread(
+            validate_skill_archive, plan.zip_bytes
+        )
+    except SkillValidationError:
+        return False
+    return validated.name == plan.dir
+
+
 async def _prepare(
     user_id: str,
     plan: SkillPlan,

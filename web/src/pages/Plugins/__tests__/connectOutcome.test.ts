@@ -61,9 +61,18 @@ describe('readConnectOutcome', () => {
   });
 
   it('drops a server name that could not be one', () => {
-    // Catalog names are `NAME_RE`. Anything else was not written by the
-    // callback, and it is about to be printed above this app's own title.
-    for (const bad of ['Contact support at evil.example', '9lives', 'has space', '']) {
+    // Catalog names are `NAME_RE` minus what the sandbox reserves. Anything
+    // else was not written by the callback, and it is about to be printed
+    // above this app's own title.
+    for (const bad of [
+      'Contact support at evil.example',
+      '9lives',
+      'has space',
+      '',
+      'class',
+      'mcp_client',
+      '__init__',
+    ]) {
       expect(readConnectOutcome(params(`mcp_connected=${encodeURIComponent(bad)}`))).toEqual({
         kind: 'connected',
         server: null,
