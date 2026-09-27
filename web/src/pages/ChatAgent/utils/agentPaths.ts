@@ -2,6 +2,7 @@
 // agentPaths.generated.ts. Re-exported here so callers keep one import.
 import {
   AGENT_MD_FILE,
+  CASEFOLD_EXCEPTIONS,
   MEMO_INDEX_FILENAME,
   MEMO_USER_DIR,
   MEMORY_INDEX_FILENAME,
@@ -45,18 +46,49 @@ export function isUserProfileReadmePath(rawPath: string): boolean {
 /**
  * True for the workspace's own notes file, which is runtime context the agent
  * keeps for itself rather than a deliverable. That file lives at the workspace
- * root: `agent.md` bare or under the sandbox root, or under the project folder
- * a workspace on a shared computer lives in, when the caller knows its name.
- * Only a sandbox-anchored path names that folder: a relative path resolves
- * against it already, as routing reads it, so `alpha/agent.md` is a nested file.
- * Any other `agent.md` is a deliverable: `docs/agent.md` was asked for, and
- * `/tmp/agent.md` keeps its own root after parsing, so it never reads as the
- * workspace's file.
+ * root, however the path spells it (see `workspaceScopedPath`), so
+ * `alpha/agent.md` is a nested file and `/tmp/agent.md` keeps its own root.
  */
-export function isAgentNotesPath(parts: AgentPathParts, workspaceDirName?: string | null): boolean {
-  if (parts.directory) return false;
-  return parts.path === AGENT_MD_FILE
-    || (!!workspaceDirName && parts.absolute && parts.path === `${workspaceDirName}/${AGENT_MD_FILE}`);
+export function isAgentNotesPath(
+  parts: AgentPathParts,
+  workspaceDirName?: string | null,
+  previousDirNames?: readonly string[] | null,
+): boolean {
+  return !parts.directory && workspaceScopedPath(parts, workspaceDirName, previousDirNames) === AGENT_MD_FILE;
+}
+
+/**
+ * A reference read from the workspace's own folder. A machine-root path that
+ * names that folder, or one it was renamed out of, has the folder folded off;
+ * a relative path already reads from it, so `alpha/x.md` stays a nested file.
+ * Without the folder names this is the canonical path, which reads a bare
+ * sandbox-root path the way the layout before workspace folders did.
+ *
+ * The folder matches as the server's file routes match it: the current one
+ * exactly, since another spelling is another directory on a case-sensitive
+ * disk, and a former one by its name key, since the rename moved it away and
+ * a path an older turn wrote can only mean this workspace.
+ */
+export function workspaceScopedPath(
+  parts: AgentPathParts,
+  dirName?: string | null,
+  previousDirNames?: readonly string[] | null,
+): string {
+  // A root the sandbox did not claim survives parsing (`/tmp/x`): no folder there.
+  const { path } = parts;
+  if (!parts.absolute || path.startsWith('/')) return path;
+  const first = path.split('/', 1)[0];
+  const inFolder = (!!dirName && first === dirName)
+    || (!!first && (previousDirNames ?? []).some((name) => !!name && foldFolderName(name) === foldFolderName(first)));
+  return inFolder ? path.slice(first.length + 1) : path;
+}
+
+/**
+ * The server's `casefold`, code point by code point. Anything looser lets a
+ * sibling's folder match a former one: `ı` and `i` are two keys there.
+ */
+function foldFolderName(name: string): string {
+  return Array.from(name, (c) => CASEFOLD_EXCEPTIONS[c] ?? c.toLowerCase()).join('');
 }
 
 // The sandbox roots the agent sometimes emits, bare or `file:///`-wrapped (see
@@ -244,16 +276,16 @@ export function workspaceRelativePath(rawPath: string): string {
   return takeApart(rawPath).path.replace(/^\/+/, '');
 }
 
-/** Remove the selected project folder from a machine-root absolute path. */
-function selectedWorkspacePath(rawPath: string, dirName?: string | null): string {
-  if (!dirName) return rawPath;
+/** A machine-root path with the selected workspace's folder folded off; any other path as it came. */
+function selectedWorkspacePath(
+  rawPath: string,
+  dirName?: string | null,
+  previousDirNames?: readonly string[] | null,
+): string {
   const parts = takeApart(rawPath, true);
-  if (!parts.absolute) return rawPath;
-  const path = parts.path.replace(/^\/+/, '');
-  if (path !== dirName && !path.startsWith(`${dirName}/`)) return rawPath;
-  const scoped = path === dirName ? '' : path.slice(dirName.length + 1);
-  if (!scoped && parts.directory) return './';
-  return scoped + (parts.directory && scoped ? '/' : '');
+  const scoped = workspaceScopedPath(parts, dirName, previousDirNames);
+  if (scoped === parts.path) return rawPath;
+  return scoped || (parts.directory ? './' : '');
 }
 
 // The pre-folder spelling of the workspace memory dir, before a workspace
@@ -392,8 +424,9 @@ export function computeAgentArtifactRouting(
   rawPath: string,
   targetWorkspaceId?: string,
   workspaceDirName?: string | null,
+  previousDirNames?: readonly string[] | null,
 ): AgentArtifactRouting {
-  const routedPath = selectedWorkspacePath(rawPath, workspaceDirName);
+  const routedPath = selectedWorkspacePath(rawPath, workspaceDirName, previousDirNames);
   const info = classifyAgentPath(routedPath);
   // Caller-supplied wsid wins; otherwise fall back to the wsid extracted from
   // a `__wsref__/...` marker in the path itself.

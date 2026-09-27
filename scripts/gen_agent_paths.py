@@ -52,6 +52,29 @@ def _string_list(name: str, values: tuple[str, ...] | list[str]) -> str:
     return f"export const {name} = [\n{body}] as const;\n"
 
 
+def _js_string(text: str) -> str:
+    """A single-quoted literal, escaping everything outside printable ASCII."""
+    return "'" + "".join(
+        c if " " <= c <= "~" and c not in "'\\" else f"\\u{{{ord(c):x}}}"
+        for c in text
+    ) + "'"
+
+
+def _casefold_exceptions() -> list[tuple[str, str]]:
+    """Every code point Python's ``casefold`` maps differently from ``lower``.
+
+    The server keys workspace folders with ``casefold`` and the browser has only
+    ``toLowerCase``, which agrees with ``lower`` on every code point both
+    runtimes' Unicode versions assign. The set is the same under Unicode 15.0
+    through 16.0.
+    """
+    return [
+        (c, c.casefold())
+        for c in map(chr, range(sys.maxunicode + 1))
+        if c.casefold() != c.lower()
+    ]
+
+
 def render() -> str:
     layout = SandboxLayout.default()
     out = [_HEADER, "\n"]
@@ -123,6 +146,18 @@ def render() -> str:
     out.append(f"export const LEGACY_ROOT_TOOLS_DIR = '{LEGACY_ROOT_TOOLS_DIR}';\n")
     out.append(f"export const LEGACY_ROOT_CODE_DIR = '{LEGACY_ROOT_CODE_DIR}';\n")
     out.append(_string_list("LEGACY_ROOT_DIRS", LEGACY_ROOT_DIRS))
+    out.append("\n")
+
+    out.append(
+        "/** Code points whose `casefold` differs from `toLowerCase`. The server\n"
+        " *  matches former workspace folders by `casefold`, so the browser folds\n"
+        " *  these from the table and every other code point with `toLowerCase`. */\n"
+    )
+    out.append("export const CASEFOLD_EXCEPTIONS: Readonly<Record<string, string>> = {\n")
+    pairs = [f"{_js_string(k)}: {_js_string(v)}," for k, v in _casefold_exceptions()]
+    for i in range(0, len(pairs), 4):
+        out.append("  " + " ".join(pairs[i : i + 4]) + "\n")
+    out.append("};\n")
 
     return "".join(out)
 

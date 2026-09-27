@@ -24,6 +24,7 @@ import { SubagentStatusIcon } from './taskStatusUi';
 import type { NavWorkspace } from '../hooks/useNavigationData';
 import { WorkspaceMenuItems } from './workspaceActions';
 import type { WorkspaceActions } from './workspaceActions';
+import { clampWorkspaceName } from '../utils/workspaceName';
 
 export interface ThreadEntry {
   thread_id: string;
@@ -497,7 +498,7 @@ function WorkspaceTreeRowImpl({
               className="text-sm font-medium bg-transparent border-b flex-1 min-w-0"
               style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-muted)' }}
               value={rename.value}
-              onChange={(e) => rename.onChange(e.target.value)}
+              onChange={(e) => rename.onChange(clampWorkspaceName(e.target.value))}
               onClick={(e) => e.stopPropagation()}
               onPointerDown={(e) => e.stopPropagation()}
               onKeyDown={(e) => {

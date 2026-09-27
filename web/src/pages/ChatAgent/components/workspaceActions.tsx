@@ -8,6 +8,7 @@ import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
 import { deleteWorkspace, duplicateWorkspace } from '../utils/api';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
+import { workspaceNameErrorMessage } from '../utils/workspaceName';
 import { invalidateWorkspaceMembership } from '../hooks/workspaceRowActions';
 import { forgetStableNavOrder } from '../hooks/useNavigationData';
 import { forgetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
@@ -130,7 +131,11 @@ export function useWorkspaceActions({
       onAfterMutate?.('duplicate');
     } catch (err) {
       console.error('Error duplicating workspace:', err);
-      toast({ variant: 'destructive', title: t('workspace.duplicateFailed', 'Could not duplicate workspace'), description: entitlementErrorMessage(err, t) });
+      toast({
+        variant: 'destructive',
+        title: t('workspace.duplicateFailed', 'Could not duplicate workspace'),
+        description: workspaceNameErrorMessage(err, t, 'duplicate') ?? entitlementErrorMessage(err, t),
+      });
     } finally {
       setDuplicateBusy(false);
     }

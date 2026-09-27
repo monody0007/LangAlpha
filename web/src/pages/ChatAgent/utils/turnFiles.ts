@@ -10,7 +10,7 @@
 import { assistantText } from '../components/messageList/messageText';
 import type { MessageRecord } from '../components/messageList/types';
 import { fileKind, isFilePath, isImagePath, parseWsPath } from './filePaths';
-import { classifyAgentPath, isAgentNotesPath, parseAgentHref } from './agentPaths';
+import { classifyAgentPath, isAgentNotesPath, parseAgentHref, workspaceScopedPath } from './agentPaths';
 import { splitFileLocation, type FileLocation } from './fileLocation';
 import { isSystemPath, writeCalls, type TurnMessage } from './fileRefResolver';
 import { normalizeFileRefs } from './normalizeFileRefs';
@@ -122,7 +122,11 @@ interface MessageFiles {
   embedded: string[];
 }
 
-function filesInMessage(message: TurnMessage, workspaceDirName?: string | null): MessageFiles {
+function filesInMessage(
+  message: TurnMessage,
+  workspaceDirName?: string | null,
+  previousDirNames?: readonly string[] | null,
+): MessageFiles {
   const cited: TurnFile[] = [];
   const written: TurnFile[] = [];
   const embedded: string[] = [];
@@ -144,8 +148,8 @@ function filesInMessage(message: TurnMessage, workspaceDirName?: string | null):
         const { path: href, location } = splitFileLocation(dest);
         const wsRef = parseWsPath(href);
         const parts = parseAgentHref(href);
-        const { path } = parts;
-        if (!openablePath(path) || isAgentNotesPath(parts, workspaceDirName)) return;
+        const path = workspaceScopedPath(parts, workspaceDirName, previousDirNames);
+        if (!openablePath(path) || isAgentNotesPath(parts, workspaceDirName, previousDirNames)) return;
         const file: TurnFile = { path, workspaceId: wsRef?.workspaceId, location: location ?? undefined };
         if (embeds || isImagePath(path)) {
           embedded.push(refKey(file));
@@ -164,8 +168,8 @@ function filesInMessage(message: TurnMessage, workspaceDirName?: string | null):
   }
 
   for (const { parts, call } of writeCalls(message)) {
-    const { path } = parts;
-    if (!openablePath(path) || isAgentNotesPath(parts, workspaceDirName)) continue;
+    const path = workspaceScopedPath(parts, workspaceDirName, previousDirNames);
+    if (!openablePath(path) || isAgentNotesPath(parts, workspaceDirName, previousDirNames)) continue;
     // Only an Edit says what changed. A Write carries the new file alone, and
     // whether it replaced one, or how much of it, is not in the call. Neither
     // does a `replace_all` Edit, which carries one pair of strings for every
@@ -191,8 +195,9 @@ function filesInMessage(message: TurnMessage, workspaceDirName?: string | null):
 export function collectTurnFiles(
   messages: readonly TurnMessage[],
   workspaceDirName?: string | null,
+  previousDirNames?: readonly string[] | null,
 ): TurnFile[] {
-  const parsed = messages.filter(Boolean).map((m) => filesInMessage(m, workspaceDirName));
+  const parsed = messages.filter(Boolean).map((m) => filesInMessage(m, workspaceDirName, previousDirNames));
 
   const embedded = new Set(parsed.flatMap((p) => p.embedded));
   const byRef = new Map<string, TurnFile>();
@@ -220,28 +225,36 @@ export function collectTurnFiles(
 
 // Keyed on the message that ends a turn, and checked against the whole member
 // list, so the entry survives exactly as long as the turn's messages do. The
-// folder name is part of the check: the workspace record often lands after
-// the transcript, and the entry built without it hides the wrong `agent.md`.
+// folder names are part of the check: the workspace record often lands after
+// the transcript, and the entry built without them hides the wrong `agent.md`.
+// They are compared by value, so the same names from another copy of the
+// record still hit.
 const turnCache = new WeakMap<object, {
   members: readonly TurnMessage[];
-  workspaceDirName: string | null;
+  folders: string;
   files: TurnFile[];
 }>();
 
-function cachedTurnFiles(members: readonly TurnMessage[], workspaceDirName: string | null): TurnFile[] {
+function cachedTurnFiles(
+  members: readonly TurnMessage[],
+  workspaceDirName: string | null,
+  previousDirNames: readonly string[] | null,
+): TurnFile[] {
   const key = members[members.length - 1] as object | undefined;
   if (!key) return [];
+  // A folder name holds no `/`, so joined on it the names read back unambiguously.
+  const folders = [workspaceDirName ?? '', ...(previousDirNames ?? [])].join('/');
   const hit = turnCache.get(key);
   if (
     hit
-    && hit.workspaceDirName === workspaceDirName
+    && hit.folders === folders
     && hit.members.length === members.length
     && hit.members.every((m, i) => m === members[i])
   ) {
     return hit.files;
   }
-  const files = collectTurnFiles(members, workspaceDirName);
-  turnCache.set(key, { members: [...members], workspaceDirName, files });
+  const files = collectTurnFiles(members, workspaceDirName, previousDirNames);
+  turnCache.set(key, { members: [...members], folders, files });
   return files;
 }
 
@@ -260,6 +273,7 @@ function cachedTurnFiles(members: readonly TurnMessage[], workspaceDirName: stri
 export function turnFilesByTurn(
   projected: readonly { message: MessageRecord; turnIndex: number }[],
   workspaceDirName?: string | null,
+  previousDirNames?: readonly string[] | null,
 ): Map<number, TurnFile[]> {
   const byTurn = new Map<number, TurnMessage[]>();
   const streaming = new Set<number>();
@@ -276,7 +290,7 @@ export function turnFilesByTurn(
   const files = new Map<number, TurnFile[]>();
   for (const [turnIndex, members] of byTurn) {
     if (streaming.has(turnIndex)) continue;
-    const collected = cachedTurnFiles(members, workspaceDirName ?? null);
+    const collected = cachedTurnFiles(members, workspaceDirName ?? null, previousDirNames ?? null);
     if (collected.length > 0) files.set(turnIndex, collected);
   }
   return files;

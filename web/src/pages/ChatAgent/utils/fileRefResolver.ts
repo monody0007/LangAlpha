@@ -10,7 +10,7 @@
  */
 
 import { SYSTEM_DIR_PREFIXES } from '../components/filePanel/fileMeta';
-import { normalizeAgentPath, parseAgentPath, type AgentPathParts } from './agentPaths';
+import { normalizeAgentPath, parseAgentPath, workspaceScopedPath, type AgentPathParts } from './agentPaths';
 
 /** The tools whose path argument names a file the agent created or changed. */
 export const WRITE_TOOLS = new Set(['Write', 'Edit']);
@@ -160,12 +160,16 @@ export interface WriteEvent {
  * file changed needs the write itself, since a rewrite of the newest file
  * leaves that list byte-identical.
  */
-export function collectWriteLog(messages: readonly TurnMessage[]): WriteEvent[] {
+export function collectWriteLog(
+  messages: readonly TurnMessage[],
+  workspaceDirName?: string | null,
+  previousDirNames?: readonly string[] | null,
+): WriteEvent[] {
   const out: WriteEvent[] = [];
   for (let i = messages.length - 1; i >= 0 && out.length < RECENT_WRITE_LIMIT; i--) {
     const calls = writeCalls(messages[i] ?? {});
     for (let j = calls.length - 1; j >= 0 && out.length < RECENT_WRITE_LIMIT; j--) {
-      out.push({ id: calls[j].id, path: calls[j].parts.path });
+      out.push({ id: calls[j].id, path: workspaceScopedPath(calls[j].parts, workspaceDirName, previousDirNames) });
     }
   }
   return out;
@@ -183,13 +187,17 @@ export function collectWriteLog(messages: readonly TurnMessage[]): WriteEvent[] 
 export const RECENT_WRITE_LIMIT = 200;
 
 /** Paths the agent wrote or edited in this thread, newest first. */
-export function collectRecentWritePaths(messages: readonly TurnMessage[]): string[] {
+export function collectRecentWritePaths(
+  messages: readonly TurnMessage[],
+  workspaceDirName?: string | null,
+  previousDirNames?: readonly string[] | null,
+): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (let i = messages.length - 1; i >= 0 && out.length < RECENT_WRITE_LIMIT; i--) {
     const calls = writeCalls(messages[i] ?? {});
     for (let j = calls.length - 1; j >= 0 && out.length < RECENT_WRITE_LIMIT; j--) {
-      const { path } = calls[j].parts;
+      const path = workspaceScopedPath(calls[j].parts, workspaceDirName, previousDirNames);
       if (seen.has(path)) continue;
       seen.add(path);
       out.push(path);

@@ -69,6 +69,9 @@ export interface Workspace {
   computer_id?: string | null;
   /** Folder name under the computer's root: the workspace's address on disk. */
   dir_name?: string | null;
+  /** Folders a rename moved this workspace out of, most recent first. Paths in
+   *  older turns still name them. */
+  previous_dir_names?: string[];
   /** The restore from this workspace's file backup did not finish, so the tree
    *  is short some files until the next start retries it. */
   files_restore_incomplete?: boolean;

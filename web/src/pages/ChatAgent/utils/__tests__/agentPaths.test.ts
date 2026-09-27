@@ -472,4 +472,63 @@ describe('isAgentNotesPath', () => {
     expect(isAgentNotesPath(parseAgentHref('/home/workspace/alpha/agent.md?v=2'), 'alpha')).toBe(true);
     expect(isAgentNotesPath(parseAgentHref('agent.md/'))).toBe(false);
   });
+
+  it('matches the notes file in a folder a rename moved the workspace out of', () => {
+    const renamed = (raw: string) => isAgentNotesPath(parseAgentPath(raw), 'Research', ['research-ab12', 'alpha']);
+    expect(renamed('/home/workspace/Research/agent.md')).toBe(true);
+    expect(renamed('/home/workspace/research-ab12/agent.md')).toBe(true);
+    expect(renamed('file:///home/daytona/alpha/agent.md')).toBe(true);
+    // Still only a sandbox-anchored path names the folder.
+    expect(renamed('research-ab12/agent.md')).toBe(false);
+    expect(renamed('/home/workspace/beta/agent.md')).toBe(false);
+    // Without a current folder the former ones still count.
+    expect(isAgentNotesPath(parseAgentPath('/home/workspace/alpha/agent.md'), null, ['alpha'])).toBe(true);
+  });
+});
+
+describe('computeAgentArtifactRouting: a renamed workspace', () => {
+  const route = (raw: string) => computeAgentArtifactRouting(raw, undefined, 'Research', ['research-ab12', 'older']);
+
+  it('folds a path an older turn wrote under a former folder', () => {
+    expect(route('/home/workspace/research-ab12/report.md')).toMatchObject({ targetFile: 'report.md' });
+    expect(route('file:///home/workspace/older/results/q3.csv')).toMatchObject({ targetFile: 'results/q3.csv' });
+    expect(route('/home/workspace/research-ab12/results/')).toMatchObject({ targetFile: null, targetDirectory: 'results' });
+    expect(route('/home/workspace/research-ab12/')).toMatchObject({ targetFile: null, targetDirectory: '' });
+  });
+
+  it('still folds the current folder', () => {
+    expect(route('/home/workspace/Research/report.md')).toMatchObject({ targetFile: 'report.md' });
+  });
+
+  it('routes a former folder\'s store paths to their own tabs', () => {
+    expect(route(`/home/workspace/research-ab12/${MEMORY_WORKSPACE_DIR}/risk.md`)).toMatchObject({
+      targetMemoryKey: 'risk.md',
+      targetMemoryTier: 'workspace',
+    });
+  });
+
+  it('leaves relative paths and other folders alone', () => {
+    expect(route('research-ab12/report.md')).toMatchObject({ targetFile: 'research-ab12/report.md' });
+    expect(route('/home/workspace/other/report.md')).toMatchObject({ targetFile: '/home/workspace/other/report.md' });
+  });
+
+  it('folds one folder, not a subfolder that shares a former name', () => {
+    expect(route('/home/workspace/Research/research-ab12/x.md')).toMatchObject({ targetFile: 'research-ab12/x.md' });
+  });
+
+  it('matches a former folder by its name key and the current one exactly, as the server does', () => {
+    expect(route('/home/workspace/RESEARCH-AB12/report.md')).toMatchObject({ targetFile: 'report.md' });
+    expect(route('/home/workspace/RESEARCH/report.md')).toMatchObject({ targetFile: '/home/workspace/RESEARCH/report.md' });
+    const renamed = (raw: string) => computeAgentArtifactRouting(raw, undefined, 'Weg', ['Straße']);
+    expect(renamed('/home/workspace/STRASSE/plan.md')).toMatchObject({ targetFile: 'plan.md' });
+  });
+
+  it('keeps a folder casefold tells apart from the former one', () => {
+    const dotless = (raw: string) => computeAgentArtifactRouting(raw, undefined, 'Now', ['\u0131']);
+    expect(dotless('/home/workspace/\u0131/report.md')).toMatchObject({ targetFile: 'report.md' });
+    expect(dotless('/home/workspace/i/report.md')).toMatchObject({ targetFile: '/home/workspace/i/report.md' });
+    expect(dotless('/home/workspace/I/report.md')).toMatchObject({ targetFile: '/home/workspace/I/report.md' });
+    const cherokee = (raw: string) => computeAgentArtifactRouting(raw, undefined, 'Now', ['\u13a0']);
+    expect(cherokee('/home/workspace/\uab70/report.md')).toMatchObject({ targetFile: 'report.md' });
+  });
 });

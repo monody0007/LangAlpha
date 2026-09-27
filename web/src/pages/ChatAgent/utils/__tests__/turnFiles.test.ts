@@ -176,6 +176,29 @@ describe('collectTurnFiles', () => {
     expect(collectTurnFiles(turn, 'alpha')).toEqual([]);
   });
 
+  it('leaves out the notes file a turn wrote before the workspace was renamed', () => {
+    const files = collectTurnFiles([
+      assistant('Updated [my notes](/home/workspace/research-ab12/agent.md) and [the report](weekly/report.md).', {
+        a: write(0, '/home/workspace/research-ab12/agent.md'),
+        b: write(1, '/home/workspace/Research/agent.md'),
+        c: write(2, '/home/workspace/docs/agent.md'),
+      }),
+    ], 'Research', ['research-ab12']);
+    expect(files.map((f) => f.path)).toEqual(['weekly/report.md', 'docs/agent.md']);
+  });
+
+  it('names a file under the workspace folder by its path inside it', () => {
+    // The card opens what it names, relative to the folder: `Research/weekly/…`
+    // read from there is a folder nested in the workspace, which does not exist.
+    const files = collectTurnFiles([
+      assistant('See [the report](/home/workspace/Research/weekly/report.md).', {
+        a: write(0, 'weekly/report.md'),
+        b: write(1, '/home/workspace/research-ab12/data/prices.csv'),
+      }),
+    ], 'Research', ['research-ab12']);
+    expect(files.map((f) => f.path)).toEqual(['weekly/report.md', 'data/prices.csv']);
+  });
+
   it('leaves out system paths, section links and folders', () => {
     const files = collectTurnFiles([
       assistant('[skills](.agents/skills/report/SKILL.md), [a section](#findings), [a folder](results/), [a route](/settings)'),
@@ -297,6 +320,24 @@ describe('turnFilesByTurn', () => {
     const projected = [turn(settled as Record<string, unknown>, 0)];
     expect(turnFilesByTurn(projected).get(0)?.map((f) => f.path)).toEqual(['alpha/agent.md']);
     expect(turnFilesByTurn(projected, 'alpha').get(0)).toBeUndefined();
+  });
+
+  it('rebuilds when a rename moves the folder, and not for a copy of the same names', () => {
+    const settled = assistant('Done, see [the report](results/report.md).', {
+      a: write(0, '/home/workspace/alpha/agent.md'),
+    });
+    const projected = [turn(settled as Record<string, unknown>, 0)];
+    const paths = (files?: { path: string }[]) => files?.map((f) => f.path);
+
+    const before = turnFilesByTurn(projected, 'alpha', []).get(0);
+    expect(paths(before)).toEqual(['results/report.md']);
+    // Renamed to Beta: the old folder is only in the previous names now.
+    const renamed = turnFilesByTurn(projected, 'Beta', ['alpha']).get(0);
+    expect(paths(renamed)).toEqual(['results/report.md']);
+    // A refetch hands over a new array with the same names; the cards keep their identity.
+    expect(turnFilesByTurn(projected, 'Beta', ['alpha']).get(0)).toBe(renamed);
+    // Before the record carries the old folder, its notes file reads as a deliverable.
+    expect(paths(turnFilesByTurn(projected, 'Beta').get(0))).toEqual(['results/report.md', 'alpha/agent.md']);
   });
 
   it('claims nothing for a turn still streaming', () => {

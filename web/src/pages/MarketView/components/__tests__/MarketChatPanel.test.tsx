@@ -43,6 +43,7 @@ const h = vi.hoisted(() => ({
 const api = vi.hoisted(() => ({
   summarizeThread: vi.fn().mockResolvedValue({ original_message_count: 3 }),
   offloadThread: vi.fn().mockResolvedValue({ offloaded_args: 1, offloaded_reads: 2 }),
+  getWorkspace: vi.fn().mockResolvedValue({ workspace_id: 'ws-1', name: 'Workspace 1' }),
 }));
 
 // Capture the props MarketChatPanel hands to MessageList + ChatInput.
@@ -119,6 +120,7 @@ vi.mock('@/pages/MarketView/components/MarketChatHistoryButton', () => ({
 vi.mock('@/pages/ChatAgent/utils/api', async (importActual) => ({
   ...(await importActual<Record<string, unknown>>()),
   getFlashWorkspace: vi.fn().mockResolvedValue({ workspace_id: 'flash-ws' }),
+  getWorkspace: api.getWorkspace,
   getPreviewUrl: vi.fn().mockResolvedValue({ url: 'https://signed.example/' }),
   summarizeThread: api.summarizeThread,
   offloadThread: api.offloadThread,
@@ -193,6 +195,21 @@ describe('MarketChatPanel', () => {
     localStorage.clear();
   });
   afterEach(() => vi.clearAllMocks());
+
+  it('reads the PTC folder from the workspace detail, which a turn re-reads after a settle', async () => {
+    api.getWorkspace.mockResolvedValueOnce({
+      workspace_id: 'ws-1',
+      name: 'New Name',
+      dir_name: 'New Name',
+      previous_dir_names: ['Old Name'],
+    });
+    renderPanel({
+      workspaces: [{ workspace_id: 'ws-1', name: 'Old Name', dir_name: 'Old Name', previous_dir_names: [] }],
+    });
+    await vi.waitFor(() => expect(ml.props?.workspaceDirName).toBe('New Name'));
+    expect(api.getWorkspace).toHaveBeenCalledWith('ws-1');
+    expect(ml.props?.previousDirNames).toEqual(['Old Name']);
+  });
 
   it('provides every HITL handler through MessageActionsContext so plan/question cards work', () => {
     renderPanel();

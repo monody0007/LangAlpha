@@ -3,11 +3,18 @@
  * computer row; the open page has no other reason to re-read that row, so the
  * stream's end has to ask for it. Once per turn, and only where there is a
  * machine: a flash thread has none.
+ *
+ * The same machine is where a renamed workspace's folder moves, during the
+ * sandbox acquisition that precedes a PTC run's first event. The page folds
+ * agent paths against the workspace row's folder, so it re-reads that row
+ * when the run's `metadata` event arrives, and again at the turn's end for a
+ * stream that joined past it.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Mock } from 'vitest';
+import type { Mock, MockInstance } from 'vitest';
 import { act, waitFor } from '@testing-library/react';
-import { renderHookWithProviders } from '@/test/utils';
+import { createTestQueryClient, renderHookWithProviders } from '@/test/utils';
+import { queryKeys } from '@/lib/queryKeys';
 import { settleMountEffect } from './chatHookHarness';
 
 vi.mock('react-i18next', () => ({
@@ -38,35 +45,55 @@ const mockReplay = replayThreadHistory as Mock;
 const mockSend = sendChatMessageStream as Mock;
 const mockRefresh = refreshComputersAfterTurn as Mock;
 
-/** Mount a thread and run one turn that streams a line and completes. */
-async function completeOneTurn(agentMode: string) {
-  mockSend.mockImplementation(async (...args: unknown[]) => {
-    const onEvent = args[5] as (e: Record<string, unknown>) => void;
-    onEvent({ event: 'message_chunk', role: 'assistant', agent: 'main', content_type: 'text', content: 'done' });
-    return { disconnected: false };
-  });
-  const rendered = renderHookWithProviders(() =>
-    useChatMessages('ws-x', 'th-x', null, null, null, null, null, null, agentMode),
+const CHUNK = { event: 'message_chunk', role: 'assistant', agent: 'main', content_type: 'text', content: 'done' };
+const METADATA = { event: 'metadata', thread_id: 'th-x', run_id: 'run-1' };
+
+/** Mount a thread with a spied query client. */
+async function mountThread(agentMode: string) {
+  const queryClient = createTestQueryClient();
+  const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+  const rendered = renderHookWithProviders(
+    () => useChatMessages('ws-x', 'th-x', null, null, null, null, null, null, agentMode),
+    { queryClient },
   );
   await waitFor(() => expect(mockReplay).toHaveBeenCalled());
   await settleMountEffect();
-  await act(async () => {
-    await rendered.result.current.handleSendMessage('measure', false);
-  });
-  await waitFor(() => expect(rendered.result.current.isLoading).toBe(false));
-  return rendered;
+  return { ...rendered, invalidate };
 }
 
-describe('useChatMessages, turn end re-reads the machine rows', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockReplay.mockReset();
-    mockReplay.mockResolvedValue(undefined);
-    mockSend.mockReset();
-    mockStatus.mockReset();
-    mockStatus.mockResolvedValue({ can_reconnect: false, status: 'completed' });
+/** Mount a thread and run one turn that streams `events` and completes. */
+async function completeOneTurn(agentMode: string, events: Record<string, unknown>[] = [CHUNK]) {
+  mockSend.mockImplementation(async (...args: unknown[]) => {
+    const onEvent = args[5] as (e: Record<string, unknown>) => void;
+    for (const e of events) onEvent(e);
+    return { disconnected: false };
   });
+  const mounted = await mountThread(agentMode);
+  await act(async () => {
+    await mounted.result.current.handleSendMessage('measure', false);
+  });
+  await waitFor(() => expect(mounted.result.current.isLoading).toBe(false));
+  return mounted;
+}
 
+/** How many times the page asked to re-read this workspace's row. */
+function workspaceRowReads(invalidate: MockInstance) {
+  const key = JSON.stringify(queryKeys.workspaces.detail('ws-x'));
+  return invalidate.mock.calls.filter(([filters]) =>
+    JSON.stringify((filters as { queryKey?: unknown } | undefined)?.queryKey) === key,
+  ).length;
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockReplay.mockReset();
+  mockReplay.mockResolvedValue(undefined);
+  mockSend.mockReset();
+  mockStatus.mockReset();
+  mockStatus.mockResolvedValue({ can_reconnect: false, status: 'completed' });
+});
+
+describe('useChatMessages, turn end re-reads the machine rows', () => {
   it('asks for the rows once when a PTC turn completes', async () => {
     const { queryClient } = await completeOneTurn('ptc');
     expect(mockRefresh).toHaveBeenCalledTimes(1);
@@ -76,5 +103,38 @@ describe('useChatMessages, turn end re-reads the machine rows', () => {
   it('asks for nothing on a flash thread, which has no machine', async () => {
     await completeOneTurn('flash');
     expect(mockRefresh).not.toHaveBeenCalled();
+  });
+});
+
+describe('useChatMessages, a PTC run re-reads the workspace row for its folder', () => {
+  it('re-reads it when the turn ends, for a stream that never saw the run start', async () => {
+    const { invalidate } = await completeOneTurn('ptc', [CHUNK]);
+    expect(workspaceRowReads(invalidate)).toBe(1);
+  });
+
+  it('re-reads it once when the run starts, before any turn end', async () => {
+    let end: () => void = () => {};
+    mockSend.mockImplementation(async (...args: unknown[]) => {
+      const onEvent = args[5] as (e: Record<string, unknown>) => void;
+      onEvent(METADATA);
+      onEvent(CHUNK);
+      onEvent(CHUNK);
+      return new Promise((r) => { end = () => r({ disconnected: false }); });
+    });
+    const { result, invalidate } = await mountThread('ptc');
+    act(() => {
+      void result.current.handleSendMessage('measure', false);
+    });
+    await waitFor(() => expect(workspaceRowReads(invalidate)).toBe(1));
+    expect(result.current.isLoading).toBe(true);
+
+    await act(async () => { end(); });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(workspaceRowReads(invalidate)).toBe(2);
+  });
+
+  it('re-reads nothing on a flash thread, whose runs move no folder', async () => {
+    const { invalidate } = await completeOneTurn('flash', [METADATA, CHUNK]);
+    expect(workspaceRowReads(invalidate)).toBe(0);
   });
 });

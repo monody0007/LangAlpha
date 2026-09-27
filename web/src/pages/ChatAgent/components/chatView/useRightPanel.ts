@@ -29,6 +29,7 @@ export function useRightPanel({
   isMobile,
   workspaceId,
   workspaceDirName,
+  previousDirNames,
   threadId,
   isActive,
   containerRef,
@@ -42,6 +43,8 @@ export function useRightPanel({
   isMobile: boolean;
   workspaceId: string;
   workspaceDirName?: string | null;
+  /** Folders a rename moved the workspace out of, which older turns' paths still name. */
+  previousDirNames?: readonly string[] | null;
   /** The conversation a MarketView page opened from here resumes. */
   threadId?: string | null;
   isActive: boolean;
@@ -337,6 +340,7 @@ export function useRightPanel({
       rawPath,
       targetWorkspaceId,
       workspaceDirName,
+      previousDirNames,
     );
     if (r.setWorkspaceId && !isValidUuid(r.setWorkspaceId)) {
       console.warn('[ChatView] ignoring artifact ref with invalid workspace id', r.setWorkspaceId);
@@ -372,7 +376,7 @@ export function useRightPanel({
       setFilePanelWorkspaceId(r.setWorkspaceId);
     }
     landInFilePanel(target);
-  }, [landInFilePanel, setFilePanelWorkspaceId, workspaceDirName, confirmLeaveFiles, isFlashMode, workspaceId, filePanelWorkspaceId]);
+  }, [landInFilePanel, setFilePanelWorkspaceId, workspaceDirName, previousDirNames, confirmLeaveFiles, isFlashMode, workspaceId, filePanelWorkspaceId]);
 
   // A turn's sources open as a tab of the file view, one per turn; the tab
   // reads its live records through `getSourcesRecords`.
@@ -422,8 +426,12 @@ export function useRightPanel({
   // Read at click time rather than derived per render: the file panel only
   // needs this thread's Write/Edit paths when it resolves a reference, and a
   // memo over `messages` would rebuild on every streamed chunk.
-  const getRecentWritePaths = useStableHandler(() => collectRecentWritePaths(messages as TurnMessage[]));
-  const getWriteLog = useStableHandler(() => collectWriteLog(messages as TurnMessage[]));
+  const getRecentWritePaths = useStableHandler(
+    () => collectRecentWritePaths(messages as TurnMessage[], workspaceDirName, previousDirNames),
+  );
+  const getWriteLog = useStableHandler(
+    () => collectWriteLog(messages as TurnMessage[], workspaceDirName, previousDirNames),
+  );
 
   // One-shot ?file= deep link: opens the file panel targeting that file. Gated
   // on isActive so only the visible ChatView consumes it (ChatAgent keeps cached

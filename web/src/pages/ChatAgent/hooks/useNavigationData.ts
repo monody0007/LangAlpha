@@ -1,5 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useTranslation } from 'react-i18next';
+import { toast } from '@/components/ui/use-toast';
 import { useWorkspaces } from '../../../hooks/useWorkspaces';
 import { CACHE_ONLY_META, queryKeys } from '../../../lib/queryKeys';
 import { createEmitter } from '@/lib/emitter';
@@ -16,6 +18,7 @@ import type { ResourceTier, WorkspacesResponse } from '@/types/api';
 import { getWorkspaces, getWorkspaceThreads, reorderWorkspaces, updateThread } from '../utils/api';
 import { pinWorkspaceRow, renameWorkspaceRow } from './workspaceRowActions';
 import { useNavPrefs } from '../utils/navPrefs';
+import { denialMessage } from '../utils/denialMessage';
 
 /**
  * Workspace row as the nav tree consumes it: the fields the tree and its
@@ -217,6 +220,7 @@ export interface UseNavigationDataOptions {
 
 export function useNavigationData(currentWorkspaceId: string, { enabled = true }: UseNavigationDataOptions = {}) {
   const queryClient = useQueryClient();
+  const { t } = useTranslation();
   const { workspaceLimit, threadPageSize, orderBy } = useNavPrefs();
   const orderVersion = useSyncExternalStore(
     enabled ? navOrderEmitter.subscribe : subscribeNever,
@@ -407,11 +411,19 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   }, [queryClient]);
 
   // Rename a workspace. No-op on blank/unchanged names is enforced by the caller.
+  // The inline field closes before the server answers, so a refusal (most
+  // often a taken name) can only be told in a toast.
   const renameWorkspace = useCallback((wsId: string, name: string) => {
     const trimmed = name.trim();
     if (!trimmed) return Promise.resolve(false);
-    return renameWorkspaceRow(queryClient, wsId, trimmed);
-  }, [queryClient]);
+    return renameWorkspaceRow(queryClient, wsId, trimmed, {
+      onError: (err) => toast({
+        variant: 'destructive',
+        title: t('workspace.renameFailed'),
+        description: denialMessage(err, t),
+      }),
+    });
+  }, [queryClient, t]);
 
   // Optimistically patch (or, with `remove`, drop) one thread row across every
   // cached list for the workspace — finite sidebar pages, the gallery's

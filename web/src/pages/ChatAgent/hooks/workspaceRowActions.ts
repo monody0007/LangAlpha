@@ -58,12 +58,14 @@ export function rollbackCachedWorkspaces(queryClient: QueryClient, previous: Wor
 
 /**
  * Optimistically patch one workspace, persist it, then invalidate so the
- * server's re-sort lands. Rolls the caches back on failure.
+ * server's re-sort lands. Rolls the caches back on failure and hands the error
+ * to `onError`, which is how a surface tells the user why.
  */
 export async function patchWorkspaceRow(
   queryClient: QueryClient,
   wsId: string,
   patch: Record<string, unknown>,
+  { onError }: { onError?: (err: unknown) => void } = {},
 ): Promise<boolean> {
   const previous = patchCachedWorkspace(queryClient, wsId, patch);
   try {
@@ -76,6 +78,7 @@ export async function patchWorkspaceRow(
   } catch (e) {
     rollbackCachedWorkspaces(queryClient, previous);
     console.warn('[workspaceRowActions] Failed to update workspace:', e);
+    onError?.(e);
     return false;
   }
 }
@@ -108,6 +111,11 @@ export async function pinWorkspaceRow(
 }
 
 /** Rename a workspace. A blank/unchanged name is the caller's guard. */
-export function renameWorkspaceRow(queryClient: QueryClient, wsId: string, name: string): Promise<boolean> {
-  return patchWorkspaceRow(queryClient, wsId, { name });
+export function renameWorkspaceRow(
+  queryClient: QueryClient,
+  wsId: string,
+  name: string,
+  options: { onError?: (err: unknown) => void } = {},
+): Promise<boolean> {
+  return patchWorkspaceRow(queryClient, wsId, { name }, options);
 }

@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { queryKeys } from '@/lib/queryKeys';
-import { formatApiErrorDetail } from '../utils/api';
+import { denialMessage } from '../utils/denialMessage';
 import { patchCachedWorkspace, rollbackCachedWorkspaces } from './workspaceRowActions';
 
 export interface UseWorkspaceMutationOptions<A> {
@@ -13,7 +13,7 @@ export interface UseWorkspaceMutationOptions<A> {
   optimisticPatch?: (args: A) => Record<string, unknown>;
   /** i18n key for the failure toast title. */
   errorTitleKey: string;
-  /** Map an error to the failure toast description (defaults to formatApiErrorDetail). */
+  /** Map an error to the failure toast description (defaults to denialMessage). */
   mapError?: (err: unknown, args: A) => string;
 }
 
@@ -64,7 +64,7 @@ export function useWorkspaceMutation<A>(
         toast({
           variant: 'destructive',
           title: t(errorTitleKey),
-          description: mapError ? mapError(err, args) : formatApiErrorDetail(err),
+          description: mapError ? mapError(err, args) : denialMessage(err, t),
         });
         return false;
       } finally {

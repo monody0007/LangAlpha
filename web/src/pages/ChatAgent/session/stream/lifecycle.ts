@@ -61,6 +61,8 @@ export interface RecoveryDeps {
   finalizePendingTodos: (() => void) | null;
   /** Re-read the machine rows after a turn on a machine; null where there is none (flash). */
   refreshComputerAfterTurn: (() => void) | null;
+  /** Re-read the workspace row for its folder; null where there is no machine (flash). */
+  refreshWorkspaceFolder: (() => void) | null;
   reportBackWatch: {
     onStreamEnd: () => void;
     arm: (
@@ -751,6 +753,9 @@ export const cleanupAfterStreamEnd = (
   // The server measures the machine's disk when a turn ends, onto the
   // computer row; nothing else re-reads that row while the page is open.
   if (deps.refreshComputerAfterTurn) deps.refreshComputerAfterTurn();
+  // The router re-reads the workspace row on the run's `metadata` event; a
+  // stream attached past that event gets its re-read here.
+  if (deps.refreshWorkspaceFolder) deps.refreshWorkspaceFolder();
 
   // Re-arm the keyed report-back watch and poke a catch-up reconcile (no-op
   // when not awaiting): this turn's stream just ended, and the next ordered

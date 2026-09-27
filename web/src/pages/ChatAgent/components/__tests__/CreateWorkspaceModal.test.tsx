@@ -101,6 +101,47 @@ describe('CreateWorkspaceModal', () => {
     expect(screen.getByPlaceholderText(/name/i)).toHaveValue('Denied');
   });
 
+  it('keeps the user on the form and names the workspace already holding the name', async () => {
+    const user = userEvent.setup();
+    const onCreate = vi.fn().mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 409'), {
+        response: {
+          status: 409,
+          data: {
+            detail: {
+              code: 'workspace_name_taken',
+              message: 'A workspace named "Research" already exists.',
+              name: 'Research',
+              workspace_id: LIVE_CREATED.workspace_id,
+            },
+          },
+        },
+      }),
+    );
+    const { onComplete } = setup(onCreate);
+
+    const field = screen.getByPlaceholderText(/name/i);
+    await user.type(field, 'research');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    expect(
+      await screen.findByText('A workspace named "Research" already exists. Choose another name.'),
+    ).toBeInTheDocument();
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(field).toHaveValue('research');
+  });
+
+  it('caps the name at 80 characters as the server counts them, so an emoji is one', async () => {
+    const user = userEvent.setup();
+    setup(vi.fn());
+
+    const field = screen.getByPlaceholderText(/name/i) as HTMLInputElement;
+    await user.click(field);
+    await user.paste('\u{1F4C8}'.repeat(90));
+
+    expect(field.value).toBe('\u{1F4C8}'.repeat(80));
+  });
+
   it('shows the upload run only when files are queued, and never an "initializing" step', async () => {
     const user = userEvent.setup();
     const onCreate = vi.fn().mockResolvedValue(LIVE_CREATED);

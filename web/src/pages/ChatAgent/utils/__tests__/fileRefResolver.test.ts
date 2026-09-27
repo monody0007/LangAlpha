@@ -72,6 +72,14 @@ describe('collectRecentWritePaths', () => {
     ];
     expect(collectRecentWritePaths(messages)).toEqual(['results/b.md', 'results/a.md']);
   });
+
+  it('names a write under the workspace folder by its path inside it', () => {
+    const messages: TurnMessage[] = [
+      { toolCallProcesses: { a: call('Write', '/home/workspace/Research/results/a.md', 1) } },
+      { toolCallProcesses: { b: call('Edit', '/home/workspace/research-ab12/results/b.md', 1) } },
+    ];
+    expect(collectRecentWritePaths(messages, 'Research', ['research-ab12'])).toEqual(['results/b.md', 'results/a.md']);
+  });
 });
 
 /**

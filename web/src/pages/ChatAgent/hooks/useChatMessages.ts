@@ -2751,6 +2751,13 @@ export function useChatMessages(
     await streamFromCheckpoint(null, null, truncateIndex, null, modelOptions, true);
   }, [messages, streamFromCheckpoint]);
 
+  // A PTC run's sandbox acquisition moves a renamed workspace's folder, which
+  // rewrites the dir_name and previous_dir_names that agent paths fold
+  // against; the cached row would keep the old folder for minutes.
+  const refreshWorkspaceFolder = agentMode === 'ptc' && workspaceId
+    ? () => { void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.detail(workspaceId) }); }
+    : null;
+
   /** Cross-lane callbacks for the live event router; direct references, so
    * this literal must stay below every referent. */
   const streamRouterDeps: StreamRouterDeps = {
@@ -2763,6 +2770,7 @@ export function useChatMessages(
     releaseStreamOwnership,
     attachSubagentMux,
     setMarketWatch,
+    refreshWorkspaceFolder,
   };
 
   /** Composition-level callbacks for the recovery/ownership lifecycle; direct
@@ -2779,6 +2787,7 @@ export function useChatMessages(
     clearModelStatus,
     finalizePendingTodos,
     refreshComputerAfterTurn: agentMode === 'ptc' ? () => refreshComputersAfterTurn(queryClient) : null,
+    refreshWorkspaceFolder,
     reportBackWatch,
   };
 

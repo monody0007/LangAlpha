@@ -26,7 +26,9 @@ import { isArchivedThreadsKey, patchThreadRows } from '@/lib/threadRowActions';
 import { isCacheOnlyMeta, queryKeys } from '@/lib/queryKeys';
 import { resetNavPrefs, setNavPrefs } from '../../utils/navPrefs';
 
-vi.mock('../../utils/api', () => ({
+vi.mock('../../utils/api', async () => ({
+  // A failed rename is told in a toast, which reads the error for real.
+  ...(await vi.importActual<typeof import('../../utils/api/errors')>('../../utils/api/errors')),
   getWorkspaces: vi.fn(),
   getWorkspaceThreads: vi.fn(),
   reorderWorkspaces: vi.fn(),
@@ -34,7 +36,10 @@ vi.mock('../../utils/api', () => ({
   updateThread: vi.fn(),
 }));
 
+vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
+
 import { getWorkspaces, getWorkspaceThreads, reorderWorkspaces, updateWorkspace, updateThread } from '../../utils/api';
+import { toast } from '@/components/ui/use-toast';
 
 const mockGetWorkspaces = getWorkspaces as Mock;
 const mockGetWorkspaceThreads = getWorkspaceThreads as Mock;
@@ -818,6 +823,30 @@ describe('useNavigationData — pin & rename workspace', () => {
     });
 
     expect(byId('ws-1')?.name).toBe('Alpha');
+  });
+
+  it('says why a rename was refused, since the inline field has already closed', async () => {
+    const { result, byId } = setup();
+    await waitFor(() => expect(result.current.workspaces.length).toBe(2));
+    mockUpdateWorkspace.mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 409'), {
+      response: {
+        status: 409,
+        data: { detail: { code: 'workspace_name_taken', message: 'taken', name: 'Beta', workspace_id: 'ws-2' } },
+      },
+    }));
+
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.renameWorkspace('ws-1', 'beta');
+    });
+
+    expect(ok).toBe(false);
+    expect(byId('ws-1')?.name).toBe('Alpha');
+    expect(toast).toHaveBeenCalledWith({
+      variant: 'destructive',
+      title: 'Could not rename workspace',
+      description: 'A workspace named "Beta" already exists. Choose another name.',
+    });
   });
 });
 

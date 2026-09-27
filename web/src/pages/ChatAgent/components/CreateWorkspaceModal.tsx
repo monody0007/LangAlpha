@@ -7,6 +7,7 @@ import { formatBytes } from '@/lib/format';
 import type { Workspace } from '@/types/api';
 import { startWorkspace, uploadWorkspaceFile } from '../utils/api';
 import { denialMessage } from '../utils/denialMessage';
+import { clampWorkspaceName } from '../utils/workspaceName';
 import type { NewWorkspace } from '../hooks/useCreateWorkspace';
 import './CreateWorkspaceModal.css';
 
@@ -353,7 +354,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
             <Input
               type="text"
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => setName(clampWorkspaceName(e.target.value))}
               placeholder={t('workspace.enterWorkspaceName')}
               className="w-full"
               style={{

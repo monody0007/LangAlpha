@@ -886,6 +886,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isMobile,
     workspaceId,
     workspaceDirName: workspaceRecord?.dir_name,
+    previousDirNames: workspaceRecord?.previous_dir_names,
     threadId: panelThreadId,
     isActive,
     containerRef,
@@ -1507,6 +1508,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                           feedbackByTurn={feedbackByTurn}
                           flashContext={flashContext}
                           workspaceDirName={workspaceRecord?.dir_name}
+                          previousDirNames={workspaceRecord?.previous_dir_names}
                         />
                       </MessageActionsProvider>
                     </div>
@@ -1586,6 +1588,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                               isSubagentView={true}
                               isLoading={subagentTurnLive}
                               workspaceDirName={workspaceRecord?.dir_name}
+                              previousDirNames={workspaceRecord?.previous_dir_names}
                             />
                           </MessageActionsProvider>
                         </div>

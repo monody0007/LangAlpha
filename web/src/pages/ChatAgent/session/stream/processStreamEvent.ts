@@ -52,6 +52,9 @@ export interface StreamRouterDeps {
   releaseStreamOwnership: () => void;
   attachSubagentMux: (tid: string, processEvent: (event: SSEEvent) => void, snapshotAtMs?: number) => void;
   setMarketWatch: React.Dispatch<React.SetStateAction<MarketWatchState | null>>;
+  /** Re-read the workspace row, whose folder a run's sandbox acquisition may
+   * have moved; null where a run acquires none (flash). */
+  refreshWorkspaceFolder: (() => void) | null;
 }
 
 /**
@@ -151,6 +154,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       if (event.run_id) {
         rt.currentRunIdRef.current = event.run_id;
       }
+      // The server writes this only after the run has its sandbox, so any
+      // folder move that acquisition made is already on the row.
+      if (deps.refreshWorkspaceFolder) deps.refreshWorkspaceFolder();
       return;
     }
 
