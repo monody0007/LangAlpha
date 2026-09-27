@@ -71,7 +71,7 @@ def sync_lock():
     """Restore serializes on a Postgres advisory lock; unit tests have no DB."""
 
     @asynccontextmanager
-    async def _lock(_workspace_id):
+    async def _lock(_workspace_id, conn=None):
         yield "conn"
 
     with patch("src.server.services.persistence.restore.workspace_sync_lock", _lock):
@@ -370,7 +370,7 @@ async def test_a_lock_wait_that_times_out_still_flags_the_workspace(restore_flag
     starts as an empty mirror of a full manifest and the next sync prunes it."""
 
     @asynccontextmanager
-    async def _busy(_workspace_id):
+    async def _busy(_workspace_id, conn=None):
         raise WorkspaceSyncBusy("held")
         yield  # pragma: no cover
 
@@ -397,7 +397,7 @@ async def test_maybe_restore_counts_structural_rows_as_files_to_restore(mock_get
         await restore.maybe_restore("ws-1", sandbox, layout=LAYOUT)
 
     restore_fn.assert_awaited_once_with(
-        "ws-1", sandbox, expected_sandbox_id=sandbox.sandbox_id, layout=LAYOUT
+        "ws-1", sandbox, expected_sandbox_id=sandbox.sandbox_id, layout=LAYOUT, conn=None
     )
     assert mock_get.await_args.kwargs["all_kinds"] is True
 
@@ -470,7 +470,7 @@ async def test_the_flag_is_raised_before_the_lock_is_requested(restore_flag):
     restore_flag.side_effect = lambda *a, **k: order.append(f"flag={a[1]}") or True
 
     @asynccontextmanager
-    async def _busy(_workspace_id):
+    async def _busy(_workspace_id, conn=None):
         order.append("lock")
         raise WorkspaceSyncBusy("held")
         yield  # pragma: no cover
@@ -541,7 +541,7 @@ async def test_a_flag_write_that_fails_aborts_before_the_lock(restore_flag):
     requested = []
 
     @asynccontextmanager
-    async def _lock(_workspace_id):
+    async def _lock(_workspace_id, conn=None):
         requested.append(True)
         yield "conn"
 
@@ -583,7 +583,7 @@ async def test_a_raise_that_lands_nowhere_aborts_as_identity_lost(restore_flag):
     requested = []
 
     @asynccontextmanager
-    async def _lock(_workspace_id):
+    async def _lock(_workspace_id, conn=None):
         requested.append(True)
         yield "conn"
 

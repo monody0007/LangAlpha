@@ -35,6 +35,7 @@ from src.server.app.status_stream import (
     status_event_stream,
 )
 from src.server.database.workspace import WorkspaceBusyError
+from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.database.workspace_names import (
     WorkspaceNameInvalid,
     WorkspaceNameTaken,
@@ -433,6 +434,14 @@ async def update_workspace(
         raise
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         raise _name_error(e) from None
+    except WorkspaceFolderMoving:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_folder_moving",
+                "message": "This workspace's folder is being moved. Try renaming it again in a moment.",
+            },
+        ) from None
     except Exception as e:
         logger.exception(f"Error updating workspace {workspace_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update workspace")

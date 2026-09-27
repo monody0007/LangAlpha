@@ -14,6 +14,7 @@ from src.server.services.workspace_entitlements import WorkspaceEntitlementsMixi
 
 from src.server.services.computer_manager._types import MachineState
 from src.server.services.computer_manager._machine_backup import MachineBackupMixin
+from src.server.services.computer_manager._folders import FolderSettleMixin
 from src.server.services.computer_manager._lifecycle import SessionLifecycleMixin
 from src.server.services.computer_manager._machines import MachineLifecycleMixin
 from src.server.services.computer_manager._mcp import McpSecretsMixin
@@ -29,6 +30,7 @@ class ComputerManager(
     SessionCacheMixin,
     ProviderMixin,
     ProvisioningMixin,
+    FolderSettleMixin,
     MachineBackupMixin,
     McpSecretsMixin,
     SessionLifecycleMixin,

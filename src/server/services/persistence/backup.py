@@ -103,7 +103,7 @@ def _has_ancestor_in(path: str, names: set[str]) -> bool:
 
 
 async def sync_to_db(
-    workspace_id: str, sandbox: Any, *, layout: WorkspaceLayout
+    workspace_id: str, sandbox: Any, *, layout: WorkspaceLayout, conn=None
 ) -> SyncResult:
     """
     Snapshot workspace files from the sandbox into the manifest.
@@ -121,13 +121,14 @@ async def sync_to_db(
     Serialized per workspace across workers: the diff decides what to write
     from a read taken before the scan, so two overlapping passes would let
     the older one's upsert land last and reinstate what the newer pass had
-    already recorded.
+    already recorded. A caller holding a session passes it, and the lock and
+    the pass run on it rather than on a second pool slot.
 
     Returns:
         What the pass saved, and every file it could not
     """
     try:
-        async with workspace_sync_lock(workspace_id) as conn:
+        async with workspace_sync_lock(workspace_id, conn=conn) as conn:
             result = await _sync_locked(workspace_id, sandbox, conn, layout)
             # Last, under the same lock: a mark says everything changed before
             # it is saved, so it moves only once the writes above landed, the

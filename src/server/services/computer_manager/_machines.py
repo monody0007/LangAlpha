@@ -32,7 +32,8 @@ from src.server.database.computer import (
     update_computer_activity,
     update_computer_status,
 )
-from src.server.database.sql_fences import workspace_dir_name
+from src.server.database.workspace_folders import folder_allocation, takes_name_folders
+from src.server.database.workspace_names import candidate_dir_names
 from src.server.database.workspace import (
     bind_workspace_to_computer,
     get_live_workspace_ids_for_computer,
@@ -208,25 +209,34 @@ class MachineLifecycleMixin:
                 minted_here = str(computer.get("computer_id")) == candidate_id
         computer_id = str(computer["computer_id"])
 
-        for attempt in range(3):
-            try:
-                bound = await bind_workspace_to_computer(
+        async with folder_allocation(computer_id) as conn:
+            folders = (
+                [workspace["dir_name"]]
+                if workspace.get("dir_name")
+                else candidate_dir_names(
+                    workspace.get("name"),
                     workspace_id,
-                    computer_id,
-                    expected_computer_id=None,
-                    dir_name=workspace.get("dir_name")
-                    or workspace_dir_name(
-                        workspace.get("name"), workspace_id, hex_chars=4 + 4 * attempt
-                    ),
+                    await get_workspace_dir_names_for_computer(computer_id, conn=conn),
+                    own_folder=takes_name_folders(computer),
                 )
-                break
-            except WorkspaceDirNameTaken:
-                logger.info(
-                    f"Folder for workspace {workspace_id} is taken on computer "
-                    f"{computer_id}; re-slugging"
-                )
-        else:
-            bound = None
+            )
+            for dir_name in folders:
+                try:
+                    bound = await bind_workspace_to_computer(
+                        workspace_id,
+                        computer_id,
+                        expected_computer_id=None,
+                        dir_name=dir_name,
+                        conn=conn,
+                    )
+                    break
+                except WorkspaceDirNameTaken:
+                    logger.info(
+                        f"Folder for workspace {workspace_id} is held on computer "
+                        f"{computer_id}; placing it until the folder frees"
+                    )
+            else:
+                bound = None
 
         if bound is None:
             if minted_here:
@@ -664,6 +674,11 @@ class MachineLifecycleMixin:
 
             restored_projects: list[ComputerBinding] = []
             if not reconnected:
+                # Nothing is on this disk yet, so renamed projects restore
+                # straight into the folder their name gives them.
+                await self._settle_folders(
+                    computer_id, runtime, root=computer.get("root_dir"), ignore_busy=True
+                )
                 for workspace_id in await get_live_workspace_ids_for_computer(computer_id):
                     project_binding = await self.resolve_binding(workspace_id)
                     restored_projects.append(project_binding)

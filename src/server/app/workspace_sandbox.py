@@ -550,6 +550,8 @@ async def _get_full_sandbox_stats(
 ) -> SandboxStatsResponse:
     """Get full sandbox stats for running workspaces (disk, packages, MCP, skills)."""
     session, sandbox = await _get_sandbox(workspace_id, x_user_id)
+    # The acquisition may have moved the folder the row was read with.
+    workspace = await db_get_workspace(workspace_id) or workspace
     view = WorkspaceManager.get_instance().tool_view(session, workspace_id)
     mcp_servers = list(view.mcp_registry.connectors) if view.mcp_registry else []
     provider_kind = await _provider_kind(workspace_id)

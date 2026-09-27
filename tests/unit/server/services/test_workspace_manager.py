@@ -16,7 +16,9 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.core.sandbox.runtime import SandboxFailureKind, SandboxGoneError
+from src.server.database.workspace_folders import FolderHold, WorkspaceFolderMoving
 from src.server.models.computer import ComputerStatus
 from src.server.services.computer_errors import SpecChangeLostError
 
@@ -26,7 +28,11 @@ from src.server.services.computer_errors import SpecChangeLostError
 # import would land while the patch is live and keep the mock for the rest of
 # the session.
 from src.server.services import platform_secret_rollout  # noqa: F401
-from src.server.services.persistence.sync_result import SyncResult, UnsavedFile
+from src.server.services.persistence.sync_result import (
+    BackupIncomplete,
+    SyncResult,
+    UnsavedFile,
+)
 from src.server.services.workspace_manager import WorkspaceManager
 from tests.computer_manager_patch import cm_patch
 from tests.unit.server.services.conftest import (
@@ -1206,6 +1212,84 @@ class TestBackupFilesStrict:
 
         identity.assert_not_awaited()
         mock_file_svc.sync_to_db.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{_PROVISIONING}.FilePersistenceService")
+    async def test_the_scan_walks_the_folder_read_under_the_folder_hold(self, mock_file_svc):
+        """A settle on any worker moves only a folder it can hold. The sweep read
+        its layout before that, so a folder that landed since is read again under
+        the hold, and the scan ends before the hold lets go."""
+        wm = WorkspaceManager(_make_config())
+        ws_id = str(uuid.uuid4())
+        wm._machine(_STUB_COMPUTER_ID).session = _make_mock_session()
+        events = []
+
+        @asynccontextmanager
+        async def hold(workspace_id):
+            events.append("hold")
+            yield FolderHold(workspace_id, "held-conn")
+            events.append("release")
+
+        async def read_folder(_workspace_id, *, conn=None):
+            events.append(f"read on {conn}")
+            return "Macro"
+
+        async def sync(_workspace_id, _sandbox, *, layout, conn=None):
+            events.append(f"sync {layout.root}/{layout.dir_name} on {conn}")
+            return SyncResult(synced=1)
+
+        mock_file_svc.sync_to_db = AsyncMock(side_effect=sync)
+        with (
+            patch(f"{_PROVISIONING}.workspace_folder_in_use", hold),
+            patch(f"{_PROVISIONING}.db_get_workspace_dir_name", read_folder),
+        ):
+            assert await self._backup(
+                wm, ws_id, expected_sandbox_id="sandbox-abc",
+                layout=WorkspaceLayout("/persisted/root", "Research"),
+            )
+
+        # One session carries the read and the sync lock: a backup holding a
+        # slot while it waits on the pool for a second can starve the pool.
+        assert events == [
+            "hold", "read on held-conn", "sync /persisted/root/Macro on held-conn", "release"
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("moving", ["staged", "held by a settle"])
+    @patch(f"{_PROVISIONING}.FilePersistenceService")
+    async def test_a_folder_a_settle_is_moving_is_not_reported_mirrored(
+        self, mock_file_svc, moving
+    ):
+        """Scanned mid-move, the folder reads as missing, which the sync reports
+        as nothing to mirror: a strict caller would then destroy the sandbox
+        holding every file written since the last backup."""
+        wm = WorkspaceManager(_make_config())
+        ws_id = str(uuid.uuid4())
+        wm._machine(_STUB_COMPUTER_ID).session = _make_mock_session()
+        mock_file_svc.sync_to_db = AsyncMock(return_value=SyncResult(root_missing=True))
+
+        @asynccontextmanager
+        async def held_by_a_settle(workspace_id):
+            raise WorkspaceFolderMoving(workspace_id)
+            yield
+
+        with ExitStack() as stack:
+            if moving == "staged":
+                stack.enter_context(patch(
+                    f"{_PROVISIONING}.db_get_workspace_dir_name",
+                    AsyncMock(return_value=f"_internal/moving/{ws_id}"),
+                ))
+            else:
+                stack.enter_context(
+                    patch(f"{_PROVISIONING}.workspace_folder_in_use", held_by_a_settle)
+                )
+            assert not await self._backup(wm, ws_id, expected_sandbox_id="sandbox-abc")
+            with pytest.raises(BackupIncomplete, match="moving"):
+                await self._backup(
+                    wm, ws_id, expected_sandbox_id="sandbox-abc", strict=True
+                )
+
+        mock_file_svc.sync_to_db.assert_not_awaited()
 
     @pytest.mark.asyncio
     @patch(f"{_PROVISIONING}.FilePersistenceService")
@@ -6163,6 +6247,72 @@ class TestRestoreGuard:
         assert layout.dir_name == "test-ab12"
 
     @pytest.mark.asyncio
+    async def test_a_restore_check_fills_the_folder_read_under_the_hold(self):
+        """Into a folder a settle moved meanwhile, a restore recreates the old one
+        and marks itself complete there, and the next backup of the new one
+        prunes what never arrived. The binding may predate a settle."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        events = []
+
+        @asynccontextmanager
+        async def hold(workspace_id):
+            events.append("hold")
+            try:
+                yield FolderHold(workspace_id, "held-conn")
+            finally:
+                events.append("release")
+
+        async def read_folder(_workspace_id, **_kw):
+            events.append("read")
+            return "Macro"
+
+        async def maybe_restore(_workspace_id, _sandbox, *, layout, conn=None):
+            events.append(f"restore {layout.dir_name} on {conn}")
+
+        with (
+            patch(f"{_PROVISIONING}.workspace_folder_in_use", hold),
+            patch(f"{_PROVISIONING}.db_get_workspace_dir_name", read_folder),
+            patch(f"{_PROVISIONING}.FilePersistenceService.maybe_restore", maybe_restore),
+        ):
+            assert await manager._maybe_restore_files(
+                _binding("ws-1", dir_name="Research"), MagicMock()
+            )
+
+        assert events == ["hold", "read", "restore Macro on held-conn", "release"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("moving", ["staged", "held by a settle"])
+    async def test_a_folder_a_settle_is_moving_is_not_restored_into(self, moving):
+        """Unrestored, the attachment stays unrecorded and the next acquisition
+        retries once the folder has landed."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        restore = AsyncMock()
+
+        @asynccontextmanager
+        async def held_by_a_settle(workspace_id):
+            raise WorkspaceFolderMoving(workspace_id)
+            yield
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(f"{_PROVISIONING}.FilePersistenceService.maybe_restore", restore)
+            )
+            if moving == "staged":
+                stack.enter_context(patch(
+                    f"{_PROVISIONING}.db_get_workspace_dir_name",
+                    AsyncMock(return_value="_internal/moving/ws-1"),
+                ))
+            else:
+                stack.enter_context(
+                    patch(f"{_PROVISIONING}.workspace_folder_in_use", held_by_a_settle)
+                )
+            assert not await manager._maybe_restore_files(
+                _binding("ws-1", dir_name="Research"), MagicMock()
+            )
+
+        restore.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @patch(f"{_LIFECYCLE}.update_workspace_status", new_callable=AsyncMock)
     @cm_patch("SessionManager")
     @cm_patch("db_get_workspace")
@@ -6295,6 +6445,308 @@ class TestRestoreGuard:
             )
 
         assert order == ["bind", "reconcile"]
+
+
+class TestGeneratedContentGoesToTheHeldFolder:
+    """An acquisition resolves its binding before a settle on any worker may move
+    the folder, and /start or a file route has no run that settle counts as busy.
+    The asset sync (tool overlay, folder dirs) and the skill pass write into the
+    folder read under the hold, never the binding's."""
+
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+
+    def teardown_method(self):
+        WorkspaceManager.reset_instance()
+
+    @staticmethod
+    def _hold(events, *, held_by_a_settle=False):
+        @asynccontextmanager
+        async def hold(workspace_id):
+            events.append("hold")
+            if held_by_a_settle:
+                raise WorkspaceFolderMoving(workspace_id)
+            try:
+                yield FolderHold(workspace_id, None)
+            finally:
+                events.append("release")
+
+        return hold
+
+    @staticmethod
+    def _read(events, folder):
+        async def read(_workspace_id, **_kw):
+            events.append("read")
+            return folder
+
+        return read
+
+    @staticmethod
+    def _folder_patches(stack, events, *, folder, held_by_a_settle=False):
+        hold = TestGeneratedContentGoesToTheHeldFolder._hold(
+            events, held_by_a_settle=held_by_a_settle
+        )
+        stack.enter_context(patch(f"{_PROVISIONING}.workspace_folder_in_use", hold))
+        stack.enter_context(patch(
+            f"{_PROVISIONING}.db_get_workspace_dir_name",
+            TestGeneratedContentGoesToTheHeldFolder._read(events, folder),
+        ))
+
+    @staticmethod
+    def _asset_sync(events):
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        manager._vault_payloads = AsyncMock(return_value=("user-1", {"ws-1": {}}))
+        manager._stamp_layout_version = AsyncMock()
+        manager._stamp_mcp_config_version = AsyncMock()
+        sandbox = MagicMock()
+
+        async def sync(**kwargs):
+            events.append(
+                f"sync {kwargs['project'].dir_name} (owner {kwargs['root_owner_dir_name']})"
+            )
+            return SimpleNamespace(layout_version=4)
+
+        sandbox.sync_sandbox_assets = AsyncMock(side_effect=sync)
+        return manager, sandbox
+
+    @staticmethod
+    def _asset_sync_reads(stack):
+        stack.enter_context(patch(
+            f"{_PROVISIONING}.sandbox_skill_sync_params", AsyncMock(return_value={})
+        ))
+        stack.enter_context(patch(
+            f"{_PROVISIONING}.get_workspace_dir_names_for_computer",
+            AsyncMock(return_value=("Macro",)),
+        ))
+        stack.enter_context(patch(f"{_PROVISIONING}.get_computer", AsyncMock(return_value=None)))
+
+    @pytest.mark.asyncio
+    async def test_the_asset_sync_builds_the_overlay_in_the_folder_read_under_the_hold(self):
+        """Built through the old folder, the overlay recreates it and stamps this
+        claim current in the tool ledger, so the folder that landed keeps its
+        stale tools and no later sync owes it the new ones."""
+        events = []
+        manager, sandbox = self._asset_sync(events)
+
+        with ExitStack() as stack:
+            self._asset_sync_reads(stack)
+            self._folder_patches(stack, events, folder="Macro")
+            result = await manager._sync_sandbox_assets(
+                _binding("ws-1", dir_name="Research"), "user-1", sandbox
+            )
+
+        assert result is not None
+        assert events == ["hold", "read", "sync Macro (owner Macro)", "release"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("moving", ["staged", "held by a settle"])
+    async def test_a_folder_a_settle_is_moving_gets_no_asset_sync(self, moving):
+        """Staged, a write makes a folder the next settle cannot tell from the one
+        being moved; held past the wait, a settle is moving it now. The leg reads
+        as failed, and the next acquisition's sync finds the ledger behind."""
+        events = []
+        manager, sandbox = self._asset_sync(events)
+
+        with ExitStack() as stack:
+            self._asset_sync_reads(stack)
+            self._folder_patches(
+                stack, events, folder="_internal/moving/ws-1",
+                held_by_a_settle=moving == "held by a settle",
+            )
+            result = await manager._sync_sandbox_assets(
+                _binding("ws-1", dir_name="Research"), "user-1", sandbox
+            )
+
+        assert result is None
+        sandbox.sync_sandbox_assets.assert_not_awaited()
+        manager._stamp_layout_version.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("folder", ["Macro", None])
+    async def test_the_skill_pass_reconciles_the_folder_read_under_the_hold(self, folder):
+        """With no folder the pass is handed none, so the service refuses it
+        rather than naming the computer root, whose prune reaches siblings."""
+        events = []
+        manager = WorkspaceManager.get_instance(config=_make_config())
+
+        async def reconcile(_sandbox, *, user_id, workspace_id, source, project=None):
+            events.append(f"reconcile {project.dir_name if project else None}")
+
+        with ExitStack() as stack:
+            self._folder_patches(stack, events, folder=folder)
+            stack.enter_context(patch(
+                "src.server.services.computer_manager._mcp.reconcile_workspace_skills",
+                reconcile,
+            ))
+            await manager._reconcile_skills("ws-1", "user-1", MagicMock(), source="restart")
+
+        assert events == ["hold", "read", f"reconcile {folder}", "release"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("moving", ["staged", "held by a settle"])
+    async def test_a_folder_a_settle_is_moving_gets_no_skill_pass(self, moving):
+        """The pass's first script creates its skill directory. Under a staged
+        row that makes the staging folder, which the next settle lands in place
+        of the content still at the old name. Skipped, never raised: the
+        acquisition does not fail on a skill pass."""
+        events = []
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        reconcile = AsyncMock()
+
+        with ExitStack() as stack:
+            self._folder_patches(
+                stack, events, folder="_internal/moving/ws-1",
+                held_by_a_settle=moving == "held by a settle",
+            )
+            stack.enter_context(patch(
+                "src.server.services.computer_manager._mcp.reconcile_workspace_skills",
+                reconcile,
+            ))
+            await manager._reconcile_skills("ws-1", "user-1", MagicMock(), source="restart")
+
+        reconcile.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("folder", "reconciled"),
+        [("Macro", ["reconcile Macro"]), ("_internal/moving/ws-1", [])],
+    )
+    async def test_a_skill_mutation_reconciles_the_folder_read_under_the_hold(
+        self, folder, reconciled
+    ):
+        """A skill added while a failed settle left the row staged must not reach
+        the staging folder any more than the acquisition's own pass does."""
+        events = []
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        manager.get_session_if_ready = MagicMock(return_value=MagicMock())
+
+        async def reconcile(_sandbox, *, user_id, workspace_id, source, project=None):
+            events.append(f"reconcile {project.dir_name if project else None}")
+
+        with ExitStack() as stack:
+            self._folder_patches(stack, events, folder=folder)
+            stack.enter_context(patch(
+                "src.server.services.computer_manager._mcp.db_get_workspace",
+                AsyncMock(return_value={"sandbox_id": "sbx-1"}),
+            ))
+            stack.enter_context(patch(
+                "src.server.services.computer_manager._mcp.reconcile_workspace_skills",
+                reconcile,
+            ))
+            await manager.reconcile_skills_if_running("ws-1", "user-1", source="create")
+
+        assert events == ["hold", "read", *reconciled, "release"]
+
+    @staticmethod
+    def _counted_holds(events):
+        """A hold with a session of its own, and a folder read that says whether
+        it ran on the session of the hold it is under."""
+        sessions = []
+
+        @asynccontextmanager
+        async def hold(workspace_id):
+            sessions.append(object())
+            events.append(f"hold {workspace_id}")
+            try:
+                yield FolderHold(workspace_id, sessions[-1])
+            finally:
+                events.append("release")
+
+        async def read(_workspace_id, *, conn=None):
+            on_hold = bool(sessions) and conn is sessions[-1]
+            events.append("read on the hold" if on_hold else "read on another slot")
+            return "Macro"
+
+        async def restore(_workspace_id, _sandbox, *, layout, conn=None):
+            on_hold = bool(sessions) and conn is sessions[-1]
+            where = "on the hold" if on_hold else "on another slot"
+            events.append(f"restore {layout.dir_name} {where}")
+
+        return hold, read, restore
+
+    @pytest.mark.asyncio
+    async def test_cold_attach_takes_one_folder_hold(self):
+        """After a deploy every attach is cold, so the restore and the overlay
+        both run. A hold of their own inside the acquisition's is a second pooled
+        connection taken while the first is kept, and concurrent attaches then
+        fill the pool with holders each waiting for one more."""
+        events = []
+        manager, sandbox = self._asset_sync(events)
+        sandbox.runtime = None
+        sandbox.sandbox_id = "sandbox-abc"
+        sandbox._ensure_workspace_dirs = AsyncMock()
+        sandbox.workspace_overlay_missing = AsyncMock(side_effect=[True, False])
+        session = SimpleNamespace(sandbox=sandbox)
+        manager._acquire_session = AsyncMock(return_value=session)
+        manager.resolve_binding = AsyncMock(return_value=_binding("ws-1", dir_name="Macro"))
+        manager._apply_session_mcp = AsyncMock()
+        manager._workspace_tool_view = MagicMock(return_value=object())
+        manager._mint_sandbox_tokens = AsyncMock(return_value={})
+        hold, read, restore = self._counted_holds(events)
+
+        with ExitStack() as stack:
+            self._asset_sync_reads(stack)
+            for module in (_PROVISIONING, "src.server.services.workspace_manager"):
+                stack.enter_context(patch(f"{module}.workspace_folder_in_use", hold))
+            stack.enter_context(patch(f"{_PROVISIONING}.db_get_workspace_dir_name", read))
+            stack.enter_context(
+                patch(f"{_PROVISIONING}.FilePersistenceService.maybe_restore", restore)
+            )
+            got = await manager.get_session_for_workspace("ws-1", user_id="user-1")
+
+        assert got is session
+        assert events == [
+            "hold ws-1",
+            "read on the hold", "restore Macro on the hold",
+            "read on the hold", "sync Macro (owner Macro)",
+            "release",
+        ]
+        assert ("ws-1", "sandbox-abc") in manager._projects_attached
+
+    @pytest.mark.asyncio
+    async def test_unheld_helpers_still_take_their_own_hold(self):
+        """The refresh route, provisioning's restore and the discovery task's
+        sync run under no caller's hold, so each holds the folder it writes into
+        and reads it on that hold."""
+        events = []
+        manager, sandbox = self._asset_sync(events)
+        manager.resolve_binding = AsyncMock(return_value=_binding("ws-1", dir_name="Research"))
+        manager._mint_sandbox_tokens = AsyncMock(return_value={})
+        hold, read, restore = self._counted_holds(events)
+
+        with ExitStack() as stack:
+            self._asset_sync_reads(stack)
+            stack.enter_context(patch(f"{_PROVISIONING}.workspace_folder_in_use", hold))
+            stack.enter_context(patch(f"{_PROVISIONING}.db_get_workspace_dir_name", read))
+            stack.enter_context(
+                patch(f"{_PROVISIONING}.FilePersistenceService.maybe_restore", restore)
+            )
+            assert await manager.refresh_project_assets("ws-1", "user-1", sandbox)
+            assert await manager._maybe_restore_files(
+                _binding("ws-1", dir_name="Research"), sandbox
+            )
+
+        assert events == [
+            "hold ws-1", "read on the hold", "sync Macro (owner Macro)", "release",
+            "hold ws-1", "read on the hold", "restore Macro on the hold", "release",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_hold_on_another_folder_covers_nothing(self):
+        """Taken for one workspace, a hold keeps no settle off a sibling's folder."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        read = AsyncMock()
+
+        with (
+            patch(f"{_PROVISIONING}.db_get_workspace_dir_name", read),
+            pytest.raises(ValueError, match="cannot cover ws-2"),
+        ):
+            async with manager._held_workspace_folder(
+                "ws-2", hold=FolderHold("ws-1", object())
+            ):
+                pass
+
+        read.assert_not_awaited()
 
 
 class TestSupersededResolve:

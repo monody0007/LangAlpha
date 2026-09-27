@@ -8,8 +8,6 @@ would retarget a mutating job at whatever ``.env`` is on disk.
 from __future__ import annotations
 
 import hashlib
-import re
-from typing import Optional
 
 # Share the bind fence across entry points. A whitelist could reject future
 # transitional states and make losing binders destroy valid provisions.
@@ -71,25 +69,6 @@ def computer_cols(alias: str = "") -> str:
 
 # One column list keeps every dict_row result shape consistent.
 COMPUTER_COLS = computer_cols()
-
-# migration 046's dir_name column width. The separator and the hex suffix come
-# out of the slug's budget, so widening the suffix cannot overflow the column.
-DIR_NAME_MAX = 64
-
-
-def workspace_dir_name(
-    name: Optional[str], workspace_id: str, *, hex_chars: int = 4
-) -> str:
-    """Match workspace.py's _DIR_NAME_SQL before a row exists; widen hex_chars on a taken folder.
-
-    The slug pays for the suffix, so a re-slug cannot overflow dir_name and turn
-    a folder collision into a truncation error the UniqueViolation loop misses.
-    """
-    slug_cap = DIR_NAME_MAX - 1 - hex_chars
-    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower())[:slug_cap].strip("-")
-    digest = hashlib.md5(str(workspace_id).encode("utf-8")).hexdigest()
-    return f"{slug or 'workspace'}-{digest[:hex_chars]}"
-
 
 def advisory_key(domain: str, *parts: str) -> int:
     """sha256("domain|part|part")[:8] as a signed bigint for pg advisory locks."""

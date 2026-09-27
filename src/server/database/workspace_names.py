@@ -108,6 +108,39 @@ def placeholder_dir_name(name: Optional[str], workspace_id: str, *, hex_chars: i
     return f"{_fit_bytes(base, FOLDER_NAME_MAX_BYTES - 1 - hex_chars)}-{digest}"
 
 
+#: Placeholder spellings a new folder tries after the name's own, each with a
+#: longer suffix, before the caller reports the folder taken.
+PLACEHOLDER_ATTEMPTS = 3
+
+
+def candidate_dir_name(name: Optional[str], workspace_id: str, attempt: int) -> str:
+    """The folder to try on ``attempt``: the name's own first, then placeholders."""
+    if attempt == 0:
+        try:
+            return workspace_folder_name(name)
+        except WorkspaceNameInvalid:
+            pass
+    return placeholder_dir_name(name, workspace_id, hex_chars=4 * max(1, attempt))
+
+
+def candidate_dir_names(
+    name: Optional[str], workspace_id: str, held: Iterable[str] = (), *, own_folder: bool = True
+) -> list[str]:
+    """Every candidate in order, less any folder ``held`` has under any case.
+
+    The folder index compares case, but a case-insensitive disk (a Docker work
+    dir bind-mounted from macOS) keeps "Research" and "research" as one folder,
+    so two rows would share its files and cleaning up one would take both.
+    Without ``own_folder`` only placeholders are offered.
+    """
+    folded = {folder.casefold() for folder in held}
+    candidates = (
+        candidate_dir_name(name, workspace_id, attempt)
+        for attempt in range(0 if own_folder else 1, PLACEHOLDER_ATTEMPTS + 1)
+    )
+    return [folder for folder in candidates if folder.casefold() not in folded]
+
+
 def suffixed_name(name: str, suffix: str) -> str:
     """``name`` plus ``suffix``, trimming the name so the result still fits.
 

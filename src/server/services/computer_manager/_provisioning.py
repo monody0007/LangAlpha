@@ -6,13 +6,14 @@ import asyncio
 import hashlib
 import json
 import logging
-import shlex
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
 from ptc_agent.config import AgentConfig
-from ptc_agent.core.paths import WorkspaceLayout, workspace_root
+from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.sandbox import assets as sandbox_assets
 from ptc_agent.core.sandbox.migration import LayoutMigrationError
@@ -20,7 +21,6 @@ from ptc_agent.core.sandbox.runtime import SandboxGoneError
 from ptc_agent.core.session import Session, SessionManager
 
 from src.server.database.computer import (
-    DEFAULT_ROOT_DIR,
     get_computer,
     stamp_computer_layout_version,
     stamp_computer_mcp_config_version,
@@ -28,8 +28,6 @@ from src.server.database.computer import (
     update_computer_status,
 )
 from src.server.database.workspace import (
-    complete_workspace_folder_cleanup,
-    defer_workspace_folder_cleanup,
     flag_sibling_restores_pending,
     get_workspace_dir_names_for_computer,
     get_workspace as db_get_workspace,
@@ -37,6 +35,12 @@ from src.server.database.workspace import (
     get_workspace_identity as db_get_workspace_identity,
     SandboxIdentityLostError,
     update_workspace_activity,
+)
+from src.server.database.workspace_folders import (
+    FolderHold,
+    WorkspaceFolderMoving,
+    is_top_level,
+    workspace_folder_in_use,
 )
 from src.server.models.computer import ComputerStatus
 from src.server.services.persistence.file import (
@@ -58,6 +62,25 @@ from src.server.services.computer_manager._types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _folder_hold(
+    workspace_id: str, hold: Optional[FolderHold]
+) -> AsyncIterator[FolderHold]:
+    """The caller's hold on this workspace's folder, else one taken here.
+
+    Passed down rather than found in a context variable, which a task spawned
+    under the hold would inherit and keep trusting after the holder let go."""
+    if hold is None:
+        async with workspace_folder_in_use(workspace_id) as own:
+            yield own
+        return
+    if hold.workspace_id != workspace_id:
+        raise ValueError(
+            f"A hold on the folder of {hold.workspace_id} cannot cover {workspace_id}"
+        )
+    yield hold
 
 
 class ProvisioningMixin:
@@ -101,76 +124,6 @@ class ProvisioningMixin:
                 durable_sandbox_id, delete=True, binding=binding
             )
 
-    async def _remove_workspace_folder(
-        self,
-        workspace_id: str,
-        workspace: Dict[str, Any],
-        computer: Dict[str, Any],
-    ) -> bool:
-        """Do not boot stopped machines just to remove mirrored, unreferenced files.
-
-        Recreation restores only live projects from the mirror, removing these
-        leftovers without an extra provider round trip."""
-        dir_name = (workspace.get("dir_name") or "").strip("/")
-        if not dir_name or "/" in dir_name or dir_name in (".", ".."):
-            # Without a project folder, the path is the machine runtime root: never unlink it.
-            return False
-        provider_ref = computer.get("provider_ref")
-        if not provider_ref or computer.get("status") != "running":
-            return False
-
-        binding = self._binding_from_computer(workspace_id, computer)
-        target = workspace_root(computer.get("root_dir") or DEFAULT_ROOT_DIR, dir_name)
-        try:
-            # The local handle may be stale or absent; address the durable machine ref.
-            async with self._detached_runtime(provider_ref, binding=binding) as runtime:
-                from src.server.services.egress.session_binding import refresh_computer_grant_map
-
-                try:
-                    await refresh_computer_grant_map(
-                        runtime,
-                        root=computer.get("root_dir") or DEFAULT_ROOT_DIR,
-                        computer_id=str(computer["computer_id"]),
-                        user_id=computer["user_id"],
-                    )
-                except Exception:
-                    logger.warning("Could not refresh egress map after workspace deletion", exc_info=True)
-                result = await runtime.exec(f"rm -rf {shlex.quote(target)}")
-                if result.exit_code != 0:
-                    raise RuntimeError(
-                        f"folder removal exited {result.exit_code}: {result.stdout}"
-                    )
-            await complete_workspace_folder_cleanup(
-                workspace_id,
-                computer_id=str(computer["computer_id"]),
-                dir_name=dir_name,
-            )
-            logger.info(
-                f"Removed folder {target} of workspace {workspace_id} from "
-                f"sandbox {provider_ref}"
-            )
-            return True
-        except Exception as e:
-            # The tombstoned workspace carries the durable retry claim. Touching
-            # it moves a broken candidate behind newer cleanup work.
-            try:
-                await defer_workspace_folder_cleanup(
-                    workspace_id,
-                    computer_id=str(computer["computer_id"]),
-                    dir_name=dir_name,
-                )
-            except Exception:
-                logger.warning(
-                    "Could not defer failed folder cleanup for workspace %s",
-                    workspace_id,
-                    exc_info=True,
-                )
-            logger.warning(
-                f"Could not remove folder {target} of workspace {workspace_id} "
-                f"from sandbox {provider_ref}: {e}"
-            )
-            return False
-
     def _forget_project(self, workspace_id: str) -> None:
         """The computer owns the session, metadata and lock; they outlive a project."""
         self._projects_attached = {
@@ -199,6 +152,8 @@ class ProvisioningMixin:
         sandbox: Any,
         reusing_sandbox: bool = False,
         force_refresh: bool = False,
+        *,
+        hold: Optional[FolderHold] = None,
     ) -> Any:
         """Upload this project's assets, returning the asset leg's result or None.
 
@@ -206,11 +161,16 @@ class ProvisioningMixin:
         stale tool module is not a reason to refuse a turn, but the refresh
         route answers on it. Layout failures always propagate because the
         project paths cannot be used until its files have moved.
+
+        The folder is not the binding's: an acquisition reads that before a
+        settle on another worker can move it. An overlay built through the old
+        folder recreates it and stamps this claim current in the tool ledger,
+        so the folder that landed keeps its stale tools with no sync owed.
+        A caller already holding the folder passes its ``hold``.
         """
         if not sandbox:
             return None
         workspace_id = binding.workspace_id
-        project = ProjectContext(workspace_id, binding.dir_name or "")
 
         skill_dirs = (
             self.config.skills.local_skill_dirs_with_sandbox()
@@ -247,22 +207,25 @@ class ProvisioningMixin:
             except Exception as exc:
                 raise LayoutMigrationError("Cannot identify sibling folders safely") from exc
             view = self._machine(binding.computer_id).tool_views.get(workspace_id)
-            with sandbox_assets.asset_sync_context(
-                mcp_registry=view.mcp_registry if view is not None else None,
-                mcp_servers=view.mcp_servers if view is not None else None,
-                vault_payloads=vault_payloads,
-            ):
-                result = await sandbox.sync_sandbox_assets(
-                    skill_dirs=skill_dirs,
-                    reusing_sandbox=reusing_sandbox,
-                    force_refresh=force_refresh,
-                    tokens=tokens or None,
-                    user_id=user_id,
-                    project=project,
-                    root_owner_dir_name=await self._layout_root_owner_dir(binding),
-                    workspace_dir_names=workspace_dirs,
-                    **user_skill_params,
-                )
+            async with self._held_workspace_folder(workspace_id, hold=hold) as dir_name:
+                with sandbox_assets.asset_sync_context(
+                    mcp_registry=view.mcp_registry if view is not None else None,
+                    mcp_servers=view.mcp_servers if view is not None else None,
+                    vault_payloads=vault_payloads,
+                ):
+                    result = await sandbox.sync_sandbox_assets(
+                        skill_dirs=skill_dirs,
+                        reusing_sandbox=reusing_sandbox,
+                        force_refresh=force_refresh,
+                        tokens=tokens or None,
+                        user_id=user_id,
+                        project=ProjectContext(workspace_id, dir_name or ""),
+                        root_owner_dir_name=await self._layout_root_owner_dir(
+                            replace(binding, dir_name=dir_name)
+                        ),
+                        workspace_dir_names=workspace_dirs,
+                        **user_skill_params,
+                    )
             claim = ProjectContext(workspace_id, "").claim
             sandbox.vault_secrets = dict(vault_payloads[claim])
             await self._stamp_layout_version(binding.computer_id, result)
@@ -275,7 +238,9 @@ class ProvisioningMixin:
         for result in results:
             if isinstance(result, LayoutMigrationError):
                 raise result
-            if isinstance(result, Exception):
+            if isinstance(result, WorkspaceFolderMoving):
+                logger.info(f"Asset sync for {workspace_id} waits for its folder to land")
+            elif isinstance(result, Exception):
                 logger.warning(f"Asset sync failed for {workspace_id}: {result}")
 
         total = (time.time() - _sync_t0) * 1000
@@ -305,7 +270,7 @@ class ProvisioningMixin:
             force_refresh=True,
         )
 
-    async def _workspace_folder(self, workspace_id: str) -> Optional[str]:
+    async def _workspace_folder(self, workspace_id: str, *, conn=None) -> Optional[str]:
         """Read the assigned folder afresh so layout migration cannot use stale state.
 
         Raises rather than answering None on a failed read: None spells "this
@@ -313,11 +278,26 @@ class ProvisioningMixin:
         to no computer, and on the backup path that spelling makes one
         project's scan claim its siblings' files."""
         try:
-            return await db_get_workspace_dir_name(workspace_id)
+            return await db_get_workspace_dir_name(workspace_id, conn=conn)
         except Exception as e:
             raise WorkspaceLayoutUnavailable(
                 f"Could not read the folder for workspace {workspace_id}: {e}"
             ) from e
+
+    @asynccontextmanager
+    async def _held_workspace_folder(
+        self, workspace_id: str, *, hold: Optional[FolderHold] = None
+    ) -> AsyncIterator[Optional[str]]:
+        """The folder to write generated content into, which no settle moves until exit.
+
+        Raises ``WorkspaceFolderMoving`` while a settle holds it or left it
+        staged: a file written to the staged path makes a folder the next
+        settle cannot tell from the one being moved."""
+        async with _folder_hold(workspace_id, hold) as held:
+            dir_name = await self._workspace_folder(workspace_id, conn=held.conn)
+            if dir_name and not is_top_level(dir_name):
+                raise WorkspaceFolderMoving(workspace_id)
+            yield dir_name
 
     async def _project_layout(
         self,
@@ -504,7 +484,7 @@ class ProvisioningMixin:
 
             # Reconcile after post_init restores the skill directories and ledger.
             await self._reconcile_skills(
-                binding, user_id, session.sandbox, source="provision"
+                binding.workspace_id, user_id, session.sandbox, source="provision"
             )
 
             sandbox_id = (
@@ -652,7 +632,8 @@ class ProvisioningMixin:
 
         A superseded session would destroy the good copy and miss live files.
         strict=True must abort destructive callers on incomplete backup;
-        expected_sandbox_id and layout avoid reads when the caller already holds them.
+        expected_sandbox_id and layout's root avoid reads when the caller already
+        holds them. The folder is always read again, under the folder hold.
         The machine is resolved here for a caller that holds only the project
         (the post-turn mirror), because the session and the fence are the
         machine's: requiring it of every caller made that one fail on its
@@ -692,15 +673,35 @@ class ProvisioningMixin:
             logger.warning(message)
             return False
 
+        root = layout.root if layout is not None else (
+            binding.root_dir if binding is not None else None
+        )
         try:
-            result = await FilePersistenceService.sync_to_db(
-                workspace_id,
-                session.sandbox,
-                layout=layout or await self._project_layout(
-                    workspace_id, computer_id,
-                    root=binding.root_dir if binding is not None else None,
-                ),
-            )
+            # A settle moves only a folder it can hold, so the folder read under
+            # this hold is the one the scan walks. Moved mid-scan, it would read
+            # as missing, which counts as mirrored.
+            # Its session carries the read and the sync lock, so a backup keeps
+            # one pool slot for the whole pass rather than two.
+            async with workspace_folder_in_use(workspace_id) as held:
+                dir_name = await self._workspace_folder(workspace_id, conn=held.conn)
+                if dir_name and not is_top_level(dir_name):
+                    # A move a settle could not finish: until the next one, the
+                    # content may be in any of three folders.
+                    raise WorkspaceFolderMoving(workspace_id)
+                result = await FilePersistenceService.sync_to_db(
+                    workspace_id,
+                    session.sandbox,
+                    layout=await self._project_layout(
+                        workspace_id, computer_id, dir_name=dir_name or "", root=root
+                    ),
+                    conn=held.conn,
+                )
+        except WorkspaceFolderMoving as e:
+            message = f"Folder of workspace {workspace_id} is moving; not backed up this pass"
+            if strict:
+                raise BackupIncomplete(f"{message}; aborting before sandbox teardown") from e
+            logger.warning(message)
+            return False
         except Exception as e:
             if strict:
                 raise BackupIncomplete(
@@ -828,20 +829,34 @@ class ProvisioningMixin:
         self,
         binding: ComputerBinding,
         sandbox: Any,
+        *,
+        hold: Optional[FolderHold] = None,
     ) -> bool:
-        """Completeness-guard failures must propagate to prevent destructive backups."""
+        """Completeness-guard failures must propagate to prevent destructive backups.
+
+        The folder is read again under the folder hold, as a backup's is: a
+        restore into a folder a settle moved meanwhile recreates the old one and
+        marks itself complete there, and a backup of the new one then prunes.
+        The restore runs on the hold's session: attaches that each held one
+        slot while waiting on the pool for a second could take every slot."""
         workspace_id = binding.workspace_id
         try:
-            await FilePersistenceService.maybe_restore(
-                workspace_id,
-                sandbox,
-                layout=await self._project_layout(
+            async with _folder_hold(workspace_id, hold) as held:
+                dir_name = await self._workspace_folder(workspace_id, conn=held.conn)
+                if dir_name and not is_top_level(dir_name):
+                    # Mid-move: the next acquisition restores once it lands.
+                    return False
+                await FilePersistenceService.maybe_restore(
                     workspace_id,
-                    binding.computer_id,
-                    dir_name=binding.dir_name,
-                    root=binding.root_dir,
-                ),
-            )
+                    sandbox,
+                    layout=await self._project_layout(
+                        workspace_id,
+                        binding.computer_id,
+                        dir_name=dir_name or "",
+                        root=binding.root_dir,
+                    ),
+                    conn=held.conn,
+                )
             return True
         except RestoreGuardUnavailable:
             raise
@@ -861,14 +876,20 @@ class ProvisioningMixin:
             logger.warning(f"Folder setup failed for {workspace_id}: {e}")
 
     async def _ensure_project_attached(
-        self, binding: ComputerBinding, session: Any, *, user_id: str | None = None
+        self,
+        binding: ComputerBinding,
+        session: Any,
+        *,
+        user_id: str | None = None,
+        hold: Optional[FolderHold] = None,
     ) -> None:
         """Machine startup prepares only its starter project, not every sibling.
 
         Every project on a machine needs the same three things regardless of
         which one provisioned it: a folder, its files, and its own tool
         overlay. Recheck the generated configuration on every acquire so a
-        deleted or damaged file is repaired even on a warm computer."""
+        deleted or damaged file is repaired even on a warm computer. The
+        restore and the overlay run under the caller's ``hold`` on the folder."""
         sandbox = getattr(session, "sandbox", None)
         if sandbox is None:
             return
@@ -877,11 +898,11 @@ class ProvisioningMixin:
         if key not in self._projects_attached:
             # Restore files before rebuilding the generated tool configuration.
             await self._ensure_workspace_dirs(workspace_id, sandbox, binding.dir_name)
-            restored = await self._maybe_restore_files(binding, sandbox)
+            restored = await self._maybe_restore_files(binding, sandbox, hold=hold)
         else:
             restored = True
         if not await self._ensure_project_tool_overlay(
-            binding, session, user_id=user_id
+            binding, session, user_id=user_id, hold=hold
         ):
             # Retry on the next acquire; MCP calls refuse an absent config.
             return
@@ -900,6 +921,7 @@ class ProvisioningMixin:
         session: Any,
         *,
         user_id: str | None = None,
+        hold: Optional[FolderHold] = None,
     ) -> bool:
         """Repair this project's config from its own resolved connector set."""
         sandbox = session.sandbox
@@ -934,7 +956,12 @@ class ProvisioningMixin:
                 )
                 return False
             result = await self._sync_sandbox_assets(
-                binding, user_id, sandbox, reusing_sandbox=True, force_refresh=True
+                binding,
+                user_id,
+                sandbox,
+                reusing_sandbox=True,
+                force_refresh=True,
+                hold=hold,
             )
             if result is None or await sandbox.workspace_overlay_missing(
                 workspace_id=workspace_id, dir_name=dir_name

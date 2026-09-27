@@ -14,6 +14,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+from ptc_agent.core.sandbox.runtime import SandboxTransientError
 from ptc_agent.core.session import Session
 
 from src.observability import safe_add, workspace_created
@@ -28,6 +29,12 @@ from src.server.database.workspace import (
     delete_workspace as db_delete_workspace,
     get_pending_workspace_folder_cleanups,
 )
+from src.server.database.workspace_folders import (
+    WorkspaceFolderMoving,
+    is_top_level,
+    workspace_folder_in_use,
+)
+from src.server.database.workspace_names import checked_workspace_name
 from src.server.services.computer_manager import ComputerManager
 
 logger = logging.getLogger(__name__)
@@ -69,6 +76,8 @@ class WorkspaceManager(ComputerManager):
         Returns:
             Created workspace record, bound and ready to be started.
         """
+        # Before a first computer is minted for a name that cannot be stored.
+        name = checked_workspace_name(name)
         computer = await self.ensure_primary_computer(
             user_id, name=name, resource_tier=resource_tier
         )
@@ -102,6 +111,7 @@ class WorkspaceManager(ComputerManager):
         user_id: str | None = None,
         on_state_observed: Callable[[str], None] | None = None,
         skills_signature: str | None = None,
+        run_id: str | None = None,
         _attempt: int = 0,
     ) -> Session:
         """Get or restart the session for the machine a workspace runs on.
@@ -148,11 +158,32 @@ class WorkspaceManager(ComputerManager):
             skills_signature=skills_signature,
             _attempt=_attempt,
         )
-        # Per project, not per machine: the acquire above may have handed back
-        # the session a sibling started, which prepared only that sibling's
-        # folder and only that sibling's tool overlay.
-        binding = await self.resolve_binding(workspace_id)
-        await self._ensure_project_attached(binding, session, user_id=user_id)
+        runtime = getattr(getattr(session, "sandbox", None), "runtime", None)
+        if runtime is not None:
+            binding = await self.resolve_binding(workspace_id)
+            await self._settle_folders(
+                binding.computer_id, runtime, root=binding.root_dir, own_run_id=run_id
+            )
+        try:
+            # A settle on any worker moves only a folder it can hold, and without
+            # a run (/start, a file route) this workspace is not busy to it: the
+            # restore and overlay below write only to the folder read under this,
+            # and run under this hold rather than taking one of their own.
+            async with workspace_folder_in_use(workspace_id) as hold:
+                binding = await self.resolve_binding(workspace_id)
+                if binding.dir_name and not is_top_level(binding.dir_name):
+                    # A move a settle could not finish; the agent cannot work in _internal.
+                    raise WorkspaceFolderMoving(workspace_id)
+                # Per project, not per machine: the acquire above may have handed
+                # back the session a sibling started, which prepared only that
+                # sibling's folder and only that sibling's tool overlay.
+                await self._ensure_project_attached(
+                    binding, session, user_id=user_id, hold=hold
+                )
+        except WorkspaceFolderMoving as e:
+            raise SandboxTransientError(
+                "This workspace's folder is being moved. Try again in a moment."
+            ) from e
         return session
 
     async def stop_workspace(self, workspace_id: str) -> Dict[str, Any]:

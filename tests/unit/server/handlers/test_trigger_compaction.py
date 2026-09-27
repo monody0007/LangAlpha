@@ -6,6 +6,7 @@ resolve_llm_config and therefore always used the base YAML compaction model
 instead of the user's compaction_model preference.
 """
 
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +20,9 @@ from ptc_agent.config.core import (
     SandboxConfig,
     SecurityConfig,
 )
+from fastapi import HTTPException
+
+from src.server.database.workspace_folders import WorkspaceFolderMoving
 
 
 HANDLER = "src.server.handlers.thread_maintenance"
@@ -78,7 +82,7 @@ def _stub_resolve_graph_and_state():
     backend = None
     lg_config = {"configurable": {"thread_id": "thread-1"}}
 
-    async def _stub(thread_id, verb, config=None, checkpointer=None, user_id=None):
+    async def _stub(thread_id, verb, config=None, checkpointer=None, user_id=None, held=None):
         _stub.captured_config = config
         _stub.captured_checkpointer = checkpointer
         _stub.captured_user_id = user_id
@@ -864,6 +868,90 @@ class TestSessionAcquireIdentity:
                 config=base_config,
                 checkpointer=MagicMock(),
                 user_id="user-1",
+                held=AsyncExitStack(),
             )
 
         assert manager.get_session_for_workspace.await_args.kwargs["user_id"] == "user-1"
+
+
+class TestTheBackendsFolder:
+    """/compact and /offload have no run a settle counts as busy, and what they
+    offload is the only copy once the checkpoint is truncated."""
+
+    @staticmethod
+    @contextmanager
+    def _resolving(events, *, dir_name="Macro", held_by_a_settle=False):
+        from src.server.services.workspace_manager import WorkspaceManager
+
+        manager = MagicMock(spec=WorkspaceManager)
+        manager.get_session_for_workspace = AsyncMock(
+            return_value=MagicMock(sandbox=MagicMock(working_dir="/home/workspace"))
+        )
+        graph = MagicMock()
+        graph.aget_state = AsyncMock(
+            return_value=MagicMock(values={"messages": [MagicMock(id="m1")]})
+        )
+
+        @asynccontextmanager
+        async def hold(workspace_id):
+            events.append(f"hold {workspace_id}")
+            if held_by_a_settle:
+                raise WorkspaceFolderMoving(workspace_id)
+            try:
+                yield
+            finally:
+                events.append("release")
+
+        async def read_row(_workspace_id):
+            events.append("read")
+            return {"dir_name": dir_name}
+
+        with ExitStack() as stack:
+            for target, new in (
+                ("src.server.database.conversation.get_thread_with_summary",
+                 AsyncMock(return_value={"workspace_id": "ws-1"})),
+                ("src.server.services.workspace_manager.WorkspaceManager.get_instance",
+                 MagicMock(return_value=manager)),
+                ("ptc_agent.agent.graph.build_ptc_graph_with_session", AsyncMock(return_value=graph)),
+                ("src.server.database.workspace_folders.workspace_folder_in_use", hold),
+                ("src.server.database.workspace.get_workspace", read_row),
+            ):
+                stack.enter_context(patch(target, new))
+            yield
+
+    @pytest.mark.asyncio
+    async def test_the_backend_writes_to_the_folder_read_under_the_hold(self, base_config):
+        from src.server.handlers.thread_maintenance import _resolve_graph_and_state
+
+        events = []
+        with self._resolving(events):
+            async with AsyncExitStack() as held:
+                *_, backend = await _resolve_graph_and_state(
+                    "thread-1", "offload", config=base_config, checkpointer=MagicMock(), held=held
+                )
+                events.append("offload")
+
+        assert events == ["hold ws-1", "read", "offload", "release"]
+        assert backend.root_dir == "/home/workspace/Macro"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("moving", ["staged", "held by a settle"])
+    async def test_a_folder_a_settle_is_moving_is_refused_for_a_retry(self, base_config, moving):
+        from src.server.handlers.thread_maintenance import _resolve_graph_and_state
+
+        events = []
+        resolving = self._resolving(
+            events,
+            dir_name="_internal/moving/ws-1" if moving == "staged" else "Macro",
+            held_by_a_settle=moving == "held by a settle",
+        )
+        with resolving, pytest.raises(HTTPException) as refused:
+            async with AsyncExitStack() as held:
+                await _resolve_graph_and_state(
+                    "thread-1", "offload", config=base_config, checkpointer=MagicMock(), held=held
+                )
+
+        assert refused.value.status_code == 503
+        assert events == (
+            ["hold ws-1", "read", "release"] if moving == "staged" else ["hold ws-1"]
+        )

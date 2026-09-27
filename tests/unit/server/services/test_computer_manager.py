@@ -8,6 +8,7 @@ the computer-addressed surface the router codes against.
 """
 
 import asyncio
+import hashlib
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -15,6 +16,8 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 
 from ptc_agent.config.core import FilesystemConfig
+from ptc_agent.core.sandbox.runtime import SandboxTransientError
+from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.services.computer_manager import (
     ComputerBinding,
     ComputerManager,
@@ -27,8 +30,10 @@ from tests.computer_manager_patch import cm_patch
 _LIFECYCLE = "src.server.services.computer_manager._lifecycle"
 _MACHINES = "src.server.services.computer_manager._machines"
 _PROVISIONING = "src.server.services.computer_manager._provisioning"
+_FOLDERS = "src.server.services.computer_manager._folders"
 _MACHINE_BACKUP = "src.server.services.computer_manager._machine_backup"
 _SESSIONS = "src.server.services.computer_manager._sessions"
+_WORKSPACE_MANAGER = "src.server.services.workspace_manager"
 
 # The six methods WP3's router codes against. Frozen: the router resolves them
 # by name on whatever ComputerManager.get_instance() hands back.
@@ -219,12 +224,12 @@ class _Base:
         )
         self.clear_retirement_pending = self._retirement_clear.start()
         self._folder_cleanup_complete = patch(
-            f"{_PROVISIONING}.complete_workspace_folder_cleanup",
+            f"{_FOLDERS}.complete_workspace_folder_cleanup",
             AsyncMock(return_value=True),
         )
         self.complete_folder_cleanup = self._folder_cleanup_complete.start()
         self._folder_cleanup_defer = patch(
-            f"{_PROVISIONING}.defer_workspace_folder_cleanup",
+            f"{_FOLDERS}.defer_workspace_folder_cleanup",
             AsyncMock(return_value=True),
         )
         self.defer_folder_cleanup = self._folder_cleanup_defer.start()
@@ -540,6 +545,7 @@ class TestResolveBinding(_Base):
         assert binding.computer_id == "comp-1"
 
     @pytest.mark.asyncio
+    @patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=()))
     @patch(f"{_MACHINES}.publish_workspace_binding_change")
     @patch(f"{_MACHINES}.bind_workspace_to_computer")
     @patch(f"{_MACHINES}.get_computer_by_provider_ref")
@@ -586,6 +592,43 @@ class TestResolveBinding(_Base):
         mock_binding_change.assert_awaited_once_with("ws-a", "running", "comp-1")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "sandbox_id, folder",
+        [
+            # Its files are still at the root, where "Research" may be a folder
+            # of its own that the move to the folder layout would then skip.
+            ("sbx-legacy", "Research-" + hashlib.md5(b"ws-a").hexdigest()[:4]),
+            # A machine with no sandbox yet starts on the folder layout.
+            (None, "Research"),
+        ],
+    )
+    @patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=()))
+    @patch(f"{_MACHINES}.publish_workspace_binding_change", AsyncMock())
+    @patch(f"{_MACHINES}.bind_workspace_to_computer")
+    @patch(f"{_MACHINES}.create_computer")
+    @patch(f"{_MACHINES}.get_computer_by_provider_ref")
+    async def test_an_adopted_legacy_sandbox_places_its_workspace_until_the_layout_moves(
+        self, mock_by_ref, mock_create, mock_bind, sandbox_id, folder
+    ):
+        manager = _make_manager()
+        mock_by_ref.return_value = None
+        mock_create.return_value = _make_computer(status="running", provider_ref=sandbox_id)
+        mock_bind.return_value = _make_workspace(dir_name=folder)
+        row = {
+            "workspace_id": "ws-a",
+            "user_id": "user-1",
+            "computer_id": None,
+            "status": "running",
+            "name": "Research",
+            "sandbox_id": sandbox_id,
+        }
+
+        await manager._adopt_workspace_onto_computer("ws-a", workspace=row)
+
+        assert mock_bind.await_args.kwargs["dir_name"] == folder
+
+    @pytest.mark.asyncio
+    @patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=()))
     @patch(f"{_MACHINES}.bind_workspace_to_computer")
     @patch(f"{_MACHINES}.create_computer")
     @patch(f"{_MACHINES}.get_computer_by_provider_ref")
@@ -621,6 +664,7 @@ class TestResolveBinding(_Base):
         assert mock_bind.await_args.args[1] == "comp-mine"
 
     @pytest.mark.asyncio
+    @patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=()))
     @patch(f"{_MACHINES}.update_computer_status")
     @patch(f"{_MACHINES}.get_computer_for_workspace")
     @patch(f"{_MACHINES}.bind_workspace_to_computer")
@@ -651,6 +695,7 @@ class TestResolveBinding(_Base):
         mock_status.assert_awaited_once_with("comp-loser", "deleted")
 
     @pytest.mark.asyncio
+    @patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=()))
     @patch(f"{_MACHINES}.update_computer_status")
     @patch(f"{_MACHINES}.get_computer_for_workspace")
     @patch(f"{_MACHINES}.bind_workspace_to_computer")
@@ -1088,59 +1133,111 @@ class TestTombstone(_Base):
 
 
 class TestRemovingAProjectFolder(_Base):
-    """``rm -rf`` of one folder, addressed through the machine's durable ref."""
+    """``rm -rf`` of one folder, addressed through the machine's durable ref.
 
-    @pytest.mark.asyncio
-    async def test_a_running_machine_loses_the_folder(self):
+    A folder still at the top level is first moved under ``_internal`` (the
+    settle's script, under the folder lock), so the name is free before the
+    slow removal and a workspace reusing it never shares the removed path.
+    """
+
+    _AWAY = "_internal/leftovers/ws-a"
+
+    def _manager(self, *, exec_result=None, moved=_AWAY):
         manager = _make_manager()
         runtime = MagicMock()
-        runtime.exec = AsyncMock(return_value=SimpleNamespace(exit_code=0, stdout=""))
+        runtime.exec = AsyncMock(
+            return_value=exec_result or SimpleNamespace(exit_code=0, stdout="")
+        )
         manager._detached_runtime = _detached(runtime)
+        manager._clear_tombstone_folder = AsyncMock(return_value=moved)
+        return manager, runtime
+
+    @pytest.mark.asyncio
+    async def test_a_running_machine_loses_the_folder_after_moving_it_aside(self):
+        manager, runtime = self._manager()
 
         removed = await manager._remove_workspace_folder(
             "ws-a",
-            _make_workspace(dir_name="alpha-1a2b"),
+            _make_workspace(dir_name="alpha"),
             _make_computer(status="running", provider_ref="sandbox-abc"),
         )
 
         assert removed is True
-        runtime.exec.assert_awaited_once_with("rm -rf /home/workspace/alpha-1a2b")
+        manager._clear_tombstone_folder.assert_awaited_once()
+        runtime.exec.assert_awaited_once_with(f"rm -rf /home/workspace/{self._AWAY}")
         self.complete_folder_cleanup.assert_awaited_once_with(
-            "ws-a", computer_id="comp-1", dir_name="alpha-1a2b"
+            "ws-a", computer_id="comp-1", dir_name=self._AWAY
         )
 
     @pytest.mark.asyncio
-    async def test_a_failed_command_keeps_the_durable_retry_claim(self):
-        manager = _make_manager()
-        runtime = MagicMock()
-        runtime.exec = AsyncMock(
-            return_value=SimpleNamespace(exit_code=13, stdout="permission denied")
+    async def test_a_folder_that_was_never_on_the_disk_just_hands_the_name_back(self):
+        manager, runtime = self._manager(moved=None)
+
+        assert await manager._remove_workspace_folder(
+            "ws-a",
+            _make_workspace(dir_name="alpha"),
+            _make_computer(status="running", provider_ref="sandbox-abc"),
         )
-        manager._detached_runtime = _detached(runtime)
+
+        runtime.exec.assert_not_awaited()
+        self.complete_folder_cleanup.assert_awaited_once_with(
+            "ws-a", computer_id="comp-1", dir_name="alpha"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_folder_already_moved_aside_is_removed_where_it_is(self):
+        """A settle cleared it earlier; only the removal is left."""
+        manager, runtime = self._manager()
+
+        await manager._remove_workspace_folder(
+            "ws-a",
+            _make_workspace(dir_name=self._AWAY),
+            _make_computer(status="running", provider_ref="sandbox-abc"),
+        )
+
+        manager._clear_tombstone_folder.assert_not_awaited()
+        runtime.exec.assert_awaited_once_with(f"rm -rf /home/workspace/{self._AWAY}")
+
+    @pytest.mark.asyncio
+    async def test_no_other_nested_folder_is_ever_removed(self):
+        """A row pointing inside _internal anywhere but its own leftovers is
+        mid-move, and its content is a live workspace's."""
+        manager, runtime = self._manager()
+
+        assert not await manager._remove_workspace_folder(
+            "ws-a",
+            _make_workspace(dir_name="_internal/moving/ws-a"),
+            _make_computer(status="running", provider_ref="sandbox-abc"),
+        )
+
+        runtime.exec.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_command_keeps_the_durable_retry_claim(self):
+        manager, _runtime = self._manager(
+            exec_result=SimpleNamespace(exit_code=13, stdout="permission denied")
+        )
 
         removed = await manager._remove_workspace_folder(
             "ws-a",
-            _make_workspace(dir_name="alpha-1a2b"),
+            _make_workspace(dir_name="alpha"),
             _make_computer(status="running", provider_ref="sandbox-abc"),
         )
 
         assert removed is False
         self.complete_folder_cleanup.assert_not_awaited()
         self.defer_folder_cleanup.assert_awaited_once_with(
-            "ws-a", computer_id="comp-1", dir_name="alpha-1a2b"
+            "ws-a", computer_id="comp-1", dir_name=self._AWAY
         )
 
     @pytest.mark.asyncio
     async def test_a_stopped_machine_is_not_woken_for_it(self):
         """The folder is only bytes the mirror holds and no live row names it."""
-        manager = _make_manager()
-        runtime = MagicMock()
-        runtime.exec = AsyncMock()
-        manager._detached_runtime = _detached(runtime)
+        manager, runtime = self._manager()
 
         await manager._remove_workspace_folder(
             "ws-a",
-            _make_workspace(dir_name="alpha-1a2b"),
+            _make_workspace(dir_name="alpha"),
             _make_computer(status="stopped", provider_ref="sandbox-abc"),
         )
 
@@ -1150,10 +1247,7 @@ class TestRemovingAProjectFolder(_Base):
     async def test_a_project_owning_the_root_unlinks_nothing(self):
         """An unsplit computer's project is the root, and the root is the
         machine's own runtime rather than one project's folder."""
-        manager = _make_manager()
-        runtime = MagicMock()
-        runtime.exec = AsyncMock()
-        manager._detached_runtime = _detached(runtime)
+        manager, runtime = self._manager()
 
         await manager._remove_workspace_folder(
             "ws-a",
@@ -1165,14 +1259,12 @@ class TestRemovingAProjectFolder(_Base):
 
     @pytest.mark.asyncio
     async def test_a_provider_failure_does_not_fail_the_delete(self):
-        manager = _make_manager()
-        runtime = MagicMock()
-        runtime.exec = AsyncMock(side_effect=RuntimeError("toolbox down"))
-        manager._detached_runtime = _detached(runtime)
+        manager, runtime = self._manager()
+        runtime.exec.side_effect = RuntimeError("toolbox down")
 
-        await manager._remove_workspace_folder(
+        assert not await manager._remove_workspace_folder(
             "ws-a",
-            _make_workspace(dir_name="alpha-1a2b"),
+            _make_workspace(dir_name="alpha"),
             _make_computer(status="running", provider_ref="sandbox-abc"),
         )
 
@@ -1706,6 +1798,84 @@ class TestWorkspaceFacade(_Base):
         binding, got = manager._ensure_project_attached.await_args.args
         assert binding.workspace_id == "ws-a"
         assert got is session
+
+    @staticmethod
+    def _folder_reads(events, *folders):
+        """Resolve to each folder in turn, as a settle between the reads would."""
+        remaining = iter(folders)
+
+        async def resolve(workspace_id, **_kw):
+            folder = next(remaining)
+            events.append(f"read {folder}")
+            return _make_binding(workspace_id, dir_name=folder)
+
+        return resolve
+
+    @staticmethod
+    def _hold(events, *, held_by_a_settle=False):
+        @asynccontextmanager
+        async def hold(workspace_id):
+            events.append(f"hold {workspace_id}")
+            if held_by_a_settle:
+                raise WorkspaceFolderMoving(workspace_id)
+            try:
+                yield
+            finally:
+                events.append("release")
+
+        return hold
+
+    @pytest.mark.asyncio
+    async def test_the_attachment_writes_to_the_folder_read_under_the_hold(self):
+        """/start and a file route have no run a settle counts as busy, so only
+        the hold keeps the folder where the restore and overlay write, and a
+        settle elsewhere may have landed it since the read this one used."""
+        manager = _make_manager()
+        session = _make_session()
+        events = []
+
+        async def settle(_computer_id, _runtime, **_kw):
+            events.append("settle")
+
+        async def attach(binding, _session, *, user_id=None, hold=None):
+            events.append(f"attach {binding.dir_name}")
+
+        manager._acquire_session = AsyncMock(return_value=session)
+        manager.resolve_binding = self._folder_reads(events, "Research", "Macro")
+        manager._settle_folders = settle
+        manager._ensure_project_attached = attach
+        with patch(f"{_WORKSPACE_MANAGER}.workspace_folder_in_use", self._hold(events)):
+            assert await manager.get_session_for_workspace("ws-a") is session
+
+        assert events == [
+            "read Research", "settle", "hold ws-a", "read Macro", "attach Macro", "release",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("moving", ["staged", "held by a settle"])
+    async def test_a_folder_a_settle_is_moving_is_refused_for_a_retry(self, moving):
+        """Staged, the content may be in any of three folders; held past the wait,
+        a settle is moving it now. Nothing attaches, and the caller gets the
+        retryable refusal rather than a 500."""
+        manager = _make_manager()
+        events = []
+        under_hold = "_internal/moving/ws-a" if moving == "staged" else "Macro"
+        manager._acquire_session = AsyncMock(return_value=_make_session())
+        manager.resolve_binding = self._folder_reads(events, "Research", under_hold)
+        manager._ensure_project_attached = AsyncMock()
+        hold = self._hold(events, held_by_a_settle=moving == "held by a settle")
+
+        with (
+            patch(f"{_WORKSPACE_MANAGER}.workspace_folder_in_use", hold),
+            pytest.raises(SandboxTransientError, match="being moved"),
+        ):
+            await manager.get_session_for_workspace("ws-a")
+
+        manager._ensure_project_attached.assert_not_awaited()
+        if moving == "staged":
+            assert events == ["read Research", "hold ws-a", f"read {under_hold}", "release"]
+        else:
+            assert events == ["read Research", "hold ws-a"]
 
     def test_the_facade_inherits_the_lifecycle(self):
         assert WorkspaceManager.__mro__[1] is ComputerManager
@@ -2974,6 +3144,7 @@ async def test_legacy_adoption_preserves_provider_and_root_stamp():
         patch(f"{_MACHINES}.get_computer_by_provider_ref", AsyncMock(return_value=None)) as lookup,
         patch(f"{_MACHINES}.create_computer", AsyncMock(return_value=_make_computer(origin_workspace_id="source"))) as create,
         patch(f"{_MACHINES}.bind_workspace_to_computer", AsyncMock(return_value={"dir_name": "source-folder"})),
+        patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=())),
     ):
         await manager._adopt_workspace_onto_computer("source", workspace=source)
     lookup.assert_awaited_once_with("docker", "container-id")

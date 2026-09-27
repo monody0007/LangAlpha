@@ -36,6 +36,7 @@ async def test_mcp_stats_keep_the_requested_view_when_a_sibling_syncs():
     sandbox.execute_bash_command.side_effect = sibling_sync
     with (
         patch("src.server.app.workspace_sandbox._get_sandbox", AsyncMock(return_value=(session, sandbox))),
+        patch("src.server.app.workspace_sandbox.db_get_workspace", AsyncMock(return_value=None)),
         patch("src.server.app.workspace_sandbox._provider_kind", AsyncMock(return_value="docker")),
         patch("src.server.app.workspace_sandbox.WorkspaceManager.get_instance", return_value=manager),
     ):

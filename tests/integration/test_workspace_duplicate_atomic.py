@@ -1,4 +1,8 @@
-"""A duplicate must not attach before its file manifest is visible."""
+"""A workspace row commits with what must be visible beside it.
+
+For a duplicate that is its file manifest; for a create or a bind, the release
+of its folder from any sibling's former folders.
+"""
 
 import asyncio
 
@@ -71,9 +75,13 @@ async def test_failed_copy_rolls_back_project(seed_user, test_db_pool, monkeypat
         assert await result.fetchone() is None
 
 
-async def test_a_held_folder_retry_keeps_outer_copy_transaction_usable(seed_user, test_db_pool):
+async def test_a_held_folder_retry_keeps_outer_copy_transaction_usable(
+    seed_user, test_db_pool, monkeypatch
+):
     """A deleted workspace awaiting cleanup still holds its folder, so the copy
-    is placed under a placeholder, inside the copy's own transaction."""
+    is placed under a placeholder, inside the copy's own transaction. The
+    holder is hidden from the create's read, as one that lands after it is,
+    so the insert's own violation is what places the copy."""
     user_id = seed_user["user_id"]
     source, computer_id = await _source(user_id, test_db_pool)
     gone = await workspaces.create_workspace_on_computer(user_id, "Copy", computer_id)
@@ -82,6 +90,11 @@ async def test_a_held_folder_retry_keeps_outer_copy_transaction_usable(seed_user
             "UPDATE workspaces SET status = 'deleted' WHERE workspace_id = %s",
             (gone["workspace_id"],),
         )
+
+    async def nothing_held(*args, **kwargs):
+        return ()
+
+    monkeypatch.setattr(workspaces, "get_workspace_dir_names_for_computer", nothing_held)
     duplicate = await workspaces.duplicate_workspace_on_computer(
         str(source["workspace_id"]), user_id, "Copy", computer_id,
     )
@@ -110,3 +123,49 @@ async def test_a_taken_name_rolls_the_copy_back_and_names_the_holder(seed_user, 
             (user_id,),
         )
         assert (await result.fetchone())["n"] == 1
+
+
+async def _release_fails(*args, **kwargs):
+    raise RuntimeError("release failed")
+
+
+async def test_a_failed_folder_release_leaves_no_created_workspace(
+    seed_user, test_db_pool, monkeypatch
+):
+    """The row and its folder's release commit together, so a create that fails
+    after the insert leaves nothing holding the name and a retry succeeds."""
+    user_id = seed_user["user_id"]
+    computer = await create_computer(user_id, kind="docker", name="Test computer")
+    computer_id = str(computer["computer_id"])
+
+    monkeypatch.setattr(workspaces, "release_former_folder", _release_fails)
+    with pytest.raises(RuntimeError, match="release failed"):
+        await workspaces.create_workspace_on_computer(user_id, "Research", computer_id)
+    async with test_db_pool.connection() as conn:
+        result = await conn.execute("SELECT workspace_id FROM workspaces WHERE name='Research'")
+        assert await result.fetchone() is None
+
+    monkeypatch.undo()
+    created = await workspaces.create_workspace_on_computer(user_id, "Research", computer_id)
+    assert created["dir_name"] == "Research"
+
+
+async def test_a_failed_folder_release_leaves_the_workspace_unbound(
+    seed_user, test_db_pool, monkeypatch
+):
+    user_id = seed_user["user_id"]
+    unbound = await workspaces.create_workspace(user_id, "Research", status="running")
+    computer = await create_computer(user_id, kind="docker", name="Test computer")
+
+    monkeypatch.setattr(workspaces, "release_former_folder", _release_fails)
+    with pytest.raises(RuntimeError, match="release failed"):
+        await workspaces.bind_workspace_to_computer(
+            str(unbound["workspace_id"]), str(computer["computer_id"]),
+            expected_computer_id=None, dir_name="Research",
+        )
+    async with test_db_pool.connection() as conn:
+        result = await conn.execute(
+            "SELECT computer_id, dir_name FROM workspaces WHERE workspace_id = %s",
+            (unbound["workspace_id"],),
+        )
+        assert await result.fetchone() == {"computer_id": None, "dir_name": None}

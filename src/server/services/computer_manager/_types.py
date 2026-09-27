@@ -57,11 +57,12 @@ class ComputerBinding:
 
     An empty workspace_id is a machine operation that names no project, and
     such a binding carries no folder either. dir_name is the project's folder
-    on the machine, resolved in the same read as the machine itself: a bound
-    project's folder never moves, so a holder of this binding never has to ask
-    again. None on a project binding means only that this read did not answer
-    for the folder, so the layout resolves it from the row; a caller that
-    builds a project binding out of a machine row has to supply it."""
+    on the machine, resolved in the same read as the machine itself. A folder
+    moves to follow a rename only in an acquisition's settle, before that
+    acquisition resolves the binding it hands out. None on a workspace binding
+    means only that this read did not answer for the folder, so the layout
+    resolves it from the row; a caller that builds a workspace binding out of a
+    machine row has to supply it."""
 
     workspace_id: str
     computer_id: str

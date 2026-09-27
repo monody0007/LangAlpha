@@ -26,18 +26,16 @@ async def await_settled(task: asyncio.Future) -> Any:
     return task.result()
 
 
-async def _unlock_or_close(conn, key: str) -> None:
+async def _unlock_or_close(conn, sql: str, params: tuple = ()) -> None:
     try:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (key,)
-            )
+            await cur.execute(sql, params)
     except BaseException:
         await conn.close()
         raise
 
 
-async def release_session_lock(conn, key: str) -> None:
+async def release_session_lock(conn, key: str, *, shared: bool = False) -> None:
     """Release the session lock, or close the session so the lock dies with it.
 
     The release runs as its own task and is awaited until it finishes no
@@ -47,4 +45,17 @@ async def release_session_lock(conn, key: str) -> None:
     connection is closed, which the server treats as a release and the pool
     as a slot to replace.
     """
-    await await_settled(asyncio.ensure_future(_unlock_or_close(conn, key)))
+    unlock = "pg_advisory_unlock_shared" if shared else "pg_advisory_unlock"
+    await await_settled(
+        asyncio.ensure_future(
+            _unlock_or_close(conn, f"SELECT {unlock}(hashtextextended(%s, 0))", (key,))
+        )
+    )
+
+
+async def release_session_locks(conn) -> None:
+    """Release every session lock ``conn`` holds, for a holder that took
+    several one by one; closes the session when that cannot be confirmed."""
+    await await_settled(
+        asyncio.ensure_future(_unlock_or_close(conn, "SELECT pg_advisory_unlock_all()"))
+    )

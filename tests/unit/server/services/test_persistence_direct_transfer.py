@@ -46,7 +46,7 @@ def _sync_lock():
     """Sync and restore serialize on a Postgres advisory lock; there is no DB here."""
 
     @asynccontextmanager
-    async def _lock(_workspace_id):
+    async def _lock(_workspace_id, conn=None):
         yield None
 
     with (

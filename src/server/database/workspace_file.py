@@ -483,7 +483,7 @@ async def manifest_clock(*, conn=None) -> datetime:
 
 
 @asynccontextmanager
-async def workspace_sync_lock(workspace_id: str):
+async def workspace_sync_lock(workspace_id: str, *, conn=None):
     """Serialize manifest syncs for one workspace, and yield the session holding it.
 
     Session-level rather than transaction-level because a sync is not one
@@ -492,10 +492,12 @@ async def workspace_sync_lock(workspace_id: str):
     the older pack's unconditional upsert land last, so the fence has to span
     the read and the write together. The connection is yielded because the
     sync's own reads and writes belong on this session rather than on a second
-    pool slot checked out underneath it.
+    pool slot checked out underneath it. A caller already holding a session
+    (a folder hold) passes it for the same reason: holders that each wait on
+    the pool for a second slot can take every slot between them.
     """
     key = f"{_SYNC_LOCK_NS}:{workspace_id}"
-    async with get_db_connection() as conn:
+    async with get_db_connection(conn) as conn:
         try:
             # SET LOCAL scopes the timeout to this transaction; the session
             # lock itself outlives the commit.

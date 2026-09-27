@@ -71,18 +71,29 @@ def db(cursor):
     conn.cursor = _cursor_cm
 
     @asynccontextmanager
+    async def _transaction():
+        yield
+
+    conn.transaction = _transaction
+
+    @asynccontextmanager
     async def _fake(passed=None):
         yield passed if passed is not None else conn
 
-    with patch("src.server.database.workspace.get_db_connection", new=_fake):
+    with (
+        patch("src.server.database.workspace.get_db_connection", new=_fake),
+        patch("src.server.database.workspace_folders.get_db_connection", new=_fake),
+        patch.object(W, "get_workspace_dir_names_for_computer", AsyncMock(return_value=())),
+        patch.object(W, "get_computer", AsyncMock(return_value={"provider_ref": "sbx", "layout_version": 4})),
+    ):
         yield cursor
 
 
-def _sql(cursor, call=-1) -> str:
+def _sql(cursor, call=0) -> str:
     return re.sub(r"\s+", " ", cursor.execute.call_args_list[call][0][0])
 
 
-def _params(cursor, call=-1) -> dict:
+def _params(cursor, call=0) -> dict:
     return cursor.execute.call_args_list[call][0][1]
 
 
@@ -91,10 +102,30 @@ class TestTheStatement:
     async def test_the_project_is_born_on_the_machine(self, db):
         """Never a window where the row exists unbound: no second write to lose."""
         await W.create_workspace_on_computer("user-1", "Research", COMPUTER_ID)
-        assert db.execute.await_count == 1
-        sql = _sql(db)
-        assert sql.count("INSERT INTO workspaces") == 1
-        assert "comp.computer_id" in sql
+        inserts = [
+            i for i in range(db.execute.await_count) if "INSERT INTO workspaces" in _sql(db, i)
+        ]
+        assert inserts == [0]
+        assert "comp.computer_id" in _sql(db)
+
+    @pytest.mark.asyncio
+    async def test_the_folder_it_takes_stops_being_a_siblings_former_folder(self, db):
+        """Every reader folds a former folder into its workspace, so a sibling
+        that once lived at this name would take this workspace's paths."""
+        # Casefold, as the readers fold: "Reſearch" names this folder too, and
+        # Postgres's lower() leaves the long s alone.
+        db.fetchall = AsyncMock(return_value=[
+            {"folder": "RESEARCH"}, {"folder": "Reſearch"}, {"folder": "Macro"},
+        ])
+        await W.create_workspace_on_computer(
+            "user-1", "Research", COMPUTER_ID, workspace_id=WORKSPACE_ID
+        )
+        assert "unnest(previous_dir_names)" in _sql(db, 1)
+        assert _params(db, 1) == {"id": WORKSPACE_ID, "computer": COMPUTER_ID}
+        assert "previous_dir_names &&" in _sql(db, 2)
+        assert _params(db, 2) == {
+            "id": WORKSPACE_ID, "computer": COMPUTER_ID, "spellings": ["RESEARCH", "Reſearch"],
+        }
 
     @pytest.mark.asyncio
     async def test_the_lifecycle_fields_are_copied_from_the_computer(self, db):
@@ -177,6 +208,24 @@ class TestTheFolderName:
         db.execute.assert_not_awaited()
 
 
+    @pytest.mark.asyncio
+    async def test_a_sandbox_not_yet_on_the_folder_layout_gets_a_placeholder(self, db):
+        """Its origin's files are still at the root, and the move to the folder
+        layout skips every root entry a row names: a workspace named "data"
+        would take the origin's data folder."""
+        with patch.object(W, "get_computer", AsyncMock(return_value={"provider_ref": "sbx", "layout_version": 0})):
+            await W.create_workspace_on_computer("user-1", "data", COMPUTER_ID, workspace_id=WORKSPACE_ID)
+        digest = hashlib.md5(WORKSPACE_ID.encode()).hexdigest()[:4]
+        assert _params(db)["dir_name"] == f"data-{digest}"
+
+    @pytest.mark.asyncio
+    async def test_a_computer_with_no_sandbox_yet_takes_the_name(self, db):
+        """Its first sandbox starts on the folder layout."""
+        with patch.object(W, "get_computer", AsyncMock(return_value={"provider_ref": None, "layout_version": 0})):
+            await W.create_workspace_on_computer("user-1", "data", COMPUTER_ID)
+        assert _params(db)["dir_name"] == "data"
+
+
 class TestTheCollision:
     @pytest.mark.asyncio
     async def test_a_held_folder_places_the_workspace_until_it_frees(self, db):
@@ -184,7 +233,7 @@ class TestTheCollision:
         has not moved yet, still holds the folder; the create must not fail on
         it. The placeholder is the name plus a suffix the next settle drops."""
         db.execute = AsyncMock(
-            side_effect=[_Violation(W._COMPUTER_DIR_INDEX), None]
+            side_effect=[_Violation(W._COMPUTER_DIR_INDEX), None, None, None]
         )
         result = await W.create_workspace_on_computer(
             "user-1", "Research", COMPUTER_ID, workspace_id=WORKSPACE_ID
@@ -193,6 +242,25 @@ class TestTheCollision:
         first, second = _params(db, 0)["dir_name"], _params(db, 1)["dir_name"]
         assert first == "Research"
         assert second == "Research-" + hashlib.md5(WORKSPACE_ID.encode()).hexdigest()[:4]
+
+    @pytest.mark.asyncio
+    async def test_a_folder_held_under_another_case_is_held(self, db):
+        """The folder index compares case, but a case-insensitive disk (a Docker
+        work dir bind-mounted from macOS) keeps "research" and "Research" as
+        one folder, so a tombstone's "research" would share its files."""
+        with patch.object(
+            W, "get_workspace_dir_names_for_computer", AsyncMock(return_value=("research",))
+        ):
+            await W.create_workspace_on_computer(
+                "user-1", "Research", COMPUTER_ID, workspace_id=WORKSPACE_ID
+            )
+        inserts = [
+            i for i in range(db.execute.await_count) if "INSERT INTO workspaces" in _sql(db, i)
+        ]
+        assert inserts == [0]
+        assert _params(db)["dir_name"] == (
+            "Research-" + hashlib.md5(WORKSPACE_ID.encode()).hexdigest()[:4]
+        )
 
     @pytest.mark.asyncio
     async def test_every_attempt_colliding_reaches_the_caller(self, db):

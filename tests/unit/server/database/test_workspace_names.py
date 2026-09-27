@@ -9,6 +9,7 @@ from src.server.database.workspace_names import (
     checked_workspace_name,
     copy_name,
     first_free_name,
+    candidate_dir_names,
     placeholder_dir_name,
     suffixed_name,
     workspace_folder_name,
@@ -105,3 +106,10 @@ def test_a_refusal_says_why_so_a_client_can_word_it(name, reason, held):
     with pytest.raises(WorkspaceNameInvalid) as caught:
         checked_workspace_name(name)
     assert (caught.value.reason, caught.value.name) == (reason, held)
+
+
+def test_a_folder_held_under_any_case_is_not_a_candidate():
+    """One folder on a case-insensitive disk, so adoption and create both skip it."""
+    candidates = candidate_dir_names("Research", "id-1", held=["research"])
+    assert candidates[0] == placeholder_dir_name("Research", "id-1")
+    assert "Research" not in candidates

@@ -38,7 +38,7 @@ def _sync_lock():
     """``sync_to_db`` serializes on a Postgres advisory lock; there is no DB here."""
 
     @asynccontextmanager
-    async def _lock(_workspace_id):
+    async def _lock(_workspace_id, conn=None):
         yield None
 
     with patch.object(backup, "workspace_sync_lock", _lock):
@@ -293,7 +293,7 @@ def _row(path, data, *, pack=None, offset=None, blob=None, perms="0644"):
 
 
 @asynccontextmanager
-async def _no_lock(_workspace_id):
+async def _no_lock(_workspace_id, conn=None):
     yield None
 
 

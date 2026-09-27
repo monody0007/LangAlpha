@@ -8,7 +8,7 @@ services/cancel_dispatch.py and services/thread_status.py.
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import HTTPException
 
@@ -25,7 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 async def _resolve_graph_and_state(
-    thread_id: str, verb: str, config=None, checkpointer=None, user_id=None
+    thread_id: str,
+    verb: str,
+    config=None,
+    checkpointer=None,
+    user_id=None,
+    *,
+    held: AsyncExitStack,
 ) -> tuple:
     """Validate thread, build graph, get state, build backend.
 
@@ -33,13 +39,20 @@ async def _resolve_graph_and_state(
     ``checkpointer`` overrides the global pooled saver — a mutation passes its
     fence-bound saver so checkpoint writes die with the lock session (I2).
     ``user_id`` identifies the caller to the session acquire, whose MCP resolve
-    is owner-scoped.
+    is owner-scoped. ``held`` is the caller's stack, which keeps the backend's
+    folder in place until the caller's block ends.
 
     Returns:
         (graph, lg_config, state, messages, backend)
     """
     from src.server.database import conversation as qr_db
     from src.server.database.workspace import get_workspace
+    from src.server.database.workspace_folders import (
+        WorkspaceFolderMoving,
+        is_top_level,
+        workspace_folder_in_use,
+    )
+    from src.server.utils.error_sanitization import sandbox_unreachable_detail
     from src.server.services.workspace_manager import WorkspaceManager
     from ptc_agent.agent.graph import build_ptc_graph_with_session
     from ptc_agent.agent.backends.sandbox import SandboxBackend
@@ -105,13 +118,23 @@ async def _resolve_graph_and_state(
     # Backend. Pinned to the thread's workspace folder because these routes
     # run outside a turn, where nothing has bound a project: an unpinned
     # backend would file this thread's offloads on the machine root, which a
-    # later delete of the workspace would leave behind.
+    # later delete of the workspace would leave behind. No run keeps a settle
+    # off this folder, and an offload is the only copy once the checkpoint is
+    # truncated: ``held`` keeps the folder in place, and the row is read under it.
     backend = None
     if hasattr(session, "sandbox") and session.sandbox is not None:
+        try:
+            await held.enter_async_context(workspace_folder_in_use(workspace_id))
+        except WorkspaceFolderMoving as e:
+            raise HTTPException(status_code=503, detail=sandbox_unreachable_detail(e)) from None
         row = await get_workspace(workspace_id) or {}
-        layout = SandboxLayout(session.sandbox.working_dir).for_workspace(
-            row.get("dir_name")
-        )
+        dir_name = row.get("dir_name")
+        if dir_name and not is_top_level(dir_name):
+            raise HTTPException(
+                status_code=503,
+                detail=sandbox_unreachable_detail(WorkspaceFolderMoving(workspace_id)),
+            )
+        layout = SandboxLayout(session.sandbox.working_dir).for_workspace(dir_name)
         backend = SandboxBackend(session.sandbox, layout.workspace)
 
     return graph, lg_config, state, messages, backend
@@ -177,7 +200,10 @@ async def trigger_compaction(
         # and the op key holds concurrent message POSTs at admission. The
         # runner also owns the user-Stop path (local cancel / cross-worker
         # stop flag).
-        async with _hold_thread_mutation(thread_id, "compact") as mutation:
+        async with (
+            _hold_thread_mutation(thread_id, "compact") as mutation,
+            AsyncExitStack() as held,
+        ):
             agent_cfg = setup.agent_config
             if user_id and agent_cfg is not None:
                 try:
@@ -206,7 +232,7 @@ async def trigger_compaction(
 
             graph, lg_config, state, messages, backend = await _resolve_graph_and_state(
                 thread_id, "compact", config=agent_cfg,
-                checkpointer=mutation.saver, user_id=user_id,
+                checkpointer=mutation.saver, user_id=user_id, held=held,
             )
 
             original_count = len(messages)
@@ -332,9 +358,12 @@ async def trigger_offload(thread_id: str, *, user_id: str | None = None) -> dict
         # could race a running workflow's _offloaded_tool_call_ids updates.
         # The exclusive-T lock + ledger gate are deterministic, so the old
         # fail-open/fail-closed tracker asymmetry is gone.
-        async with _hold_thread_mutation(thread_id, "offload") as mutation:
+        async with (
+            _hold_thread_mutation(thread_id, "offload") as mutation,
+            AsyncExitStack() as held,
+        ):
             graph, lg_config, state, messages, backend = await _resolve_graph_and_state(
-                thread_id, "offload", checkpointer=mutation.saver, user_id=user_id
+                thread_id, "offload", checkpointer=mutation.saver, user_id=user_id, held=held
             )
 
             # Load already-offloaded IDs from graph state (persisted in checkpoint)

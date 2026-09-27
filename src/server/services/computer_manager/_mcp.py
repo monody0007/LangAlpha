@@ -31,6 +31,7 @@ from src.server.database.workspace import (
     get_workspace as db_get_workspace,
     get_workspace_identity as db_get_workspace_identity,
 )
+from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.services.computer_manager._types import (
     ComputerBinding,
     WorkspaceToolView,
@@ -551,7 +552,7 @@ class McpSecretsMixin:
 
     async def _reconcile_skills(
         self,
-        binding: ComputerBinding,
+        workspace_id: str,
         user_id: str | None,
         sandbox: Any,
         *,
@@ -559,16 +560,29 @@ class McpSecretsMixin:
     ) -> None:
         """Reconcile after asset sync and restore so skills see the final disk state.
 
-        The service uses the cross-worker SKILL_SYNC advisory lock and never raises;
-        anonymous sessions have no skill rows."""
+        Never raises; anonymous sessions have no skill rows. The pass writes
+        into the folder read under the folder hold, as the asset sync does, and
+        not at all while it is staged: the pass's first script creates its skill
+        directory, and a staging folder that exists is what the next settle
+        lands in place of the content still at the old name."""
         if not user_id or sandbox is None:
             return
-        await reconcile_workspace_skills(
-            sandbox,
-            user_id=user_id,
-            workspace_id=binding.workspace_id,
-            source=source,
-        )
+        try:
+            async with self._held_workspace_folder(workspace_id) as dir_name:
+                await reconcile_workspace_skills(
+                    sandbox,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    source=source,
+                    # With no folder the service refuses the pass; an empty
+                    # one would name the computer root, whose prune reaches
+                    # every sibling.
+                    project=ProjectContext(workspace_id, dir_name) if dir_name else None,
+                )
+        except WorkspaceFolderMoving:
+            logger.info(f"[skill_sync] {source} pass for {workspace_id} waits for its folder to land")
+        except Exception as e:
+            logger.warning(f"[skill_sync] {source} pass for {workspace_id} skipped: {e}")
 
     # Strong refs prevent task GC; never consult this set as state.
     _skill_reconcile_tasks: set[asyncio.Task] = set()
@@ -615,11 +629,8 @@ class McpSecretsMixin:
         )
         if session is None:
             return
-        await reconcile_workspace_skills(
-            session.sandbox,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            source=source,
+        await self._reconcile_skills(
+            workspace_id, user_id, session.sandbox, source=source
         )
 
     async def proactively_apply_mcp_config(

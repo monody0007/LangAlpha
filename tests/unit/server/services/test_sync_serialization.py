@@ -193,7 +193,7 @@ async def test_sync_holds_the_lock_across_the_scan_and_the_writes():
     order: list[str] = []
 
     @asynccontextmanager
-    async def _lock(workspace_id: str):
+    async def _lock(workspace_id: str, conn=None):
         order.append("lock")
         try:
             yield None
@@ -237,7 +237,7 @@ async def test_restore_holds_the_same_lock_across_the_flag_and_the_transfer():
     seen_conns: list = []
 
     @asynccontextmanager
-    async def _lock(workspace_id: str):
+    async def _lock(workspace_id: str, conn=None):
         order.append("lock")
         try:
             yield "held-conn"

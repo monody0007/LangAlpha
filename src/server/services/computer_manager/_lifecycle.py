@@ -693,7 +693,7 @@ class SessionLifecycleMixin:
                     await self._maybe_restore_files(binding, session.sandbox)
                     mark("file_restore")
                     await self._reconcile_skills(
-                        binding,
+                        binding.workspace_id,
                         workspace_user_id,
                         session.sandbox,
                         source="lazy_phase2",
@@ -1032,7 +1032,7 @@ class SessionLifecycleMixin:
             mark("cold_asset_sync")
 
             await self._reconcile_skills(
-                binding,
+                binding.workspace_id,
                 workspace_user_id,
                 session.sandbox,
                 source="attach_running",
@@ -1301,7 +1301,7 @@ class SessionLifecycleMixin:
                 if session.sandbox:
                     await self._maybe_restore_files(binding, session.sandbox)
                     await self._reconcile_skills(
-                        binding, user_id, session.sandbox, source="restart"
+                        binding.workspace_id, user_id, session.sandbox, source="restart"
                     )
                 self._record_sync(computer_id, workspace_id)
 
