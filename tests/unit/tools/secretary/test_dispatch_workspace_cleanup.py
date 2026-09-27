@@ -779,3 +779,55 @@ async def test_continuation_probe_down_retains_unknown(cache, ledger):
 @pytest.fixture(autouse=True)
 def _internal_service_token(monkeypatch):
     monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-internal-service-token")
+
+
+@pytest.mark.asyncio
+async def test_an_auto_created_name_lost_to_two_races_takes_the_next_free_one(cache):
+    """Three dispatches planning one name: the loser of the second race
+    retries too, instead of failing the dispatch."""
+    from src.server.database.workspace_names import WorkspaceNameTaken
+
+    _fill_flash_cap(cache)
+    mgr = _manager()
+    mgr.create_workspace = AsyncMock(side_effect=[
+        WorkspaceNameTaken("analyze this"),
+        WorkspaceNameTaken("analyze this (2)"),
+        {"workspace_id": NEW_WORKSPACE_ID},
+    ])
+    with patch(
+        "src.tools.secretary.tools._hitl_confirm", return_value=(True, {})
+    ), patch(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        return_value=mgr,
+    ), patch(
+        f"{RESERVE_MOD}.check_dispatch_capacity",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "aiohttp.ClientSession",
+        MagicMock(side_effect=AssertionError("dispatch must not run")),
+    ):
+        result = await ptc_agent.ainvoke(
+            _tool_call({"question": "analyze this"}), config=_config()
+        )
+
+    # Past creation: the cap the test filled is what stops it.
+    assert "too many concurrent analyses" in _payload(result)["error"]
+    assert mgr.create_workspace.await_count == 3
+    mgr.delete_workspace.assert_awaited_once_with(NEW_WORKSPACE_ID)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_name_list_still_reaches_the_approval_card(cache):
+    """The free-name read runs before the user is asked; failing it must not
+    fail the dispatch, only cost the number."""
+    confirm = MagicMock(return_value=(False, {}))
+    with patch(
+        "src.server.database.workspace.get_workspace_name_keys",
+        AsyncMock(side_effect=RuntimeError("pool closed")),
+    ), patch("src.tools.secretary.tools._hitl_confirm", confirm):
+        await ptc_agent.ainvoke(
+            _tool_call({"question": "analyze this"}), config=_config()
+        )
+
+    confirm.assert_called_once()
+    assert confirm.call_args.args[1]["workspace_name"] == "analyze this"

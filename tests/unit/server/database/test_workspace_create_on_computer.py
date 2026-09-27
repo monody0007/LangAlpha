@@ -3,9 +3,9 @@
 Instant creation rests on this insert. The row has to be born bound, carrying
 the machine's lifecycle fields, because everything downstream reads the project
 row and would otherwise see a project that exists on no computer for a window.
-The folder name is the other half: ``dir_name`` is unique per computer, and the
-name half belongs to the user, so two projects called the same thing have to
-settle it on the suffix rather than failing the create.
+The folder is the workspace's name, and names are unique per user, so a folder
+another row still holds (a tombstone awaiting cleanup, a sibling renamed away)
+is a wait, not a refusal: the workspace takes a placeholder until it frees.
 """
 
 from __future__ import annotations
@@ -152,47 +152,37 @@ class TestTheStatement:
 
 
 class TestTheFolderName:
-    def test_the_slug_follows_the_sql_rule(self):
-        assert W.workspace_dir_name("Q3 Earnings!", WORKSPACE_ID).startswith(
-            "q3-earnings-"
-        )
+    @pytest.mark.asyncio
+    async def test_the_folder_is_the_name(self, db):
+        """The agent and the user see one name for the workspace, so the folder
+        is spelled the way the user typed it, spaces and case kept."""
+        await W.create_workspace_on_computer("user-1", "Q3 Earnings", COMPUTER_ID)
+        assert _params(db)["dir_name"] == "Q3 Earnings"
 
-    def test_an_empty_name_still_owns_a_folder(self):
-        assert W.workspace_dir_name("", WORKSPACE_ID).startswith("workspace-")
-        assert W.workspace_dir_name(None, WORKSPACE_ID).startswith("workspace-")
+    @pytest.mark.asyncio
+    async def test_the_name_key_is_the_folded_folder(self, db):
+        """What the per-user index compares: a case-insensitive disk cannot
+        hold Research and research side by side."""
+        await W.create_workspace_on_computer("user-1", "  Q3   Earnings ", COMPUTER_ID)
+        params = _params(db)
+        assert params["name"] == "Q3   Earnings"
+        assert params["name_key"] == "q3 earnings"
 
-    def test_the_same_name_on_two_projects_gives_two_folders(self):
-        """Which is why the suffix exists: the name half is the user's to repeat."""
-        a = W.workspace_dir_name("Research", WORKSPACE_ID)
-        b = W.workspace_dir_name("Research", COMPUTER_ID)
-        assert a != b
-
-    def test_widening_keeps_the_name_and_lengthens_the_suffix(self):
-        narrow = W.workspace_dir_name("Research", WORKSPACE_ID, hex_chars=4)
-        wide = W.workspace_dir_name("Research", WORKSPACE_ID, hex_chars=8)
-        assert wide.startswith(narrow)
-        assert len(wide) == len(narrow) + 4
-
-    def test_no_width_can_overflow_the_column(self):
-        """dir_name is VARCHAR(64). A long name plus a widened suffix used to
-        produce 68 chars, and StringDataRightTruncation is not a
-        UniqueViolation, so the re-slug loop above never catches it: a folder
-        collision on a long name became a 500 on the create."""
-        for hex_chars in (4, 8, 12, 16):
-            assert (
-                len(W.workspace_dir_name("x" * 120, WORKSPACE_ID, hex_chars=hex_chars))
-                <= 64
-            )
-        # The suffix is what the retry widens, so it must survive intact.
-        assert W.workspace_dir_name("x" * 120, WORKSPACE_ID, hex_chars=8).endswith(
-            hashlib.md5(WORKSPACE_ID.encode("utf-8")).hexdigest()[:8]
-        )
+    @pytest.mark.asyncio
+    async def test_an_unusable_name_writes_nothing(self, db):
+        with pytest.raises(W.WorkspaceNameInvalid):
+            await W.create_workspace_on_computer("user-1", " ./ ", COMPUTER_ID)
+        with pytest.raises(W.WorkspaceNameInvalid):
+            await W.create_workspace_on_computer("user-1", "x" * 81, COMPUTER_ID)
+        db.execute.assert_not_awaited()
 
 
 class TestTheCollision:
     @pytest.mark.asyncio
-    async def test_a_taken_folder_is_re_slugged_and_retried(self, db):
-        """The create must not fail because a sibling took the short suffix."""
+    async def test_a_held_folder_places_the_workspace_until_it_frees(self, db):
+        """A deleted workspace awaiting cleanup, or a sibling renamed away that
+        has not moved yet, still holds the folder; the create must not fail on
+        it. The placeholder is the name plus a suffix the next settle drops."""
         db.execute = AsyncMock(
             side_effect=[_Violation(W._COMPUTER_DIR_INDEX), None]
         )
@@ -200,10 +190,9 @@ class TestTheCollision:
             "user-1", "Research", COMPUTER_ID, workspace_id=WORKSPACE_ID
         )
         assert result is not None
-        assert db.execute.await_count == 2
         first, second = _params(db, 0)["dir_name"], _params(db, 1)["dir_name"]
-        assert second != first
-        assert second.startswith(first)
+        assert first == "Research"
+        assert second == "Research-" + hashlib.md5(WORKSPACE_ID.encode()).hexdigest()[:4]
 
     @pytest.mark.asyncio
     async def test_every_attempt_colliding_reaches_the_caller(self, db):
@@ -213,12 +202,27 @@ class TestTheCollision:
                 "user-1", "Research", COMPUTER_ID, workspace_id=WORKSPACE_ID
             )
         assert caught.value.computer_id == COMPUTER_ID
-        assert db.execute.await_count == 3
+        assert db.execute.await_count == 4
 
     @pytest.mark.asyncio
-    async def test_another_unique_violation_is_not_re_slugged(self, db):
-        """Renaming the folder can never clear a primary-key clash, so retrying
-        one would burn every attempt and then report the wrong cause."""
+    async def test_a_taken_name_names_the_workspace_holding_it(self, db):
+        """The client offers the holder, so the refusal carries its id and the
+        spelling it was saved under, not the one just typed."""
+        db.execute = AsyncMock(side_effect=_Violation(W._USER_NAME_INDEX))
+        holder = {"workspace_id": COMPUTER_ID, "name": "Research"}
+        with patch.object(
+            W, "find_workspace_by_name_key", AsyncMock(return_value=holder)
+        ) as find:
+            with pytest.raises(W.WorkspaceNameTaken) as caught:
+                await W.create_workspace_on_computer("user-1", "RESEARCH", COMPUTER_ID)
+        find.assert_awaited_once_with("user-1", "research")
+        assert (caught.value.name, caught.value.workspace_id) == ("Research", COMPUTER_ID)
+        assert db.execute.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_another_unique_violation_is_not_retried(self, db):
+        """Another folder can never clear a primary-key clash, so retrying one
+        would burn every attempt and then report the wrong cause."""
         db.execute = AsyncMock(side_effect=_Violation("workspaces_pkey"))
         with pytest.raises(UniqueViolation):
             await W.create_workspace_on_computer("user-1", "Research", COMPUTER_ID)

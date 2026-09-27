@@ -20,12 +20,15 @@ from src.server.database.computer import (
 from src.server.database.workspace import (
     duplicate_workspace_on_computer,
     get_workspace as db_get_workspace,
+    get_workspace_name_keys,
 )
+from src.server.database.workspace_names import WorkspaceNameTaken, copy_name
 from src.server.models.computer import ComputerStatus
 from src.server.services.computer_manager._types import ComputerBinding
 
 logger = logging.getLogger(__name__)
 
+_COPY_NAME_ATTEMPTS = 3
 
 
 class WorkspaceEntitlementsMixin:
@@ -123,8 +126,9 @@ class WorkspaceEntitlementsMixin:
         computer = await get_computer(computer_id)
         if computer is None:
             return None
-        # The folder is the project's, not a machine column, and a bound
-        # project's folder never moves, so it rides across the refresh.
+        # The folder is the workspace's, not a machine column; it moves only in
+        # an acquisition's settle, before this binding was resolved, so it
+        # rides across the refresh.
         fresh = replace(
             self._binding_from_computer(binding.workspace_id, computer),
             dir_name=binding.dir_name,
@@ -289,7 +293,8 @@ class WorkspaceEntitlementsMixin:
         source_id: str,
         user_id: str,
     ) -> Dict[str, Any]:
-        """Copy a workspace's files into a fresh "<name> (copy)" project.
+        """Copy a workspace's files into a fresh workspace named "<name> (copy)", or
+        "<name> (copy 2)" and on when that name is taken.
 
         The copy is a project on the same machine, so it takes that machine's
         tier and always-on rather than carrying the source's: those belong to
@@ -339,14 +344,22 @@ class WorkspaceEntitlementsMixin:
         ):
             source_config.pop(stamp_key, None)
 
-        new_workspace = await duplicate_workspace_on_computer(
-            source_id,
-            user_id,
-            f"{source['name']} (copy)",
-            source_binding.computer_id,
-            description=source.get("description"),
-            config=source_config or None,
-        )
+        for attempt in range(_COPY_NAME_ATTEMPTS):
+            try:
+                new_workspace = await duplicate_workspace_on_computer(
+                    source_id,
+                    user_id,
+                    copy_name(source["name"], await get_workspace_name_keys(user_id)),
+                    source_binding.computer_id,
+                    description=source.get("description"),
+                    config=source_config or None,
+                )
+                break
+            except WorkspaceNameTaken:
+                # Another duplicate took the same copy name between the read
+                # and the insert; the next read sees it.
+                if attempt == _COPY_NAME_ATTEMPTS - 1:
+                    raise
         if new_workspace is None:
             raise RuntimeError("Computer was removed before the duplicate was created")
         await self.resolve_binding(str(new_workspace["workspace_id"]), workspace=new_workspace)

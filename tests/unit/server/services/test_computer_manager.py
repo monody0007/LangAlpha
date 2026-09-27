@@ -2956,6 +2956,7 @@ async def test_duplicate_stays_on_secondary_source_computer():
     with (
         patch("src.server.services.workspace_entitlements.db_get_workspace", AsyncMock(return_value=source)),
         patch("src.server.services.workspace_entitlements.duplicate_workspace_on_computer", AsyncMock(return_value={"workspace_id": "copy"})) as duplicate,
+        patch("src.server.services.workspace_entitlements.get_workspace_name_keys", AsyncMock(return_value={"source"})),
     ):
         await manager.duplicate_workspace("source", "user-1")
     assert duplicate.await_args.args[3] == "secondary"

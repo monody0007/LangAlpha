@@ -20,6 +20,23 @@ from ptc_cli.api.models import Message
 console = Console()
 
 
+class WorkspaceNameError(Exception):
+    """The server refused a workspace name; the message says why, for the user."""
+
+
+class WorkspaceNameTakenError(WorkspaceNameError):
+    """The user already has a workspace by this name; ``workspace_id`` is it."""
+
+    def __init__(self, message: str, workspace_id: str | None) -> None:
+        """Keep the holder's id so the caller can use that workspace instead."""
+        super().__init__(message)
+        self.workspace_id = workspace_id
+
+
+class WorkspaceNameInvalidError(WorkspaceNameError):
+    """The name is reserved, or has nothing left once made a folder name."""
+
+
 class SSEStreamClient:
     """
     Client for SSE streaming from PTC Agent server.
@@ -171,6 +188,33 @@ class SSEStreamClient:
             json={"name": name},
             timeout=120.0,  # Extended timeout for sandbox creation
         )
+        if response.status_code in (httpx.codes.CONFLICT, httpx.codes.BAD_REQUEST):
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = None
+            code = detail.get("code") if isinstance(detail, dict) else None
+            if code == "workspace_name_taken":
+                raise WorkspaceNameTakenError(
+                    detail.get("message") or f'A workspace named "{name}" already exists.',
+                    detail.get("workspace_id"),
+                )
+            if code == "workspace_name_invalid":
+                raise WorkspaceNameInvalidError(
+                    detail.get("message") or f'"{name}" cannot be used as a workspace name.'
+                )
+        if response.status_code == httpx.codes.UNPROCESSABLE_ENTITY:
+            # The request model checks the name's length before the server's
+            # own name rules can answer with a code.
+            try:
+                errors = response.json().get("detail")
+            except ValueError:
+                errors = None
+            for error in errors if isinstance(errors, list) else ():
+                if isinstance(error, dict) and list(error.get("loc") or ())[-1:] == ["name"]:
+                    raise WorkspaceNameInvalidError(
+                        f'"{name}" cannot be used as a workspace name: {error.get("msg")}.'
+                    )
         response.raise_for_status()
         return response.json()
 

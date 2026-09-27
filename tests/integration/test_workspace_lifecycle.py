@@ -125,6 +125,26 @@ class TestUpdateWorkspace:
         assert updated is not None
         assert updated["is_pinned"] is True
 
+    async def test_a_rename_onto_a_taken_name_names_the_holder(
+        self, seed_workspace, patched_get_db_connection
+    ):
+        from src.server.database.workspace import (
+            WorkspaceNameTaken,
+            create_workspace,
+            get_workspace,
+            update_workspace,
+        )
+
+        other = await create_workspace(
+            user_id=seed_workspace["user_id"], name="Research"
+        )
+        with pytest.raises(WorkspaceNameTaken) as caught:
+            await update_workspace(str(other["workspace_id"]), name="TEST workspace")
+
+        assert caught.value.workspace_id == str(seed_workspace["workspace_id"])
+        assert caught.value.name == "Test Workspace"
+        assert (await get_workspace(str(other["workspace_id"])))["name"] == "Research"
+
     async def test_update_workspace_status(
         self, seed_workspace, patched_get_db_connection
     ):

@@ -44,8 +44,8 @@ class WorkspaceCreate(BaseModel):
     name: str = Field(
         ...,
         min_length=1,
-        max_length=255,
-        description="Workspace name",
+        max_length=80,
+        description="Workspace name; unique per user, and the name of its folder",
     )
     description: Optional[str] = Field(
         None,
@@ -64,8 +64,8 @@ class WorkspaceUpdate(BaseModel):
     name: Optional[str] = Field(
         None,
         min_length=1,
-        max_length=255,
-        description="New workspace name",
+        max_length=80,
+        description="New workspace name; unique per user, and the name of its folder",
     )
     description: Optional[str] = Field(
         None,
@@ -138,6 +138,13 @@ class WorkspaceResponse(BaseModel):
         description=(
             "The folder this workspace owns on its computer; null for a "
             "workspace with no computer"
+        ),
+    )
+    previous_dir_names: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Folders this workspace was renamed out of, newest first; a path "
+            "under one of them still means this workspace's folder"
         ),
     )
     status: str = Field(

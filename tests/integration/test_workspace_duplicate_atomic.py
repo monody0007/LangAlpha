@@ -71,17 +71,42 @@ async def test_failed_copy_rolls_back_project(seed_user, test_db_pool, monkeypat
         assert await result.fetchone() is None
 
 
-async def test_slug_retry_keeps_outer_copy_transaction_usable(seed_user, test_db_pool, monkeypatch):
-    source, computer_id = await _source(seed_user["user_id"], test_db_pool)
-    monkeypatch.setattr(workspaces, "workspace_dir_name", lambda *args, hex_chars:
-                        source["dir_name"] if hex_chars == 4 else "copy-retried")
+async def test_a_held_folder_retry_keeps_outer_copy_transaction_usable(seed_user, test_db_pool):
+    """A deleted workspace awaiting cleanup still holds its folder, so the copy
+    is placed under a placeholder, inside the copy's own transaction."""
+    user_id = seed_user["user_id"]
+    source, computer_id = await _source(user_id, test_db_pool)
+    gone = await workspaces.create_workspace_on_computer(user_id, "Copy", computer_id)
+    async with test_db_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE workspaces SET status = 'deleted' WHERE workspace_id = %s",
+            (gone["workspace_id"],),
+        )
     duplicate = await workspaces.duplicate_workspace_on_computer(
-        str(source["workspace_id"]), seed_user["user_id"], "Copy", computer_id,
+        str(source["workspace_id"]), user_id, "Copy", computer_id,
     )
-    assert duplicate["dir_name"] == "copy-retried"
+    assert gone["dir_name"] == "Copy"
+    assert duplicate["dir_name"].startswith("Copy-")
     async with test_db_pool.connection() as conn:
         result = await conn.execute(
             "SELECT content_text FROM workspace_files WHERE workspace_id=%s",
             (duplicate["workspace_id"],),
         )
         assert (await result.fetchone())["content_text"] == "proof"
+
+
+async def test_a_taken_name_rolls_the_copy_back_and_names_the_holder(seed_user, test_db_pool):
+    user_id = seed_user["user_id"]
+    source, computer_id = await _source(user_id, test_db_pool)
+    with pytest.raises(workspaces.WorkspaceNameTaken) as caught:
+        await workspaces.duplicate_workspace_on_computer(
+            str(source["workspace_id"]), user_id, "SOURCE", computer_id,
+        )
+    assert caught.value.workspace_id == str(source["workspace_id"])
+    assert caught.value.name == "Source"
+    async with test_db_pool.connection() as conn:
+        result = await conn.execute(
+            "SELECT count(*) AS n FROM workspaces WHERE user_id = %s AND status <> 'deleted'",
+            (user_id,),
+        )
+        assert (await result.fetchone())["n"] == 1

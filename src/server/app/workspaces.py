@@ -35,6 +35,10 @@ from src.server.app.status_stream import (
     status_event_stream,
 )
 from src.server.database.workspace import WorkspaceBusyError
+from src.server.database.workspace_names import (
+    WorkspaceNameInvalid,
+    WorkspaceNameTaken,
+)
 from src.server.database.workspace import (
     get_workspace as db_get_workspace,
     get_workspaces_for_user,
@@ -65,6 +69,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/workspaces", tags=["Workspaces"])
 
 
+def _name_error(error: WorkspaceNameTaken | WorkspaceNameInvalid) -> HTTPException:
+    """Structured, so a client can offer the holder instead of only the message."""
+    if isinstance(error, WorkspaceNameTaken):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_name_taken",
+                "message": str(error),
+                "name": error.name,
+                "workspace_id": error.workspace_id,
+            },
+        )
+    detail = {"code": "workspace_name_invalid", "reason": error.reason, "message": str(error)}
+    if error.name:
+        detail["name"] = error.name
+    return HTTPException(status_code=400, detail=detail)
+
+
 @contextlib.asynccontextmanager
 async def _workspace_action_errors(action: str, workspace_id: str):
     """Shared error mapping for workspace action routes.
@@ -84,6 +106,9 @@ async def _workspace_action_errors(action: str, workspace_id: str):
         # keys on and ships request URLs and SDK bodies to the client. Re-raise
         # for the app-level handler that owns the wording and the sanitizing.
         raise
+    except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
+        # Before the ValueError arm: an unusable name is not a missing workspace.
+        raise _name_error(e) from None
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except BackupIncomplete as e:
@@ -121,6 +146,7 @@ def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
         sandbox_id=workspace.get("sandbox_id"),
         computer_id=str(computer_id) if computer_id else None,
         dir_name=workspace.get("dir_name"),
+        previous_dir_names=list(workspace.get("previous_dir_names") or ()),
         status=workspace["status"],
         created_at=workspace["created_at"],
         updated_at=workspace["updated_at"],
@@ -174,6 +200,8 @@ async def create_workspace(
 
     except HTTPException:
         raise
+    except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
+        raise _name_error(e) from None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -403,6 +431,8 @@ async def update_workspace(
 
     except HTTPException:
         raise
+    except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
+        raise _name_error(e) from None
     except Exception as e:
         logger.exception(f"Error updating workspace {workspace_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update workspace")

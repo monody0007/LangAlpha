@@ -1117,6 +1117,77 @@ async def test_duplicate_workspace_returns_created_copy(client):
 
 
 # ---------------------------------------------------------------------------
+# Name refusals on create, rename and duplicate: the shape clients read
+# ---------------------------------------------------------------------------
+
+_NAMING_ROUTES = ("create", "rename", "duplicate")
+_RESERVED = '"tools" is reserved; choose another name.'
+
+
+async def _refused(client, route: str, error: Exception):
+    ws = _ws(status="stopped")
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch(
+            "src.server.app.workspaces.db_update_workspace",
+            new_callable=AsyncMock,
+            side_effect=error,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+    ):
+        mock_manager = AsyncMock()
+        mock_manager.create_workspace = AsyncMock(side_effect=error)
+        mock_manager.duplicate_workspace = AsyncMock(side_effect=error)
+        MockWM.get_instance.return_value = mock_manager
+        if route == "create":
+            return await client.post("/api/v1/workspaces", json={"name": "Research"})
+        if route == "rename":
+            return await client.put(
+                f"/api/v1/workspaces/{ws['workspace_id']}", json={"name": "Research"}
+            )
+        return await client.post(f"/api/v1/workspaces/{ws['workspace_id']}/duplicate")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", _NAMING_ROUTES)
+async def test_a_taken_name_answers_409_naming_the_holder(client, route):
+    from src.server.database.workspace_names import WorkspaceNameTaken
+
+    resp = await _refused(client, route, WorkspaceNameTaken("Research", "ws-holder-1"))
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "code": "workspace_name_taken",
+        "message": 'A workspace named "Research" already exists.',
+        "name": "Research",
+        "workspace_id": "ws-holder-1",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", _NAMING_ROUTES)
+async def test_an_invalid_name_answers_400_before_the_value_error_arm(client, route):
+    """The refusal is a ValueError, which create reads as a bare 400 and duplicate as 404."""
+    from src.server.database.workspace_names import WorkspaceNameInvalid
+
+    resp = await _refused(
+        client, route, WorkspaceNameInvalid(_RESERVED, reason="reserved", name="tools")
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == {
+        "code": "workspace_name_invalid",
+        "reason": "reserved",
+        "message": _RESERVED,
+        "name": "tools",
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /api/v1/workspaces/{workspace_id}/events — SSE status stream
 # ---------------------------------------------------------------------------
 

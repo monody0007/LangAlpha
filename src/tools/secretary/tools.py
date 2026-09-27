@@ -328,6 +328,33 @@ async def _workspaces_list(user_id: str, tool_call_id: str) -> Command:
     )
 
 
+# Concurrent dispatches that planned one name each take the next free number.
+_AUTO_NAME_ATTEMPTS = 5
+
+
+async def _free_workspace_name(user_id: str, name: str) -> str:
+    """A name for a workspace nobody named, numbered past the ones the user has."""
+    from src.server.database.workspace import get_workspace_name_keys
+    from src.server.database.workspace_names import (
+        WorkspaceNameInvalid,
+        checked_workspace_name,
+        first_free_name,
+    )
+
+    try:
+        name = checked_workspace_name(name)
+    except WorkspaceNameInvalid:
+        name = "Research"
+    try:
+        taken = await get_workspace_name_keys(user_id)
+    except Exception as e:
+        # Only the number is lost: creation still refuses a taken name, and
+        # the caller's retry asks again.
+        logger.warning(f"Failed to read workspace names for {user_id}: {e}")
+        return name
+    return first_free_name(name, taken)
+
+
 async def _workspaces_create(
     user_id: str,
     name: str | None,
@@ -350,6 +377,11 @@ async def _workspaces_create(
             "User declined workspace creation.", tool_call_id
         )
 
+    from src.server.database.workspace_names import (
+        WorkspaceNameInvalid,
+        WorkspaceNameTaken,
+    )
+
     try:
         from src.server.services.workspace_manager import WorkspaceManager
 
@@ -365,10 +397,22 @@ async def _workspaces_create(
             {
                 "success": True,
                 "workspace_id": workspace_id,
-                "workspace_name": name,
+                "workspace_name": workspace["name"],
             },
             tool_call_id,
         )
+    except WorkspaceNameTaken as e:
+        if e.workspace_id is None:
+            # The holder was renamed or deleted before it could be named.
+            hint = "Try again, or create this one under a different name."
+        else:
+            hint = (
+                f"Its workspace_id is {e.workspace_id}: use that workspace, "
+                "or create this one under a different name."
+            )
+        return _error_command(f"{e} {hint}", tool_call_id)
+    except WorkspaceNameInvalid as e:
+        return _error_command(str(e), tool_call_id)
     except Exception as e:
         logger.error(f"Failed to create workspace: {e}")
         return _error_command("failed to create workspace", tool_call_id)
@@ -526,7 +570,7 @@ async def ptc_agent(
         if workspace_id:
             workspace_name = await _resolve_workspace_name(workspace_id, user_id)
         else:
-            workspace_name = question[:50].strip()
+            workspace_name = await _free_workspace_name(user_id, question[:50])
 
     approved, response = _hitl_confirm(
         "ptc_agent",
@@ -567,14 +611,25 @@ async def ptc_agent(
             if cap_err is not None:
                 return _error_command(cap_err, tool_call_id)
             try:
+                from src.server.database.workspace_names import WorkspaceNameTaken
                 from src.server.services.workspace_manager import WorkspaceManager
 
                 workspace_manager = WorkspaceManager.get_instance()
-                workspace = await workspace_manager.create_workspace(
-                    user_id=user_id,
-                    name=workspace_name or "Research",
-                    description=f"Auto-created for: {question[:100]}",
-                )
+                name = workspace_name
+                for attempt in range(_AUTO_NAME_ATTEMPTS):
+                    try:
+                        workspace = await workspace_manager.create_workspace(
+                            user_id=user_id,
+                            name=name,
+                            description=f"Auto-created for: {question[:100]}",
+                        )
+                        break
+                    except WorkspaceNameTaken:
+                        # Another dispatch took it since the last read; the
+                        # next free one is the same name with a later number.
+                        if attempt == _AUTO_NAME_ATTEMPTS - 1:
+                            raise
+                        name = await _free_workspace_name(user_id, workspace_name)
                 workspace_id = str(workspace["workspace_id"])
                 auto_created_workspace = True
             except Exception as e:

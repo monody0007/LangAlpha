@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT
+from ptc_cli.api.client import WorkspaceNameError, WorkspaceNameTakenError
 from ptc_cli.core import console
 from ptc_cli.display import show_help
 from ptc_cli.streaming.executor import execute_task, reconnect_to_workflow, replay_conversation
@@ -45,10 +46,23 @@ async def _select_or_create_workspace_interactive(
         return str(picked.get("workspace_id"))
 
     name_default = f"cli-{time.strftime('%Y%m%d-%H%M%S')}"
-    name = console.input(f"Workspace name [dim]({name_default})[/dim]: ").strip() or name_default
-    console.print("[dim]Creating workspace (can take ~60s)...[/dim]")
-    ws = await client.create_workspace(name=name)
-    return ws.get("workspace_id")
+    while True:
+        name = console.input(f"Workspace name [dim]({name_default})[/dim]: ").strip() or name_default
+        console.print("[dim]Creating workspace (can take ~60s)...[/dim]")
+        try:
+            ws = await client.create_workspace(name=name)
+        except WorkspaceNameTakenError as e:
+            if e.workspace_id:
+                console.print(f"[yellow]{e} Using it.[/yellow]")
+                return e.workspace_id
+            console.print(f"[yellow]{e}[/yellow]")
+        except WorkspaceNameError as e:
+            console.print(f"[yellow]{e}[/yellow]")
+        except httpx.HTTPStatusError as e:
+            handle_http_error(e, console, context="Could not create the workspace")
+            return None
+        else:
+            return ws.get("workspace_id")
 
 
 async def _ensure_workspace_running(client: "SSEStreamClient", workspace_id: str) -> bool:

@@ -276,6 +276,27 @@ async def test_update_workspace_name(ws_mock_db, mock_cursor):
 
 
 @pytest.mark.asyncio
+async def test_rename_collision_after_the_row_is_gone_is_not_found(ws_mock_db, mock_cursor):
+    """The name was taken, and the row went before its owner could be read: a
+    missing row answers not found, not a TypeError."""
+    from types import SimpleNamespace
+
+    from psycopg.errors import UniqueViolation
+
+    from src.server.database import workspace as W
+
+    class NameTaken(UniqueViolation):
+        @property
+        def diag(self):
+            return SimpleNamespace(constraint_name=W._USER_NAME_INDEX)
+
+    mock_cursor.execute = AsyncMock(side_effect=[NameTaken("duplicate key"), None])
+    mock_cursor.fetchone.return_value = None
+
+    assert await W.update_workspace("ws-1", name="Taken") is None
+
+
+@pytest.mark.asyncio
 async def test_update_workspace_status_stopped(ws_mock_db, mock_cursor):
     """update_workspace_status with 'stopped' sets stopped_at."""
     from src.server.database.workspace import update_workspace_status

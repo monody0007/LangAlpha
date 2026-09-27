@@ -51,6 +51,8 @@ docs: |
   - `name`: Workspace name
   - `description`: Workspace description
   - `sandbox_id`: Daytona sandbox ID (null if not yet created)
+  - `dir_name`: The workspace's folder on its computer
+  - `previous_dir_names`: Folders a rename moved the workspace out of, newest first
   - `status`: Workspace status (creating, running, stopping, stopped, error, deleted)
   - `created_at`: Creation timestamp
   - `updated_at`: Last update timestamp

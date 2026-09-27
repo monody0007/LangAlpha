@@ -58,8 +58,12 @@ docs/api/
 curl -X POST "http://localhost:8000/api/v1/workspaces" \
   -H "Content-Type: application/json" \
   -H "X-User-Id: user-123" \
-  -d '{"name": "My Project"}'
+  -d '{"name": "My Workspace"}'
 ```
+
+Names are unique per user. Run this twice and the second call answers `409`
+with `detail.code` set to `workspace_name_taken` and `detail.workspace_id` naming
+the workspace that already has the name, which you can use instead.
 
 ### Step 2: Start a Chat
 

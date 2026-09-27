@@ -5642,7 +5642,7 @@ class TestSetWorkspaceSpec:
 
 
 # ---------------------------------------------------------------------------
-# duplicate_workspace — copy files + carried tier into a fresh "<name> (copy)";
+# duplicate_workspace: copy files + carried tier into a fresh "<name> (copy)";
 # re-check the spec entitlement (a duplicate is a new allocation); eager
 # sandbox create; mark the new row error on create failure.
 # ---------------------------------------------------------------------------
@@ -5651,8 +5651,14 @@ class TestSetWorkspaceSpec:
 class TestDuplicateWorkspace:
     def setup_method(self):
         WorkspaceManager.reset_instance()
+        self._name_keys = patch(
+            "src.server.services.workspace_entitlements.get_workspace_name_keys",
+            AsyncMock(return_value={"test workspace"}),
+        )
+        self.name_keys = self._name_keys.start()
 
     def teardown_method(self):
+        self._name_keys.stop()
         WorkspaceManager.reset_instance()
 
     def _make_manager(self):
@@ -5733,6 +5739,51 @@ class TestDuplicateWorkspace:
         # Sandbox-identity stamps stripped; unrelated config keys preserved.
         assert mock_insert.call_args.kwargs["config"] == {"custom": "keep-me"}
         assert mock_insert.call_args[0][2] == "Test Workspace (copy)"
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_entitlements.duplicate_workspace_on_computer",
+        new_callable=AsyncMock,
+    )
+    @patch("src.server.services.workspace_entitlements.db_get_workspace")
+    async def test_a_taken_copy_name_counts_on(self, mock_get_ws, mock_insert):
+        """Names are unique per user, so a second copy cannot reuse the first's."""
+        manager = self._make_manager()
+        source = _make_workspace(status="stopped", user_id="user-1")
+        mock_get_ws.return_value = source
+        self.name_keys.return_value = {"test workspace", "test workspace (copy)"}
+        mock_insert.return_value = _make_workspace(computer_id=_STUB_COMPUTER_ID)
+
+        await manager.duplicate_workspace(source["workspace_id"], "user-1")
+
+        assert mock_insert.call_args[0][2] == "Test Workspace (copy 2)"
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_entitlements.duplicate_workspace_on_computer",
+        new_callable=AsyncMock,
+    )
+    @patch("src.server.services.workspace_entitlements.db_get_workspace")
+    async def test_a_copy_name_taken_in_between_is_read_again(self, mock_get_ws, mock_insert):
+        """Two duplicates at once read the same free name; the loser re-reads."""
+        from src.server.database.workspace_names import WorkspaceNameTaken
+
+        manager = self._make_manager()
+        source = _make_workspace(status="stopped", user_id="user-1")
+        mock_get_ws.return_value = source
+        self.name_keys.side_effect = [
+            {"test workspace"},
+            {"test workspace", "test workspace (copy)"},
+        ]
+        mock_insert.side_effect = [
+            WorkspaceNameTaken("Test Workspace (copy)"),
+            _make_workspace(computer_id=_STUB_COMPUTER_ID),
+        ]
+
+        await manager.duplicate_workspace(source["workspace_id"], "user-1")
+
+        names = [c.args[2] for c in mock_insert.call_args_list]
+        assert names == ["Test Workspace (copy)", "Test Workspace (copy 2)"]
 
     @pytest.mark.asyncio
     @patch(
