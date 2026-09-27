@@ -39,6 +39,8 @@ from src.server.app.workspace_files._shared import (
     _is_text_content_type,
     _is_utf8,
     _to_client_path,
+    folder_unmoved,
+    previous_dir_names_of,
 )
 from src.server.app.workspace_files.file_refs import (
     ResolveFileRefRequest,
@@ -136,6 +138,10 @@ async def _shared_file_bytes(
         else:
             if resolved is None:
                 return None
+            # Read without a folder hold, so the folder is checked after the
+            # fact: a sibling may have landed on the name the path was built on.
+            if not await folder_unmoved(workspace_id, target.workspace.get("dir_name")):
+                return None
             client_path, content = resolved
             return SharedBytes(
                 client_path, content, _mime_for(client_path, None), "sandbox"
@@ -201,11 +207,18 @@ async def _visible_listing(
     sandbox = warm_sandbox(target.workspace, target.workspace_id)
     if sandbox is not None:
         try:
-            return await _live_listing(sandbox, target, normalized_path), "sandbox"
+            files = await _live_listing(sandbox, target, normalized_path)
         except HTTPException:
             raise
         except Exception as e:
             _log_sandbox_miss("files", target.workspace_id, e)
+        else:
+            # Checked after the read as in _shared_file_bytes; a folder that
+            # moved mid-listing is a sandbox miss like any other.
+            if await folder_unmoved(
+                target.workspace_id, target.workspace.get("dir_name")
+            ):
+                return files, "sandbox"
     return await _stored_listing(target, normalized_path), "database"
 
 
@@ -243,7 +256,9 @@ async def list_shared_files(
     if _is_flash_workspace(target.workspace):
         return {"files": [], "source": "none"}
 
-    normalized_path = contained_listing_path(path, target.work_dir)
+    normalized_path = contained_listing_path(
+        path, target.work_dir, previous_dir_names_of(target.workspace)
+    )
     if normalized_path is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
@@ -263,11 +278,16 @@ async def resolve_shared_file(share_token: str, body: ResolveFileRefRequest):
     if _is_flash_workspace(target.workspace):
         return {"status": "unavailable", "reason": "flash_workspace", "matches": []}
 
-    candidates = clean_candidates(body.candidates, target.work_dir)
+    previous_dirs = previous_dir_names_of(target.workspace)
+    candidates = clean_candidates(body.candidates, target.work_dir, previous_dirs)
     if not candidates:
         raise HTTPException(status_code=400, detail="A file reference is required")
     recent_writes = [
-        p for p in (clean_path(w, target.work_dir) for w in body.recent_writes) if p
+        p
+        for p in (
+            clean_path(w, target.work_dir, previous_dirs) for w in body.recent_writes
+        )
+        if p
     ]
     files, source = await _visible_listing(target, "")
     result = resolve_file_ref(candidates, files, recent_writes)
@@ -293,7 +313,9 @@ async def read_shared_file(
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
     target = await resolve_shared_files(share_token, require_files=True)
-    normalized_path = contained_relative_path(path, target.work_dir)
+    normalized_path = contained_relative_path(
+        path, target.work_dir, previous_dir_names_of(target.workspace)
+    )
     if normalized_path is None or not target.visible(normalized_path):
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
@@ -337,7 +359,9 @@ async def download_shared_file(
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 
     target = await resolve_shared_files(share_token, require_download=True)
-    normalized_path = contained_relative_path(path, target.work_dir)
+    normalized_path = contained_relative_path(
+        path, target.work_dir, previous_dir_names_of(target.workspace)
+    )
     if normalized_path is None or not target.visible(normalized_path):
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
 

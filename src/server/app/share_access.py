@@ -19,6 +19,7 @@ from ptc_agent.core.paths import is_agent_notes_path
 from src.server.app.workspace_files._containment import contained_relative_path
 from src.server.app.workspace_files._shared import (
     _is_serve_blocked_path,
+    previous_dir_names_of,
     work_dir_for,
 )
 from src.server.database.conversation import get_thread_by_share_token
@@ -182,7 +183,9 @@ async def resolve_shared_files(
     raw_root = perms.get(SHARE_ROOT_PATH_KEY) or ""
     if not raw_root:
         return SharedFileTarget(workspace, ShareScope(workspace_id, ""), work_dir)
-    root_path = contained_relative_path(str(raw_root), work_dir)
+    root_path = contained_relative_path(
+        str(raw_root), work_dir, previous_dir_names_of(workspace)
+    )
     if root_path is None:
         logger.warning(
             f"Share token for workspace {workspace_id} carries an unusable "

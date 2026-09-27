@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+from collections.abc import Sequence
 from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, StringConstraints
@@ -46,7 +47,9 @@ class ResolveFileRefRequest(BaseModel):
     )
 
 
-def clean_path(value: str, work_dir: str) -> str | None:
+def clean_path(
+    value: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> str | None:
     """A workspace-relative path, or None for one that names no workspace file.
 
     ``work_dir`` is the workspace's own folder, never the computer root it sits
@@ -59,7 +62,7 @@ def clean_path(value: str, work_dir: str) -> str | None:
     absolute after the fold is refused here rather than handed on to a glob
     that would search for it under the workspace anyway.
     """
-    path = workspace_relative_path(value, work_dir)
+    path = workspace_relative_path(value, work_dir, previous_dir_names)
     if not path or path.startswith("/") or ".." in path.split("/"):
         return None
     # A ``file:`` URL can spell a NUL percent-encoded, and the result of this
@@ -69,9 +72,12 @@ def clean_path(value: str, work_dir: str) -> str | None:
     return path
 
 
-def clean_candidates(raw: list[str], work_dir: str) -> list[str]:
+def clean_candidates(
+    raw: list[str], work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> list[str]:
     """Distinct cleaned candidates that share the first one's file name."""
-    out = list(dict.fromkeys(p for p in (clean_path(v, work_dir) for v in raw) if p))
+    cleaned = (clean_path(v, work_dir, previous_dir_names) for v in raw)
+    out = list(dict.fromkeys(p for p in cleaned if p))
     if not out:
         return out
     name = posixpath.basename(out[0])

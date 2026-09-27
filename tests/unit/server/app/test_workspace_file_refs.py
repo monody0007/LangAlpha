@@ -7,6 +7,7 @@ namesake the reference did not mean.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from fnmatch import fnmatchcase
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,7 +17,10 @@ from fastapi import HTTPException
 
 from src.server.app.share_files import resolve_shared_file
 from src.server.app.workspace_files._containment import contained_relative_path
-from src.server.app.workspace_files._shared import _normalize_requested_path
+from src.server.app.workspace_files._shared import (
+    _normalize_requested_path,
+    previous_dir_names_of,
+)
 from src.server.app.workspace_files.crud import resolve_workspace_file
 from src.server.app.workspace_files.file_refs import (
     ResolveFileRefRequest,
@@ -152,6 +156,76 @@ class TestFoldingSpellings:
         assert contained_relative_path("//etc/passwd", FOLDER_WORK_DIR) is None
 
 
+RENAMED_WORK_DIR = f"{WORK_DIR}/New Name"
+PREVIOUS = ("Old Name", "Older")
+
+
+class TestPreviousFolderSpellings:
+    """A path under a folder the workspace was renamed out of is its own file.
+
+    The rename moved the folder, so ``/home/workspace/Old Name/x`` in an older
+    transcript names what ``<folder>/x`` names now, not ``<folder>/Old Name/x``.
+    """
+
+    @pytest.mark.parametrize("fold", _FOLDS, ids=_ids)
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [
+            (f"{WORK_DIR}/Old Name/reports/q3.md", "reports/q3.md"),
+            (f"{WORK_DIR}/Older/reports/q3.md", "reports/q3.md"),
+            # Folder names compare casefold, like the names they come from.
+            (f"{WORK_DIR}/old name/reports/q3.md", "reports/q3.md"),
+            ("/home/daytona/Old Name/reports/q3.md", "reports/q3.md"),
+            (f"file://{WORK_DIR}/Old%20Name/reports/q3.md", "reports/q3.md"),
+            # The current folder still wins, and relative paths are untouched.
+            (f"{RENAMED_WORK_DIR}/reports/q3.md", "reports/q3.md"),
+            ("Old Name/reports/q3.md", "Old Name/reports/q3.md"),
+        ],
+    )
+    def test_an_old_folder_spelling_folds_into_the_current_folder(
+        self, fold, requested, expected
+    ):
+        assert fold(requested, RENAMED_WORK_DIR, PREVIOUS) == expected
+
+    @pytest.mark.parametrize("fold", _FOLDS, ids=_ids)
+    def test_without_previous_names_the_old_folder_is_a_directory(self, fold):
+        requested = f"{WORK_DIR}/Old Name/reports/q3.md"
+        assert fold(requested, RENAMED_WORK_DIR) == "Old Name/reports/q3.md"
+
+    @pytest.mark.parametrize("gate", _GATES, ids=_ids)
+    @pytest.mark.parametrize(
+        "requested",
+        [
+            f"{WORK_DIR}/Old Name",
+            f"{WORK_DIR}/Old Name/",
+            f"{WORK_DIR}/Old Name/../Beta/secret.md",
+        ],
+    )
+    def test_the_old_folder_itself_or_a_climb_out_is_refused(self, gate, requested):
+        assert gate(requested, RENAMED_WORK_DIR, PREVIOUS) is None
+
+    @pytest.mark.parametrize("fold", _FOLDS, ids=_ids)
+    @pytest.mark.parametrize(
+        "requested",
+        ["/srv/ws/Old Name/reports/q3.md", "file:///srv/ws/Old%20Name/reports/q3.md"],
+    )
+    def test_an_old_folder_on_a_configured_root_folds_too(self, fold, requested):
+        # A configured working directory puts the computer root outside the
+        # stock roots; the former folder still sat beside the current one.
+        assert fold(requested, "/srv/ws/New Name", PREVIOUS) == "reports/q3.md"
+
+    @pytest.mark.parametrize("gate", _GATES, ids=_ids)
+    def test_a_climb_out_of_an_old_folder_on_a_configured_root_is_refused(self, gate):
+        requested = "/srv/ws/Old Name/../Beta/secret.md"
+        assert gate(requested, "/srv/ws/New Name", PREVIOUS) is None
+
+    def test_the_row_supplies_every_previous_name_but_its_current_one(self):
+        row = {"dir_name": "New Name", "previous_dir_names": ["Old Name", "New Name", ""]}
+        assert previous_dir_names_of(row) == ("Old Name",)
+        assert previous_dir_names_of({"dir_name": "New Name"}) == ()
+        assert previous_dir_names_of(None) == ()
+
+
 class TestResolve:
     def test_an_exact_candidate_wins(self):
         result = resolve_file_ref(["reports/model.py", "model.py"], ["model.py", "reports/model.py"])
@@ -200,6 +274,16 @@ def _body(*candidates: str, writes: list[str] | None = None) -> ResolveFileRefRe
 CRUD = "src.server.app.workspace_files.crud"
 
 
+def _held(sandbox, workspace):
+    """Stands in for the folder-holding acquisition the live search runs under."""
+
+    @asynccontextmanager
+    async def acquire(*_args):
+        yield sandbox, workspace
+
+    return acquire
+
+
 @pytest.mark.asyncio
 @patch(f"{CRUD}.owner_work_dir", return_value=WORK_DIR)
 @patch(f"{CRUD}.db_get_workspace", new_callable=AsyncMock)
@@ -214,21 +298,59 @@ class TestWorkspaceRoute:
         tree = [{"path": "results/q3/report.md"}, {"path": "results/summary.md"}, {"path": "_internal/report.md"}]
         with (
             patch(f"{CRUD}.FilePersistenceService.get_file_tree", new_callable=AsyncMock, return_value=tree),
-            patch(f"{CRUD}._acquire_sandbox", new_callable=AsyncMock) as acquire,
+            patch(f"{CRUD}._acquire_sandbox_to_change") as acquire,
         ):
             result = await resolve_workspace_file("ws-1", "user-1", _body("/home/workspace/report.md"))
-        acquire.assert_not_awaited()
+        acquire.assert_not_called()
         assert result == {
             "status": "resolved", "path": "results/q3/report.md", "match": "name",
             "matches": ["results/q3/report.md"], "source": "database",
         }
+
+    async def test_a_reference_under_an_old_folder_resolves_in_the_current_one(self, mock_ws, _wd):
+        """The row's previous folders reach the fold, so the nested namesake loses."""
+        mock_ws.return_value = {
+            **_workspace("stopped"), "dir_name": "New Name", "previous_dir_names": ["Old Name"],
+        }
+        tree = [{"path": "results/q3/report.md"}, {"path": "Old Name/results/q3/report.md"}]
+        with (
+            patch(f"{CRUD}.owner_work_dir", return_value=RENAMED_WORK_DIR),
+            patch(f"{CRUD}.FilePersistenceService.get_file_tree", new_callable=AsyncMock, return_value=tree),
+        ):
+            result = await resolve_workspace_file(
+                "ws-1", "user-1", _body(f"{WORK_DIR}/Old Name/results/q3/report.md")
+            )
+        assert (result["status"], result["path"], result["match"]) == (
+            "resolved", "results/q3/report.md", "exact",
+        )
+
+    async def test_the_reference_folds_against_the_row_the_acquisition_left(self, mock_ws, _wd):
+        """The acquisition is where a renamed folder moves, so a reference under
+        the new folder folds against the row it returns, not the one read first."""
+        before = {**_workspace("running"), "dir_name": "Old Name", "previous_dir_names": []}
+        after = {**_workspace("running"), "dir_name": "New Name", "previous_dir_names": ["Old Name"]}
+        mock_ws.return_value = before
+        sandbox = MagicMock()
+        sandbox.is_ready.return_value = True
+        sandbox.aglob_files = AsyncMock(return_value=[
+            f"{RENAMED_WORK_DIR}/report.md", f"{RENAMED_WORK_DIR}/New Name/report.md",
+        ])
+        with (
+            patch(f"{CRUD}._acquire_sandbox_to_change", _held(sandbox, after)),
+            patch(f"{CRUD}.owner_work_dir", side_effect=lambda ws: f"{WORK_DIR}/{ws['dir_name']}"),
+            patch(f"{CRUD}.contained_sandbox_path", new_callable=AsyncMock, return_value=RENAMED_WORK_DIR),
+        ):
+            result = await resolve_workspace_file(
+                "ws-1", "user-1", _body(f"{RENAMED_WORK_DIR}/report.md")
+            )
+        assert (result["status"], result["path"], result["match"]) == ("resolved", "report.md", "exact")
 
     async def test_a_sandbox_still_starting_leaves_the_client_to_read_the_path(self, mock_ws, _wd):
         mock_ws.return_value = _workspace("running")
         sandbox = MagicMock()
         sandbox.is_ready.return_value = False
         sandbox.aglob_files = AsyncMock()
-        with patch(f"{CRUD}._acquire_sandbox", new_callable=AsyncMock, return_value=sandbox):
+        with patch(f"{CRUD}._acquire_sandbox_to_change", _held(sandbox, _workspace("running"))):
             result = await resolve_workspace_file("ws-1", "user-1", _body("report.md"))
         assert result == {"status": "unavailable", "reason": "sandbox_starting", "matches": []}
         sandbox.aglob_files.assert_not_awaited()
@@ -241,7 +363,7 @@ class TestWorkspaceRoute:
             "/home/workspace/a/model.py", "/home/workspace/b/model.py", "/home/workspace/.git/x/model.py",
         ])
         with (
-            patch(f"{CRUD}._acquire_sandbox", new_callable=AsyncMock, return_value=sandbox),
+            patch(f"{CRUD}._acquire_sandbox_to_change", _held(sandbox, _workspace("running"))),
             patch(f"{CRUD}.contained_sandbox_path", new_callable=AsyncMock, return_value=WORK_DIR),
         ):
             result = await resolve_workspace_file("ws-1", "user-1", _body("model.py", writes=["b/model.py"]))
@@ -264,7 +386,7 @@ class TestWorkspaceRoute:
             "/home/workspace/other-zz99/results/model.py",
         ])
         with (
-            patch(f"{CRUD}._acquire_sandbox", new_callable=AsyncMock, return_value=sandbox),
+            patch(f"{CRUD}._acquire_sandbox_to_change", _held(sandbox, _workspace("running"))),
             patch(f"{CRUD}.owner_work_dir", return_value="/home/workspace/acme-ab12"),
             patch(f"{CRUD}.contained_sandbox_path", new_callable=AsyncMock, return_value="/home/workspace/acme-ab12"),
         ):

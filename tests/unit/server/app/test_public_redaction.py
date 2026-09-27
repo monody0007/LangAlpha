@@ -872,6 +872,9 @@ class TestReplayStripsWorkspaceId:
 # ---------------------------------------------------------------------------
 
 _RESOLVE_BYTES = "src.server.app.share_files.resolve_file_bytes_or_none"
+# The row a share route re-reads after a live read, to prove the folder the
+# read went to was still this workspace's.
+_FOLDER_RECHECK = "src.server.app.workspace_files._shared.db_get_workspace"
 
 
 def _warm_manager(
@@ -937,6 +940,10 @@ class TestPublicSharedBytesPrecedence:
             patch(
                 _DB_GET_WS, AsyncMock(return_value=_make_workspace(status="running"))
             ),
+            patch(
+                _FOLDER_RECHECK,
+                AsyncMock(return_value=_make_workspace(status="running")),
+            ),
             patch(_WORK_DIR, return_value="/home/workspace"),
             patch(_NORM_PATH, return_value="data/x.txt"),
             patch(_FILE_SVC, file_svc),
@@ -957,6 +964,10 @@ class TestPublicSharedBytesPrecedence:
             patch(_THREAD_BY_TOKEN, AsyncMock(return_value=_make_thread())),
             patch(
                 _DB_GET_WS, AsyncMock(return_value=_make_workspace(status="running"))
+            ),
+            patch(
+                _FOLDER_RECHECK,
+                AsyncMock(return_value=_make_workspace(status="running")),
             ),
             patch(_WORK_DIR, return_value="/home/workspace"),
             patch(_NORM_PATH, return_value="data/x.txt"),
@@ -985,6 +996,10 @@ class TestPublicSharedBytesPrecedence:
             patch(_THREAD_BY_TOKEN, AsyncMock(return_value=_make_thread())),
             patch(
                 _DB_GET_WS, AsyncMock(return_value=_make_workspace(status="running"))
+            ),
+            patch(
+                _FOLDER_RECHECK,
+                AsyncMock(return_value=_make_workspace(status="running")),
             ),
             patch(_WORK_DIR, return_value="/home/workspace"),
             patch(_FP_TREE, file_tree),

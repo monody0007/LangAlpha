@@ -914,6 +914,94 @@ class TestPreSplitRootPaths:
         )
 
 
+class TestPreviousFolderPaths:
+    """A path under a folder the workspace was renamed out of lands in its folder.
+
+    A rename moves the folder, but older turns, notes and links still spell the
+    old one. Folded as a loose root entry it would nest the old folder inside
+    the new one, so the old folder is dropped and the rest kept.
+    """
+
+    ROOT = "/home/workspace"
+    OWN = "New Name"
+    PREVIOUS = ("Old Name", "Older")
+    SIBLING = "Beta"
+
+    _sandbox = TestPreSplitRootPaths._sandbox
+
+    def _project(self, previous=PREVIOUS):
+        return ProjectContext(
+            workspace_id="ws-b",
+            dir_name=self.OWN,
+            sibling_dir_names=(self.SIBLING,),
+            previous_dir_names=previous,
+        )
+
+    @pytest.mark.parametrize(
+        ("absolute", "inside"),
+        [
+            ("/home/workspace/Old Name/reports/q3.md", "reports/q3.md"),
+            ("/home/workspace/Older/agent.md", "agent.md"),
+            # Names are unique per user by their casefolded key.
+            ("/home/workspace/old name/reports/q3.md", "reports/q3.md"),
+            ("/home/workspace/OLDER/data/x.csv", "data/x.csv"),
+        ],
+    )
+    def test_an_old_folder_spelling_lands_in_the_current_folder(
+        self, absolute, inside
+    ):
+        sandbox, project = self._sandbox(), self._project()
+        assert (
+            _paths.normalize_path(sandbox, absolute, project)
+            == f"{self.ROOT}/{self.OWN}/{inside}"
+        )
+
+    def test_the_old_folder_itself_is_the_current_folder(self):
+        sandbox, project = self._sandbox(), self._project()
+        assert (
+            _paths.normalize_path(sandbox, f"{self.ROOT}/Old Name", project)
+            == f"{self.ROOT}/{self.OWN}"
+        )
+
+    def test_the_folded_write_is_allowed_and_virtualizes_back(self):
+        sandbox, project = self._sandbox(), self._project()
+        spelling = f"{self.ROOT}/Old Name/reports/q3.md"
+        resolved = _paths.normalize_path(sandbox, spelling, project)
+        assert _paths.validate_path(sandbox, spelling, project) is True
+        assert _paths.virtualize_path(sandbox, resolved, project) == "/reports/q3.md"
+
+    @pytest.mark.parametrize(
+        "absolute",
+        [
+            f"/home/workspace/{SIBLING}/work/report.md",
+            # A climb out of the old folder is judged where it lands.
+            f"/home/workspace/Old Name/../{SIBLING}/work/report.md",
+            "/home/workspace/.agents/user/memory/note.md",
+        ],
+    )
+    def test_siblings_and_reserved_entries_keep_their_own_spelling(self, absolute):
+        sandbox, project = self._sandbox(), self._project()
+        assert _paths.normalize_path(sandbox, absolute, project) == (
+            absolute.replace("Old Name/../", "")
+        )
+
+    def test_a_name_a_sibling_holds_is_the_siblings_even_if_passed_in(self):
+        """Placement drops such a name; the resolver still refuses to take it."""
+        sandbox = self._sandbox()
+        project = self._project(previous=(self.SIBLING,))
+        absolute = f"{self.ROOT}/{self.SIBLING}/work/report.md"
+        assert _paths.normalize_path(sandbox, absolute, project) == absolute
+
+    def test_a_relative_old_name_is_a_directory_in_the_folder(self):
+        """Only a root-anchored spelling names the old folder; the agent's
+        relative paths already hang off the current one."""
+        sandbox, project = self._sandbox(), self._project()
+        assert (
+            _paths.normalize_path(sandbox, "Old Name/x.md", project)
+            == f"{self.ROOT}/{self.OWN}/Old Name/x.md"
+        )
+
+
 def ctx_var_reset(token: contextvars.Token) -> None:
     from ptc_agent.core import project_context
 

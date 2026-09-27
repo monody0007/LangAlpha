@@ -52,11 +52,13 @@ class FileTooLargeToServe(Exception):
         self.size = size
 
 
-def contained_relative_path(path: str, work_dir: str) -> str | None:
+def contained_relative_path(
+    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> str | None:
     """Canonicalize before mirror lookup; sandbox lexical normalization misses .. and symlinks."""
     # The NUL check reads the folded path, not the request: a ``file:`` URL
     # spells one percent-encoded, and the fold is where it decodes.
-    normalized = _normalize_requested_path(path or "", work_dir)
+    normalized = _normalize_requested_path(path or "", work_dir, previous_dir_names)
     if not normalized or "\x00" in normalized:
         return None
     canonical = posixpath.normpath(normalized)
@@ -65,17 +67,21 @@ def contained_relative_path(path: str, work_dir: str) -> str | None:
     return canonical
 
 
-def contained_listing_path(path: str, work_dir: str) -> str | None:
+def contained_listing_path(
+    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> str | None:
     """Empty and root spellings name the workspace directory, unlike empty file requests."""
     raw = (path or "").strip()
     if raw in {"", ".", "./", "/"}:
         return ""
-    return contained_relative_path(raw, work_dir)
+    return contained_relative_path(raw, work_dir, previous_dir_names)
 
 
-def contained_absolute_path(path: str, work_dir: str) -> str | None:
+def contained_absolute_path(
+    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> str | None:
     """Use the workspace base: sandbox normalization also allows the shared computer root and /tmp."""
-    relative = contained_relative_path(path, work_dir)
+    relative = contained_relative_path(path, work_dir, previous_dir_names)
     if relative is None:
         return None
     return f"{work_dir.rstrip('/')}/{relative}"

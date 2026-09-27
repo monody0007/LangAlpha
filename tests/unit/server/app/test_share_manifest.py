@@ -9,6 +9,7 @@ is locked without a database or a sandbox.
 from __future__ import annotations
 
 import time
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -58,8 +59,9 @@ def reader(monkeypatch):
     """Install a fake reader; the test fills ``.files`` before building."""
     fake = FakeReader({})
 
+    @asynccontextmanager
     async def _reader_for(workspace, user_id, work_dir):
-        return fake
+        yield fake, work_dir, ()
 
     monkeypatch.setattr(sm, "_reader_for", _reader_for)
     return fake
@@ -447,3 +449,44 @@ async def test_cjk_references_resolve_to_the_raw_unicode_path(reader):
     ).files
     entries = await _build("报告/index.html")
     assert _paths(entries) == ["报告/index.html", "报告/图表.png", "报告/图表2.png"]
+
+
+# --- build_manifest: the live folder ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_live_walk_holds_the_folder_until_the_list_is_built(monkeypatch):
+    """Files are read by path level after level, so a rename settling mid-walk
+    would drop every file after the move; the hold spans the whole walk."""
+    events: list[str] = []
+
+    class LoggingReader(FakeReader):
+        async def stat(self, paths):
+            events.append("stat")
+            return await super().stat(paths)
+
+    live = LoggingReader(
+        {"index.html": '<link href="style.css">', "style.css": "a{}"}
+    )
+
+    @asynccontextmanager
+    async def acquire(workspace_id, user_id):
+        events.append("held")
+        try:
+            yield object(), {**WORKSPACE, "status": "running"}
+        finally:
+            events.append("released")
+
+    monkeypatch.setattr(sm, "_acquire_sandbox_to_change", acquire)
+    monkeypatch.setattr(sm, "owner_work_dir", lambda workspace: WORK_DIR)
+    monkeypatch.setattr(sm, "_SandboxReader", lambda *args: live)
+
+    entries = await build_manifest(
+        {**WORKSPACE, "status": "running"},
+        "index.html",
+        user_id=OWNER,
+        work_dir=WORK_DIR,
+    )
+
+    assert _paths(entries) == ["index.html", "style.css"]
+    assert events == ["held", "stat", "stat", "released"]

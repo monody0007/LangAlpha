@@ -507,8 +507,29 @@ def computer_tier_relative_path(path: str | None) -> str | None:
     return None
 
 
+def strip_previous_dir_name(
+    relative: str, previous_dir_names: Sequence[str]
+) -> str | None:
+    """The rest of a root-relative path that starts in a folder the workspace left.
+
+    None when the first segment names none of them. Casefold, because workspace
+    names are unique per user by their casefolded key and a folder is named
+    after its workspace.
+    """
+    first, _, rest = relative.partition("/")
+    folded = first.casefold()
+    if first and any(folded == name.casefold() for name in previous_dir_names):
+        return rest
+    return None
+
+
 def _root_entry_in_folder(
-    path: str, *, workspace: str, root: str, siblings: Sequence[str] | None
+    path: str,
+    *,
+    workspace: str,
+    root: str,
+    siblings: Sequence[str] | None,
+    previous: Sequence[str] = (),
 ) -> str | None:
     """A loose root entry re-read as this project's own file, or None to keep the path.
 
@@ -517,10 +538,12 @@ def _root_entry_in_folder(
     spelling of this project's file: a turn resumed from before the folder
     existed, or a link stored when the workspace was the whole machine. Left at
     the root the write lands beside the folders, where no route serves it and
-    no mirror scans it. A sibling's folder is spelled as itself, since a turn
-    may write there on purpose, which is why ``siblings`` of None -- a caller
-    that cannot enumerate the machine's folders -- leaves every path alone
-    rather than reading a sibling's as its own.
+    no mirror scans it. A folder the workspace was renamed out of (``previous``)
+    names the current folder, so its entry is dropped rather than nested. A
+    sibling's folder is spelled as itself, since a turn may write there on
+    purpose, which is why ``siblings`` of None -- a caller that cannot
+    enumerate the machine's folders -- leaves every path alone rather than
+    reading a sibling's as its own.
     """
     if siblings is None or workspace == root or not path.startswith(f"{root}/"):
         return None
@@ -533,7 +556,8 @@ def _root_entry_in_folder(
         or first == posixpath.basename(workspace)
     ):
         return None
-    return lexical_path(f"{workspace}/{relative}")
+    inside = strip_previous_dir_name(relative, previous)
+    return lexical_path(f"{workspace}/{relative if inside is None else inside}")
 
 
 def resolve_agent_path(
@@ -543,6 +567,7 @@ def resolve_agent_path(
     root: str,
     allowed: Sequence[str],
     sibling_dir_names: Sequence[str] | None = None,
+    previous_dir_names: Sequence[str] = (),
 ) -> str:
     """Fold an agent's spelling of a path onto the directory it names.
 
@@ -553,8 +578,8 @@ def resolve_agent_path(
     the computer; the split matters because the store-backed user mounts are
     keyed on the root-anchored prefix, so a computer-tier name folded into the
     folder would miss every route and write a real file the store never sees.
-    An absolute path that lands on an unowned root entry folds too, per
-    :func:`_root_entry_in_folder`.
+    An absolute path that lands on an unowned root entry, or in a folder the
+    workspace was renamed out of, folds too, per :func:`_root_entry_in_folder`.
     """
     if path in (None, "", ".", "/"):
         return workspace
@@ -569,6 +594,7 @@ def resolve_agent_path(
                     workspace=workspace,
                     root=root,
                     siblings=sibling_dir_names,
+                    previous=previous_dir_names,
                 )
                 or collapsed
             )

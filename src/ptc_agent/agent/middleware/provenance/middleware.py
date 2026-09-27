@@ -50,6 +50,7 @@ from ptc_agent.core.paths import (
     MEMORY_USER_DIR,
     SandboxLayout,
     WorkspaceLayout,
+    strip_previous_dir_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -173,17 +174,24 @@ def _normalize_sandbox_path(path: str) -> str:
     cwd is that folder, so a relative path it emits is already in this form and
     only an absolute one carries the folder. Without the second strip a doc
     read as ``/home/workspace/<ws>/.agents/tools/docs/...`` misses every infra
-    prefix and is recorded as a data source.
+    prefix and is recorded as a data source. An absolute path under a folder
+    the workspace was renamed out of names the same file, so it strips too.
     """
     p = (path or "").lstrip("/").removeprefix("./")
+    rooted = False
     for prefix in _SANDBOX_ROOT_PREFIXES:
         if p.startswith(prefix):
             p = p[len(prefix):]
+            rooted = True
             break
     project = current_project()
     folder = (project.dir_name if project else None) or ""
     if folder and (p == folder or p.startswith(folder + "/")):
         p = p[len(folder) :].lstrip("/")
+    elif rooted and project is not None:
+        inside = strip_previous_dir_name(p, project.previous_dir_names)
+        if inside is not None:
+            p = inside
     return p
 
 

@@ -57,6 +57,7 @@ def normalize_path(
         root=sandbox._work_dir,
         allowed=sandbox.config.filesystem.allowed_directories,
         sibling_dir_names=ctx.sibling_dir_names if ctx is not None else (),
+        previous_dir_names=ctx.previous_dir_names if ctx is not None else (),
     )
 
 

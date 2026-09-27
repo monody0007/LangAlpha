@@ -25,6 +25,7 @@ _BINDING_SQL = """
         w.dir_name,
         w.status,
         w.layout_origin,
+        w.previous_dir_names,
         ARRAY(
             SELECT s.dir_name
             FROM workspaces s
@@ -43,7 +44,7 @@ _BINDING_SQL = """
 async def get_project_binding(
     workspace_id: str, *, conn=None
 ) -> Optional[Dict[str, Any]]:
-    """The project's computer, its folder there, and its siblings' folders.
+    """The workspace's computer, its current and former folders there, and its siblings'.
 
     Raises on a read failure rather than answering None: the caller cannot tell
     a failed read from an unbound project, and treating the second as the first
@@ -68,5 +69,6 @@ async def get_project_binding(
         "dir_name": row["dir_name"],
         "status": row["status"],
         "layout_origin": row.get("layout_origin"),
+        "previous_dir_names": tuple(row.get("previous_dir_names") or ()),
         "sibling_dir_names": tuple(row["sibling_dir_names"] or ()),
     }

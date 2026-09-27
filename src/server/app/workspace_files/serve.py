@@ -45,6 +45,8 @@ from ._shared import (
     _is_serve_blocked_path,
     _record_fs_bytes,
     _to_client_path,
+    folder_unmoved,
+    previous_dir_names_of,
     work_dir_for,
 )
 
@@ -347,6 +349,10 @@ async def _resolve_serve_bytes(
         )
     if resolved is None:
         return None
+    # Read without a folder hold, so the folder ``work_dir`` was built on is
+    # checked after the fact: a sibling may have landed on its name.
+    if not await folder_unmoved(workspace_id, workspace.get("dir_name")):
+        return None
     return resolved[1], extension_mime
 
 
@@ -389,7 +395,9 @@ async def serve_workspace_file(
         raise HTTPException(status_code=404, detail="Not found")
 
     work_dir = _served_work_dir(workspace, workspace_id)
-    normalized_path = contained_relative_path(path, work_dir)
+    normalized_path = contained_relative_path(
+        path, work_dir, previous_dir_names_of(workspace)
+    )
     if normalized_path is None or not visible(normalized_path):
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -473,7 +481,9 @@ async def render_workspace_file_pdf(
         raise HTTPException(status_code=404, detail="Not found")
 
     work_dir = _served_work_dir(workspace, workspace_id)
-    normalized_path = contained_relative_path(path, work_dir)
+    normalized_path = contained_relative_path(
+        path, work_dir, previous_dir_names_of(workspace)
+    )
     if normalized_path is None or not visible(normalized_path):
         raise HTTPException(status_code=404, detail="Not found")
 

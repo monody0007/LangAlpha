@@ -30,6 +30,8 @@ class ProjectPlacement:
     #: The layout version the project's files were first written under, or
     #: None for a project born on the current one.
     layout_origin: int | None = None
+    #: Folders a rename moved the workspace out of that no sibling holds now.
+    previous_dir_names: tuple[str, ...] = ()
 
     @property
     def dir_name(self) -> str:
@@ -70,17 +72,30 @@ def placement_from_binding(
     *,
     root: str,
 ) -> ProjectPlacement:
+    """The layout plus its neighbours, dropping any former folder a sibling holds.
+
+    The old spelling stopped naming this workspace when the sibling took the
+    name, and reading it as this workspace's would fold the sibling's paths into
+    this folder.
+    """
     layout = layout_from_binding(workspace_id, binding, root=root)
     siblings = tuple(
         name
         for name in ((binding or {}).get("sibling_dir_names") or ())
         if name and name != layout.dir_name
     )
+    held = {name.casefold() for name in siblings}
+    previous = tuple(
+        name
+        for name in ((binding or {}).get("previous_dir_names") or ())
+        if name and name != layout.dir_name and name.casefold() not in held
+    )
     origin = (binding or {}).get("layout_origin")
     return ProjectPlacement(
         layout=layout,
         sibling_dir_names=siblings,
         layout_origin=int(origin) if origin is not None else None,
+        previous_dir_names=previous,
     )
 
 

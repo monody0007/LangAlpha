@@ -68,6 +68,7 @@ async def capture_and_rewrite_images(
         project = ProjectContext(
             workspace_id, placement.dir_name,
             placement.sibling_dir_names, placement.layout_origin,
+            placement.previous_dir_names,
         )
     path_to_url = await capture_sandbox_images(
         sandbox, image_paths, thread_id, project=project

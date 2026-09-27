@@ -8,6 +8,7 @@ external infrastructure.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +20,7 @@ from tests.integration.sandbox.conftest import _make_core_config
 from tests.integration.sandbox.memory_provider import MemoryProvider
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+from src.server.database.workspace_folders import FolderHold
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -110,10 +112,15 @@ async def files_client(mock_session, sandbox):
 
     # The dual-router package resolves sessions from three modules — patch
     # WorkspaceManager at every import site or the real singleton gets hit.
+    # The row is read twice: once for ownership, and again after acquisition.
+    workspace = AsyncMock(return_value=_make_workspace())
     with (
+        patch("src.server.app.workspace_files.crud.db_get_workspace", workspace),
+        patch("src.server.app.workspace_files._shared.db_get_workspace", workspace),
+        # The folder hold is an advisory lock; the database is mocked here.
         patch(
-            "src.server.app.workspace_files.crud.db_get_workspace",
-            AsyncMock(return_value=_make_workspace()),
+            "src.server.app.workspace_files._shared.workspace_folder_in_use",
+            lambda workspace_id: nullcontext(FolderHold(workspace_id, None)),
         ),
         patch("src.server.app.workspace_files.crud.WorkspaceManager") as MockWM,
         patch(

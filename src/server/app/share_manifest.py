@@ -18,6 +18,8 @@ import logging
 import posixpath
 import re
 import shlex
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from html.parser import HTMLParser
@@ -34,8 +36,10 @@ from src.server.app.workspace_files._containment import (
     is_within,
 )
 from src.server.app.workspace_files._shared import (
-    _acquire_sandbox,
+    _acquire_sandbox_to_change,
     _to_client_path,
+    owner_work_dir,
+    previous_dir_names_of,
 )
 from src.server.app.workspace_files.serve import _db_fallback_bytes, warm_sandbox_bytes
 from src.server.models.workspace import served_from_mirror
@@ -196,7 +200,9 @@ def script_refs(text: str) -> list[str]:
     return [m.group(1) for m in _SCRIPT_PATH_RE.finditer(text)]
 
 
-def resolve_ref(ref: str, referrer: str, work_dir: str) -> str | None:
+def resolve_ref(
+    ref: str, referrer: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> str | None:
     """The workspace path a reference names, or None when it names nothing here.
 
     Relative references resolve against the referencing file's folder, and
@@ -214,7 +220,7 @@ def resolve_ref(ref: str, referrer: str, work_dir: str) -> str | None:
     if not raw or "\x00" in raw:
         return None
     if raw.startswith("/") or raw.lower().startswith("file:"):
-        return contained_relative_path(raw, work_dir)
+        return contained_relative_path(raw, work_dir, previous_dir_names)
     joined = posixpath.normpath(posixpath.join(posixpath.dirname(referrer), raw))
     if joined in (".", "..") or joined.startswith(("/", "../")):
         return None
@@ -325,13 +331,27 @@ class _SandboxReader:
         return resolved[1] if resolved else None
 
 
-async def _reader_for(workspace: dict[str, Any], user_id: str, work_dir: str):
-    """The same source the owner's own file routes read for this status."""
+@asynccontextmanager
+async def _reader_for(
+    workspace: dict[str, Any], user_id: str, work_dir: str
+) -> AsyncIterator[tuple[Any, str, tuple[str, ...]]]:
+    """The same source the owner's own file routes read for this status.
+
+    Yields the reader with the folder and former folders to fold references
+    against. A live walk holds the folder until the list is built: a rename
+    settling mid-walk would drop every file read after the move.
+    """
     if served_from_mirror(workspace.get("status")):
-        return _MirrorReader(workspace)
+        yield _MirrorReader(workspace), work_dir, previous_dir_names_of(workspace)
+        return
     workspace_id = str(workspace["workspace_id"])
-    sandbox = await _acquire_sandbox(workspace_id, user_id)
-    return _SandboxReader(sandbox, work_dir, ShareScope(workspace_id, ""))
+    async with _acquire_sandbox_to_change(workspace_id, user_id) as (sandbox, held):
+        work_dir = owner_work_dir(held)
+        yield (
+            _SandboxReader(sandbox, work_dir, ShareScope(workspace_id, "")),
+            work_dir,
+            previous_dir_names_of(held),
+        )
 
 
 # --- the walk ------------------------------------------------------------
@@ -386,8 +406,21 @@ async def build_manifest(
     if not shared_path_visible(scope, entry_path):
         raise ManifestEntryMissing(entry_path)
 
-    reader = await _reader_for(workspace, user_id, work_dir)
+    async with _reader_for(workspace, user_id, work_dir) as (
+        reader,
+        work_dir,
+        previous_dirs,
+    ):
+        return await _walk(reader, entry_path, scope, work_dir, previous_dirs)
 
+
+async def _walk(
+    reader: Any,
+    entry_path: str,
+    scope: ShareScope,
+    work_dir: str,
+    previous_dirs: tuple[str, ...],
+) -> list[ManifestEntry]:
     entries: list[ManifestEntry] = []
     listed: set[str] = set()
     total = 0
@@ -458,7 +491,7 @@ async def build_manifest(
             refs = await asyncio.to_thread(_references, kind, content)
             for ref, ref_reason in refs:
                 for referrer in referrers:
-                    resolved = resolve_ref(ref, referrer, work_dir)
+                    resolved = resolve_ref(ref, referrer, work_dir, previous_dirs)
                     if resolved is not None and resolved not in listed:
                         level.append((resolved, ref_reason, next_depth, page))
 

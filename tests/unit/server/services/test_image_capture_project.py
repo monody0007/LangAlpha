@@ -25,6 +25,7 @@ async def test_capture_reads_the_project_folder_outside_the_run_context(monkeypa
     monkeypatch.setattr('ptc_agent.agent.middleware.image_capture.get_public_url', lambda key: 'https://images.example/'+key)
     placement = AsyncMock(return_value=SimpleNamespace(
         dir_name=project.dir_name, sibling_dir_names=(), layout_origin=None,
+        previous_dir_names=(),
     ))
     monkeypatch.setattr('src.server.services.workspace_layout.resolve_project_placement', placement)
     events = [{'event': 'message_chunk', 'data': {

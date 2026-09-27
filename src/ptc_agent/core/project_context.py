@@ -44,6 +44,9 @@ class ProjectContext:
     sibling_dir_names: tuple[str, ...] = field(default=())
     #: Layout version the files predate the folder layout under (3), or None.
     layout_origin: int | None = None
+    #: Folders a rename moved this workspace out of that no sibling holds now,
+    #: so an old spelling of a path still names this folder.
+    previous_dir_names: tuple[str, ...] = field(default=())
 
     @property
     def claim(self) -> str:

@@ -415,6 +415,61 @@ async def test_file_read_keeps_lookalike_paths(middleware, path):
     assert emitted[0]["identifier"] == path
 
 
+@pytest.fixture
+def renamed_project():
+    """A turn in `New Name`, renamed out of `Old Name`."""
+    from ptc_agent.core import project_context
+    from ptc_agent.core.project_context import ProjectContext, set_project
+
+    token = set_project(
+        ProjectContext(
+            workspace_id="ws-1",
+            dir_name="New Name",
+            sibling_dir_names=("Beta",),
+            previous_dir_names=("Old Name",),
+        )
+    )
+    yield
+    project_context._current.reset(token)
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/home/workspace/New Name/.agents/memory/memory.md", "memory_read"),
+        ("/home/workspace/Old Name/.agents/memory/memory.md", "memory_read"),
+        ("/home/workspace/old name/.agents/user/memo/x.md", "memo_read"),
+        # Only an absolute path carries a folder; a relative one is already in
+        # the cwd, so an `Old Name/` there is a directory inside it.
+        ("Old Name/.agents/memory/memory.md", "file_read"),
+        ("/home/workspace/Beta/.agents/memory/memory.md", "file_read"),
+    ],
+)
+def test_a_renamed_out_folder_classifies_as_the_current_one(
+    renamed_project, path, expected
+):
+    from ptc_agent.agent.middleware.provenance.middleware import (
+        _classify_file_source_type,
+    )
+
+    assert _classify_file_source_type(path) == expected
+
+
+@pytest.mark.parametrize(
+    "path,infra",
+    [
+        ("/home/workspace/Old Name/.agents/skills/x/SKILL.md", True),
+        ("/home/workspace/Beta/.agents/skills/x/SKILL.md", False),
+    ],
+)
+def test_a_renamed_out_folder_skips_infra_like_the_current_one(
+    renamed_project, path, infra
+):
+    from ptc_agent.agent.middleware.provenance.middleware import _is_agent_infra_path
+
+    assert _is_agent_infra_path(path) is infra
+
+
 @pytest.mark.asyncio
 async def test_glob_not_tracked(middleware):
     """Glob is directory enumeration, not a data access — emits no provenance."""

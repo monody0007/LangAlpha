@@ -22,7 +22,11 @@ from pydantic import BaseModel, Field
 
 from src.server.app.share_access import ShareScope, shared_path_visible
 from src.server.app.workspace_files._containment import contained_relative_path
-from src.server.app.workspace_files._shared import _is_flash_workspace, owner_work_dir
+from src.server.app.workspace_files._shared import (
+    _is_flash_workspace,
+    owner_work_dir,
+    previous_dir_names_of,
+)
 from src.server.database.share_codes import share_path
 from src.server.database.share_links import (
     KIND_FILE,
@@ -151,7 +155,9 @@ async def get_or_create_share_link(
             raise HTTPException(status_code=422, detail="A port is required")
         return _to_model(await ensure_app_link(ws_id, body.port))
 
-    path = contained_relative_path(body.path or "", work_dir)
+    path = contained_relative_path(
+        body.path or "", work_dir, previous_dir_names_of(workspace)
+    )
     if path is None or not shared_path_visible(ShareScope(ws_id, ""), path):
         raise HTTPException(status_code=400, detail="This file cannot be shared")
     return _to_model(await ensure_file_link(ws_id, path))

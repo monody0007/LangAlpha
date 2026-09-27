@@ -39,6 +39,9 @@ _DBWS_PATCH = "src.server.app.workspace_files.serve.db_get_workspace"
 _FP_PATCH = "src.server.app.workspace_files.serve.FilePersistenceService"
 _WD_PATCH = "src.server.app.workspace_files.serve.work_dir_for"
 _WSMGR_PATCH = "src.server.app.workspace_files.serve.WorkspaceManager"
+# The row the route re-reads after a live read, to prove the folder the read
+# went to was still this workspace's.
+_RECHECK_PATCH = "src.server.app.workspace_files._shared.db_get_workspace"
 # The serve root is resolved in the shared helpers, so a test about resolving
 # it patches the manager they read the computer root from, not the route's.
 _SHARED_WSMGR_PATCH = "src.server.app.workspace_files._shared.WorkspaceManager"
@@ -358,12 +361,15 @@ async def test_db_fallback_unknown_extension_uses_db_mime(
 
 
 @pytest.mark.asyncio
+@patch(_RECHECK_PATCH, new_callable=AsyncMock)
 @patch(_VAULT_PATCH, new_callable=AsyncMock, return_value={})
 @patch(_WD_PATCH, return_value="/home/workspace")
 @patch(_WSMGR_PATCH)
 @patch(_DBWS_PATCH, new_callable=AsyncMock)
-async def test_running_workspace_serves_live_bytes(mock_ws, mock_mgr, _wd, _vault):
-    mock_ws.return_value = _workspace("running")
+async def test_running_workspace_serves_live_bytes(
+    mock_ws, mock_mgr, _wd, _vault, mock_recheck
+):
+    mock_ws.return_value = mock_recheck.return_value = _workspace("running")
     _warm(mock_mgr, _running_sandbox(b"<html><body>live</body></html>"))
     resp = await serve_workspace_file(WS_ID, "results/x.html", inject_theme=False)
     assert resp.status_code == 200

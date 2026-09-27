@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import posixpath
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 from urllib.parse import unquote
 
@@ -26,9 +29,16 @@ from ptc_agent.core.paths import (
     USER_PROFILE_PORTFOLIO_FILE,
     USER_PROFILE_PREFERENCE_FILE,
     USER_PROFILE_WATCHLIST_FILE,
+    strip_previous_dir_name,
 )
 from ptc_agent.core.sandbox.runtime import STREAM_CHUNK_BYTES
 from src.server.database.blob_keys import RELAY_MAX_BYTES
+from src.server.database.workspace import get_workspace as db_get_workspace
+from src.server.database.workspace_folders import (
+    WorkspaceFolderMoving,
+    is_top_level,
+    workspace_folder_in_use,
+)
 from src.server.services.persistence.transfer import (
     INPROCESS_MAX_INFLIGHT_BYTES,
     ByteBudget,
@@ -297,8 +307,17 @@ def _is_flash_workspace(workspace: dict[str, Any]) -> bool:
     return workspace.get("status") == "flash"
 
 
-async def _acquire_sandbox(workspace_id: str, user_id: str) -> Any:
-    """Get a ready sandbox for the workspace, or raise 503."""
+async def _acquire_sandbox(
+    workspace_id: str, user_id: str
+) -> tuple[Any, dict[str, Any]]:
+    """A ready sandbox and the workspace row as the acquisition left it, or 503.
+
+    Acquiring is where a renamed workspace's folder moves, so a row read before
+    it can name a folder that is gone: a route builds every sandbox path from
+    the row this returns, never from the one it read to check ownership. A
+    settle on another worker can still move it before the sandbox is read, so
+    a file route takes ``_acquire_sandbox_to_change`` rather than this.
+    """
     manager = WorkspaceManager.get_instance()
     try:
         session = await manager.get_session_for_workspace(workspace_id, user_id=user_id)
@@ -320,7 +339,68 @@ async def _acquire_sandbox(workspace_id: str, user_id: str) -> Any:
             status_code=503,
             detail="Sandbox is not reachable: no sandbox attached to the session",
         )
-    return sandbox
+    workspace = await db_get_workspace(workspace_id)
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return sandbox, workspace
+
+
+@asynccontextmanager
+async def _acquire_sandbox_to_change(
+    workspace_id: str, user_id: str
+) -> AsyncIterator[tuple[Any, dict[str, Any]]]:
+    """``_acquire_sandbox`` for a route that touches files by path: the folder
+    stays put until the block ends, and the row is read under that hold.
+
+    Reads need it as much as changes: a folder moved between the row read and
+    the sandbox read is gone, or is a sibling's that landed on the old name,
+    whose files would answer as this workspace's.
+    """
+    sandbox, _ = await _acquire_sandbox(workspace_id, user_id)
+    async with AsyncExitStack() as held:
+        try:
+            hold = await held.enter_async_context(
+                workspace_folder_in_use(workspace_id)
+            )
+        except WorkspaceFolderMoving as e:
+            raise HTTPException(
+                status_code=503, detail=sandbox_unreachable_detail(e)
+            ) from None
+        # On the hold's own session: a second checkout while this one is kept
+        # is how concurrent requests fill the pool waiting on each other.
+        workspace = await db_get_workspace(workspace_id, conn=hold.conn)
+        if not workspace:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        dir_name = workspace.get("dir_name")
+        if dir_name and not is_top_level(dir_name):
+            # A move a settle could not finish; the acquisition refuses it too.
+            raise HTTPException(
+                status_code=503,
+                detail=sandbox_unreachable_detail(WorkspaceFolderMoving(workspace_id)),
+            )
+        yield sandbox, workspace
+
+
+async def folder_unmoved(workspace_id: str, dir_name: str | None) -> bool:
+    """Whether the row still names ``dir_name`` as a settled folder.
+
+    A URL-only route checks this after reading a warm sandbox, in place of the
+    folder hold, which would pin a pooled connection per visitor request. It
+    is enough because a move stages the row before it touches the folder, and
+    a sibling lands on the old name only once this row has left it. A failed
+    lookup is False, which those routes answer like a missing file.
+    """
+    try:
+        workspace = await db_get_workspace(workspace_id)
+    except Exception as e:
+        logger.warning(
+            f"Folder recheck failed for workspace {workspace_id}: {single_line(str(e))}"
+        )
+        return False
+    if not workspace:
+        return False
+    current = workspace.get("dir_name")
+    return current == dir_name and (not current or is_top_level(current))
 
 
 def _to_client_path(
@@ -443,6 +523,22 @@ def owner_work_dir(workspace: dict[str, Any], *, manager: Any = None) -> str:
     return owner_layout(workspace, manager=manager).workspace
 
 
+def previous_dir_names_of(workspace: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """The folders a rename moved this workspace out of, for folding old spellings.
+
+    Unlike the agent's fold, a former folder a sibling has taken since still
+    folds here: a route only ever serves this workspace's folder, so the
+    spelling answers as this workspace's file or not at all, and a link that
+    carries it was written while the folder was this workspace's.
+    """
+    current = (workspace or {}).get("dir_name")
+    return tuple(
+        name
+        for name in ((workspace or {}).get("previous_dir_names") or ())
+        if name and name != current
+    )
+
+
 _FILE_URL_SCHEME = "file://"
 
 
@@ -484,29 +580,49 @@ def _known_roots(work_dir: str) -> tuple[str, ...]:
     return tuple(sorted((r for r in roots if r), key=lambda r: (-len(r), r)))
 
 
-def workspace_relative_path(path: str, work_dir: str) -> str:
+def workspace_relative_path(
+    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> str:
     """Every spelling of a requested path folded to one ``work_dir``-relative form.
 
     A path arrives relative to the workspace, under the workspace folder, under
     a computer root that folder sits on (the layout before the split spelled
-    every path that way, and transcripts still hold those), or as a ``file:``
-    URL of any of the three. The sweep that split the root physically moved
-    those entries into the folder, so the root spelling names the same file the
+    every path that way, and transcripts still hold those), under a folder the
+    workspace was renamed out of, or as a ``file:`` URL of any of these. The
+    sweep that split the root physically moved those entries into the folder,
+    and a rename moves the folder, so each spelling names the same file the
     folder spelling does.
 
     A leading slash survives a path no root claimed: whether that names a
     workspace file or nothing at all is the caller's policy, not this fold's.
     """
     raw = _file_url_path((path or "").strip()).replace("\\", "/")
+    folder = work_dir.rstrip("/")
     for root in _known_roots(work_dir):
         if raw == root:
             return ""
         if raw.startswith(f"{root}/"):
-            return _fold_relative(raw[len(root) + 1 :])
+            relative = _fold_relative(raw[len(root) + 1 :])
+            if root != folder:
+                inside = strip_previous_dir_name(relative, previous_dir_names)
+                if inside is not None:
+                    return inside
+            return relative
+    # A former folder sat beside this one, on the computer's root, which a
+    # configured working directory puts outside the stock roots.
+    beside = posixpath.dirname(folder).rstrip("/")
+    if previous_dir_names and raw.startswith(f"{beside}/"):
+        inside = strip_previous_dir_name(
+            _fold_relative(raw[len(beside) + 1 :]), previous_dir_names
+        )
+        if inside is not None:
+            return inside
     return raw if raw.startswith("/") else _fold_relative(raw)
 
 
-def _normalize_requested_path(path: str, work_dir: str) -> str:
+def _normalize_requested_path(
+    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> str:
     """The folded path, reading a slash no root claimed as the workspace root.
 
     That is the client's virtual-absolute spelling, so one leading slash comes
@@ -514,24 +630,28 @@ def _normalize_requested_path(path: str, work_dir: str) -> str:
     that follows refuses it. ``clean_path`` refuses the same spelling outright,
     because its callers glob what it returns.
     """
-    relative = workspace_relative_path(path, work_dir)
+    relative = workspace_relative_path(path, work_dir, previous_dir_names)
     if relative.startswith("/"):
         return _fold_relative(relative[1:])
     return relative
 
 
-def _requested_hidden_ok(path: str, work_dir: str) -> bool:
+def _requested_hidden_ok(
+    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> bool:
     """Return True if caller explicitly requested a hidden directory."""
-    normalized = _normalize_requested_path(path, work_dir)
+    normalized = _normalize_requested_path(path, work_dir, previous_dir_names)
     if not normalized:
         return False
     internal = SandboxLayout.INTERNAL_DIR
     return normalized == internal or normalized.startswith(f"{internal}/")
 
 
-def _requested_system_ok(path: str, work_dir: str) -> bool:
+def _requested_system_ok(
+    path: str, work_dir: str, previous_dir_names: Sequence[str] = ()
+) -> bool:
     """Return True if caller explicitly requested a system directory."""
-    normalized = _normalize_requested_path(path, work_dir)
+    normalized = _normalize_requested_path(path, work_dir, previous_dir_names)
     if not normalized:
         return False
     return any(

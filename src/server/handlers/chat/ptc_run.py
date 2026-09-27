@@ -121,6 +121,7 @@ async def _resolve_project(session, workspace_id: str) -> ProjectContext | None:
         dir_name=placement.dir_name,
         sibling_dir_names=placement.sibling_dir_names,
         layout_origin=placement.layout_origin,
+        previous_dir_names=placement.previous_dir_names,
     )
 
 
@@ -464,7 +465,10 @@ async def astream_ptc_workflow(
         # session in memory). The extra "starting/ready" SSE pair is harmless.
         if not needs_startup:
             session = await workspace_manager.get_session_for_workspace(
-                workspace_id, user_id=user_id, skills_signature=skills_signature
+                workspace_id,
+                user_id=user_id,
+                skills_signature=skills_signature,
+                run_id=run_id,
             )
         else:
             yield f"id: 0\nevent: workspace_status\ndata: {json.dumps({'status': 'starting', 'workspace_id': workspace_id})}\n\n"
@@ -488,6 +492,7 @@ async def astream_ptc_workflow(
                     user_id=user_id,
                     on_state_observed=_on_state,
                     skills_signature=skills_signature,
+                    run_id=run_id,
                 )
             )
 

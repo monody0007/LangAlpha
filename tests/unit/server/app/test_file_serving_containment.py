@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -64,8 +65,11 @@ _SHARE_VAULT = "src.server.app.share_files.get_vault_secrets_for_redaction"
 _SHARE_WSMGR = "src.server.app.workspace_files.serve.WorkspaceManager"
 _CRUD_DBWS = "src.server.app.workspace_files.crud.db_get_workspace"
 _CRUD_OWNER = "src.server.app.workspace_files.crud.require_workspace_owner"
-_CRUD_ACQUIRE = "src.server.app.workspace_files.crud._acquire_sandbox"
+_CRUD_ACQUIRE_TO_CHANGE = "src.server.app.workspace_files.crud._acquire_sandbox_to_change"
 _CRUD_WD = "src.server.app.workspace_files.crud.owner_work_dir"
+# The row a URL-only route re-reads after a live read, to prove the folder the
+# read went to was still this workspace's.
+_RECHECK = "src.server.app.workspace_files._shared.db_get_workspace"
 
 
 class _ShellRuntime:
@@ -491,6 +495,7 @@ async def test_serve_returns_a_contained_file(tree) -> None:
     with (
         patch(_SERVE_DBWS, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WD, return_value=tree.root),
+        patch(_RECHECK, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WSMGR) as mgr,
         patch(_SERVE_VAULT, AsyncMock(return_value=[])),
         patch(_SERVE_FP) as fp,
@@ -649,6 +654,7 @@ async def test_shared_serve_returns_a_file_inside_the_token_scope(tree) -> None:
         patch(_SHARE_DBWS, AsyncMock(return_value=_workspace())),
         patch(_SHARE_WD, return_value=tree.root),
         patch(_SERVE_WD, return_value=tree.root),
+        patch(_RECHECK, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WSMGR) as mgr,
         patch(_SERVE_VAULT, AsyncMock(return_value=[])),
         patch(_SERVE_FP) as fp,
@@ -670,6 +676,7 @@ async def test_shared_serve_without_a_scope_still_serves_the_workspace(tree) -> 
         patch(_SHARE_DBWS, AsyncMock(return_value=_workspace())),
         patch(_SHARE_WD, return_value=tree.root),
         patch(_SERVE_WD, return_value=tree.root),
+        patch(_RECHECK, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WSMGR) as mgr,
         patch(_SERVE_VAULT, AsyncMock(return_value=[])),
         patch(_SERVE_FP) as fp,
@@ -708,6 +715,7 @@ async def test_shared_pdf_pulls_subresources_through_the_token(tree) -> None:
         patch(_SHARE_DBWS, AsyncMock(return_value=_workspace())),
         patch(_SHARE_WD, return_value=tree.root),
         patch(_SERVE_WD, return_value=tree.root),
+        patch(_RECHECK, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WSMGR) as mgr,
         patch(_SERVE_FP) as fp,
         patch("src.server.services.pdf_render.render_workspace_pdf", render),
@@ -809,7 +817,7 @@ async def test_workspace_download_denies_a_symlink_out_of_the_root(tree) -> None
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=tree.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
     ):
         with pytest.raises(HTTPException) as exc:
             await download_workspace_file(
@@ -818,6 +826,20 @@ async def test_workspace_download_denies_a_symlink_out_of_the_root(tree) -> None
     assert exc.value.status_code == 404
     assert tree.sandbox.reads == []
 
+
+
+def _acquired(sandbox, workspace, events=None):
+    """Stands in for the folder-holding acquisition, noting when it lets go."""
+
+    @asynccontextmanager
+    async def acquire(*_args):
+        try:
+            yield sandbox, workspace
+        finally:
+            if events is not None:
+                events.append("released")
+
+    return acquire
 
 _EXEC_CAP = "src.server.app.workspace_files._containment.EXEC_READ_MAX_BYTES"
 _CRUD_STORAGE = "src.server.app.workspace_files.crud.is_storage_enabled"
@@ -837,7 +859,7 @@ async def test_workspace_download_past_the_exec_limit_uses_the_provider(
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=tree.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
         patch(_EXEC_CAP, 4),
         patch(_CRUD_STORAGE, return_value=storage_on),
     ):
@@ -846,6 +868,38 @@ async def test_workspace_download_past_the_exec_limit_uses_the_provider(
     assert body == b"\x89PNG\r\n\x1a\n\xff\xfe"
     assert response.headers["content-length"] == str(len(body))
     assert tree.sandbox.reads == [f"{tree.root}/work/chart.png"]
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_download_holds_the_folder_until_the_response_is_sent(tree) -> None:
+    """The file is read by path chunk after chunk, so a settle that moved the
+    folder mid-send would end the download; the hold goes with the response."""
+    request = MagicMock()
+    request.headers = {}
+    events: list[str] = []
+    with (
+        patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_WD, return_value=tree.root),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace(), events)),
+        patch(_EXEC_CAP, 4),
+        patch(_CRUD_STORAGE, return_value=False),
+    ):
+        response = await download_workspace_file(WS_ID, OWNER, request, path="work/chart.png")
+        assert events == []
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+            if message.get("more_body") is False or message["type"] == "http.response.body":
+                assert events == []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+    assert b"".join(m.get("body", b"") for m in sent) == b"\x89PNG\r\n\x1a\n\xff\xfe"
+    assert events == ["released"]
 
 
 @pytest.mark.asyncio
@@ -858,7 +912,7 @@ async def test_workspace_download_fails_the_send_when_the_file_grows(tree) -> No
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=tree.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
         patch(_EXEC_CAP, 4),
         patch(_CRUD_STORAGE, return_value=False),
     ):
@@ -877,7 +931,7 @@ async def test_workspace_download_past_the_exec_limit_still_denies_an_escape(
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=tree.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
         patch(_EXEC_CAP, 1),
         patch(_CRUD_STORAGE, return_value=False),
     ):
@@ -895,7 +949,7 @@ async def test_workspace_read_denies_a_symlink_out_of_the_root(tree) -> None:
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=tree.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
     ):
         with pytest.raises(HTTPException) as exc:
             await read_workspace_file(WS_ID, OWNER, path="work/escape/secret.txt")
@@ -911,7 +965,7 @@ async def test_workspace_download_returns_a_contained_file(tree) -> None:
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=tree.root),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=tree.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
     ):
         response = await download_workspace_file(
             WS_ID, OWNER, request, path="work/chart.png"

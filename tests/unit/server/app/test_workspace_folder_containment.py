@@ -44,12 +44,17 @@ from src.server.app.workspace_files._containment import contained_sandbox_path
 from src.server.app.workspace_files.crud import (
     delete_workspace_files,
     download_workspace_file,
+    get_backup_status,
     list_workspace_files,
     read_workspace_file,
+    resolve_workspace_file,
+    workspace_file_download_url,
     write_workspace_file,
 )
 from src.server.app.workspace_files.crud import DeleteFilesRequest, WriteFileRequest
+from src.server.app.workspace_files.file_refs import ResolveFileRefRequest
 from src.server.app.workspace_files.serve import serve_workspace_file
+from src.server.database.workspace_folders import FolderHold, moving_path
 
 WS_A = "ws-folder-a"
 WS_B = "ws-folder-b"
@@ -73,9 +78,20 @@ _SHARE_VAULT = "src.server.app.share_files.get_vault_secrets_for_redaction"
 
 _CRUD_DBWS = "src.server.app.workspace_files.crud.db_get_workspace"
 _CRUD_OWNER = "src.server.app.workspace_files.crud.require_workspace_owner"
-_CRUD_ACQUIRE = "src.server.app.workspace_files.crud._acquire_sandbox"
+_CRUD_ACQUIRE_TO_CHANGE = "src.server.app.workspace_files.crud._acquire_sandbox_to_change"
 _CRUD_WD = "src.server.app.workspace_files.crud.owner_work_dir"
 _CRUD_VAULT = "src.server.app.workspace_files.crud.get_vault_secrets_for_redaction"
+_CRUD_LINK = "src.server.app.workspace_files.crud.live_download_link"
+_CRUD_SCAN = "src.server.app.workspace_files.crud.FilePersistenceService.list_sandbox_files"
+_SYNC_META = "src.server.database.workspace_file.get_file_metadata_for_sync"
+_TOTAL_SIZE = "src.server.database.workspace_file.get_workspace_total_size"
+
+# What the held acquisition reads through, and the row a URL-only route
+# re-reads after a live read.
+_SHARED_DBWS = "src.server.app.workspace_files._shared.db_get_workspace"
+_SHARED_WSMGR = "src.server.app.workspace_files._shared.WorkspaceManager"
+_SHARED_HOLD = "src.server.app.workspace_files._shared.workspace_folder_in_use"
+_SHARE_FP_TREE = "src.server.app.share_files.FilePersistenceService.get_file_tree"
 
 
 class _ShellRuntime:
@@ -443,6 +459,16 @@ async def test_shared_listing_never_names_the_sibling(computer, requested) -> No
     _nothing_from_the_sibling(computer)
 
 
+def _acquired(sandbox, workspace):
+    """Stands in for the folder-holding acquisition a change route opens."""
+
+    @asynccontextmanager
+    async def acquire(*_args):
+        yield sandbox, workspace
+
+    return acquire
+
+
 # --- authenticated owner routes -------------------------------------------
 
 
@@ -453,7 +479,7 @@ async def test_read_denies_every_reach_for_the_sibling(computer, requested) -> N
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=computer.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
         patch(_CRUD_VAULT, AsyncMock(return_value=[])),
     ):
         with pytest.raises(HTTPException) as exc:
@@ -471,7 +497,7 @@ async def test_download_denies_every_reach_for_the_sibling(computer, requested) 
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=computer.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
         patch(_CRUD_VAULT, AsyncMock(return_value=[])),
     ):
         with pytest.raises(HTTPException) as exc:
@@ -487,7 +513,7 @@ async def test_listing_never_leaves_the_workspace_folder(computer, requested) ->
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=computer.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
         try:
             result = await list_workspace_files(WS_A, OWNER, path=requested)
@@ -509,7 +535,7 @@ async def test_write_never_lands_outside_the_workspace_folder(
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=computer.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
         with pytest.raises(HTTPException) as exc:
             await write_workspace_file(
@@ -527,7 +553,7 @@ async def test_write_to_the_shared_scratch_folds_into_the_workspace(computer) ->
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=computer.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
         await write_workspace_file(
             WS_A, OWNER, path="/tmp/note.txt", body=WriteFileRequest(content="x")
@@ -547,7 +573,7 @@ async def test_delete_never_names_a_path_outside_the_workspace_folder(
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=computer.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
         result = await delete_workspace_files(
             WS_A, OWNER, body=DeleteFilesRequest(paths=[requested])
@@ -568,7 +594,7 @@ async def test_delete_unlinks_a_symlink_instead_of_its_target(computer) -> None:
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
-        patch(_CRUD_ACQUIRE, AsyncMock(return_value=computer.sandbox)),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
         result = await delete_workspace_files(
             WS_A, OWNER, body=DeleteFilesRequest(paths=["work/report-link.html"])
@@ -579,12 +605,61 @@ async def test_delete_unlinks_a_symlink_instead_of_its_target(computer) -> None:
     assert target.read_bytes() == A_REPORT
 
 
+def _renamed(computer: SimpleNamespace) -> tuple[dict, dict]:
+    """A's row before and after the acquisition that moves it out of ``old-a``."""
+    before = _workspace(dir_name="old-a") | {"computer_root_dir": computer.root}
+    after = _workspace() | {
+        "computer_root_dir": computer.root,
+        "previous_dir_names": ["old-a"],
+    }
+    return before, after
+
+
+@pytest.mark.asyncio
+async def test_listing_after_a_rename_reads_the_folder_the_acquisition_settled(
+    computer,
+) -> None:
+    before, after = _renamed(computer)
+    with (
+        patch(_CRUD_DBWS, AsyncMock(return_value=before)),
+        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, after)),
+    ):
+        result = await list_workspace_files(
+            WS_A, OWNER, path="work", pattern="**/*", wait_for_sandbox=True
+        )
+    assert "work/report.html" in result["files"]
+    _nothing_from_the_sibling(computer)
+
+
+@pytest.mark.asyncio
+async def test_write_after_a_rename_does_not_recreate_the_former_folder(
+    computer,
+) -> None:
+    before, after = _renamed(computer)
+    with (
+        patch(_CRUD_DBWS, AsyncMock(return_value=before)),
+        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, after)),
+    ):
+        result = await write_workspace_file(
+            WS_A,
+            OWNER,
+            path="/home/workspace/old-a/work/report.html",
+            body=WriteFileRequest(content="x"),
+        )
+    assert result["path"] == "work/report.html"
+    assert computer.sandbox.writes == [f"{computer.work_dir}/work/report.html"]
+    assert not Path(computer.root, "old-a").exists()
+
+
 @pytest.mark.asyncio
 async def test_the_workspace_serves_its_own_files(computer) -> None:
     """The containment is a fence, not a wall: A's own report still serves."""
     with (
         patch(_SERVE_DBWS, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WD, return_value=computer.work_dir),
+        patch(_SHARED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_SERVE_WSMGR) as mgr,
         patch(_SERVE_VAULT, AsyncMock(return_value=[])),
         patch(_SERVE_FP) as fp,
@@ -596,3 +671,185 @@ async def test_the_workspace_serves_its_own_files(computer) -> None:
         )
     assert response.status_code == 200
     assert response.body == A_REPORT
+
+
+# --- a folder that moves while a route reads it ----------------------------
+#
+# A settle on another worker can move A's folder between the row read and the
+# sandbox read, and B can then land on the name A left. The stale row names
+# DIR_B: A's folder when it was read, B's by the time the sandbox is. Both
+# folders hold ``work/report.html``, so reading the stale one does not fail,
+# it answers with B's file as A's.
+
+
+def _moved(computer: SimpleNamespace) -> tuple[dict, dict]:
+    """A's row as read before the move, and as read after it."""
+    Path(computer.sibling, "work").mkdir()
+    Path(computer.sibling, "work", "report.html").write_bytes(B_SECRET)
+    root = {"computer_root_dir": computer.root}
+    return _workspace(dir_name=DIR_B) | root, _workspace() | root
+
+
+def _record_sandbox_calls(sandbox: _ComputerSandbox, events: list[str]) -> None:
+    for name in ("aglob_files", "adownload_file_bytes"):
+        original = getattr(sandbox, name)
+
+        async def call(*args, _original=original, _name=name, **kwargs):
+            events.append(_name)
+            return await _original(*args, **kwargs)
+
+        setattr(sandbox, name, call)
+    run = sandbox.runtime.exec
+
+    async def exec_(command: str, timeout: int = 60):
+        events.append("exec")
+        return await run(command, timeout)
+
+    sandbox.runtime.exec = exec_
+
+
+LIVE_READS = {
+    "list": (
+        lambda: list_workspace_files(
+            WS_A, OWNER, path=".", include_system=False, pattern="**/*",
+            wait_for_sandbox=True, auto_start=False,
+        ),
+        lambda r: "work/report.html" in r["files"] and "secret.txt" not in r["files"],
+    ),
+    "resolve": (
+        lambda: resolve_workspace_file(
+            WS_A, OWNER, ResolveFileRefRequest(candidates=["report.html"])
+        ),
+        lambda r: r["path"] == "work/report.html",
+    ),
+    "read": (
+        lambda: read_workspace_file(
+            WS_A, OWNER, path="work/report.html", offset=0, limit=100, unlimited=True
+        ),
+        lambda r: r["content"] == A_REPORT.decode(),
+    ),
+    "download-url": (
+        lambda: workspace_file_download_url(WS_A, OWNER, path="work/report.html"),
+        lambda r: r == {"url": "https://store.example.com/work/report.html"},
+    ),
+    "backup-status": (
+        lambda: get_backup_status(WS_A, OWNER),
+        lambda r: r["untracked"] == ["work/report.html"],
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", sorted(LIVE_READS))
+async def test_live_reads_hold_the_folder_until_the_read_ends(computer, route) -> None:
+    """Every sandbox read runs under the folder hold, on the row read under it."""
+    before, after = _moved(computer)
+    events: list[str] = []
+    folders: list[str] = []
+    held = False
+    session = object()
+
+    @asynccontextmanager
+    async def hold(workspace_id):
+        nonlocal held
+        events.append("held")
+        held = True
+        try:
+            yield FolderHold(workspace_id, session)
+        finally:
+            held = False
+            events.append("released")
+
+    async def row(_workspace_id, conn=None):
+        # The held row is the one read on the hold's own session.
+        return after if held and conn is session else before
+
+    async def export(_workspace, _sandbox, rel_path, *, layout):
+        events.append("export")
+        folders.append(layout.workspace)
+        return f"https://store.example.com/{rel_path}"
+
+    async def scan(_sandbox, *, layout):
+        events.append("scan")
+        folders.append(layout.workspace)
+        return {"work/report.html": {"file_size": len(A_REPORT), "mtime": 1.0}}
+
+    manager = MagicMock()
+    manager.get_instance.return_value.get_session_for_workspace = AsyncMock(
+        return_value=SimpleNamespace(sandbox=computer.sandbox)
+    )
+    _record_sandbox_calls(computer.sandbox, events)
+    call, answered_for_a = LIVE_READS[route]
+    with (
+        patch(_CRUD_DBWS, AsyncMock(return_value=before)),
+        patch(_SHARED_WSMGR, manager),
+        patch(_SHARED_HOLD, hold),
+        patch(_SHARED_DBWS, row),
+        patch(_CRUD_VAULT, AsyncMock(return_value=[])),
+        patch(_CRUD_LINK, export),
+        patch(_CRUD_SCAN, scan),
+        patch(_SYNC_META, AsyncMock(return_value={})),
+        patch(_TOTAL_SIZE, AsyncMock(return_value=0)),
+    ):
+        result = await call()
+
+    assert events[0] == "held" and events[-1] == "released", events
+    assert len(events) > 2 and events.count("held") == 1, events
+    assert folders == [computer.work_dir] * len(folders)
+    assert not any(computer.sibling in c for c in computer.sandbox.runtime.commands)
+    _nothing_from_the_sibling(computer)
+    assert answered_for_a(result), result
+
+
+SHARED_READS = {
+    "read": lambda: read_shared_file("tok", path="work/report.html", offset=0, limit=100),
+    "download": lambda: download_shared_file("tok", path="work/report.html"),
+    "serve": lambda: serve_shared_file(_json_request(), "tok", path="work/report.html"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", sorted(SHARED_READS))
+@pytest.mark.parametrize("row_after", ["moved", "staged", "lookup failed"])
+async def test_a_shared_read_that_raced_a_folder_move_is_not_served(
+    computer, route, row_after
+) -> None:
+    """A share route holds no folder, so the row is checked after the read.
+    The token resolved while the row named DIR_B; B's file is 404, not A's."""
+    before, after = _moved(computer)
+    recheck = {
+        "moved": AsyncMock(return_value=after),
+        "staged": AsyncMock(return_value=after | {"dir_name": moving_path(WS_A)}),
+        "lookup failed": AsyncMock(side_effect=RuntimeError("pool exhausted")),
+    }[row_after]
+    with (
+        patch(_SHARE_THREAD, AsyncMock(return_value=_shared_thread())),
+        patch(_SHARE_DBWS, AsyncMock(return_value=before)),
+        patch(_SHARED_DBWS, recheck),
+        patch(_SERVE_WSMGR) as mgr,
+        patch(_SHARE_VAULT, AsyncMock(return_value=[])),
+        patch(_SERVE_VAULT, AsyncMock(return_value=[])),
+    ):
+        _warm(mgr, computer.sandbox)
+        with pytest.raises(HTTPException) as exc:
+            await SHARED_READS[route]()
+    assert exc.value.status_code == 404
+    recheck.assert_awaited_once_with(WS_A)
+
+
+@pytest.mark.asyncio
+async def test_a_shared_listing_that_raced_a_folder_move_answers_from_the_manifest(
+    computer,
+) -> None:
+    """A moved folder is a sandbox miss like any other on this route."""
+    before, after = _moved(computer)
+    with (
+        patch(_SHARE_THREAD, AsyncMock(return_value=_shared_thread())),
+        patch(_SHARE_DBWS, AsyncMock(return_value=before)),
+        patch(_SHARED_DBWS, AsyncMock(return_value=after)),
+        patch(_SERVE_WSMGR) as mgr,
+        patch(_SHARE_FP_TREE, AsyncMock(return_value=[{"path": "work/report.html"}])),
+    ):
+        _warm(mgr, computer.sandbox)
+        result = await list_shared_files("tok", path=".")
+    assert result == {"path": ".", "files": ["work/report.html"], "source": "database"}

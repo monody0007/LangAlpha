@@ -17,7 +17,8 @@ fails lazy init, request B calls ``/files`` while status is
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -152,3 +153,103 @@ async def test_mutation_rejects_shared_agent_root_after_canonicalization():
         with pytest.raises(HTTPException) as error:
             await _contained_target(sandbox, "linked-doc.md", "/home/workspace/project")
     assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_backup_scans_the_folder_read_under_the_folder_hold():
+    """A settle on another worker can land the folder after the acquisition
+    read the row. Scanned at the old path, it reads as missing, which the sync
+    reports as a clean pass."""
+    from contextlib import asynccontextmanager
+
+    from src.server.app.workspace_files.crud import backup_workspace_files
+    from src.server.database.workspace_folders import FolderHold
+    from src.server.services.persistence.sync_result import SyncResult
+
+    row = {**_workspace("ws-renamed", "user-1", status="running"), "computer_root_dir": "/home/workspace"}
+    events = []
+
+    @asynccontextmanager
+    async def hold(workspace_id):
+        events.append("hold")
+        yield FolderHold(workspace_id, None)
+        events.append("release")
+
+    async def scan(_workspace_id, _sandbox, *, layout):
+        events.append(f"sync {layout.workspace}")
+        return SyncResult(synced=1)
+
+    acquire = AsyncMock(return_value=(object(), {**row, "dir_name": "Research"}))
+    sync = AsyncMock(side_effect=scan)
+    with (
+        patch("src.server.app.workspace_files.crud.db_get_workspace", AsyncMock(return_value=row)),
+        patch("src.server.app.workspace_files._shared._acquire_sandbox", acquire),
+        patch("src.server.app.workspace_files._shared.workspace_folder_in_use", hold),
+        patch(
+            "src.server.app.workspace_files._shared.db_get_workspace",
+            AsyncMock(return_value={**row, "dir_name": "Macro"}),
+        ),
+        patch("src.server.app.workspace_files.crud.FilePersistenceService.sync_to_db", sync),
+    ):
+        result = await backup_workspace_files(workspace_id="ws-renamed", x_user_id="user-1")
+
+    assert events == ["hold", "sync /home/workspace/Macro", "release"]
+    assert result["synced"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("moving", ["hold_times_out", "row_staged"])
+async def test_backup_status_falls_back_when_the_folder_is_moving(moving):
+    """A folder a settle is moving cannot be scanned yet, and the status is
+    polled with every file-list refresh: it answers from the DB, as it does for
+    a sandbox that is not ready, rather than failing the panel."""
+    from contextlib import asynccontextmanager
+
+    from src.server.app.workspace_files.crud import get_backup_status
+    from src.server.database.workspace_folders import (
+        FolderHold,
+        WorkspaceFolderMoving,
+        moving_path,
+    )
+
+    row = {
+        **_workspace("ws-moving", "user-1", status="running"),
+        "computer_root_dir": "/home/workspace",
+        "dir_name": "Research",
+    }
+    held_row = row if moving == "hold_times_out" else {**row, "dir_name": moving_path("ws-moving")}
+
+    @asynccontextmanager
+    async def hold(workspace_id):
+        if moving == "hold_times_out":
+            raise WorkspaceFolderMoving(workspace_id)
+        yield FolderHold(workspace_id, None)
+
+    manager = MagicMock()
+    manager.get_instance.return_value.get_session_for_workspace = AsyncMock(
+        return_value=SimpleNamespace(sandbox=object())
+    )
+    scan = AsyncMock(return_value={})
+    with (
+        patch("src.server.app.workspace_files.crud.db_get_workspace", AsyncMock(return_value=row)),
+        patch("src.server.app.workspace_files._shared.WorkspaceManager", manager),
+        patch("src.server.app.workspace_files._shared.workspace_folder_in_use", hold),
+        patch("src.server.app.workspace_files._shared.db_get_workspace", AsyncMock(return_value=held_row)),
+        patch("src.server.app.workspace_files.crud.FilePersistenceService.list_sandbox_files", scan),
+        patch(
+            "src.server.database.workspace_file.get_file_metadata_for_sync",
+            AsyncMock(return_value={"data/a.csv": {"kind": "file", "file_size": 7}}),
+        ),
+        patch("src.server.database.workspace_file.get_workspace_total_size", AsyncMock(return_value=7)),
+    ):
+        result = await get_backup_status(workspace_id="ws-moving", x_user_id="user-1")
+
+    scan.assert_not_awaited()
+    assert result == {
+        "workspace_id": "ws-moving",
+        "backed_up": ["data/a.csv"],
+        "modified": [],
+        "untracked": [],
+        "total_backed_up_size": 7,
+        "files_restore_incomplete": False,
+    }
